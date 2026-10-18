@@ -112,15 +112,12 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
   } catch {}
   const args = ["--mode", "rpc"];
   if (primer) args.push("--append-system-prompt", primer);
-  // Subagents (pi-spawn package). Resolved relative to this
-  // file in dev (sibling repo); env override for custom layouts;
-  // skipped when absent (pi runs without spawn). Shadow-browser is
-  // NOT injected: it loads from the user's own pi packages.
-  const spawnCandidates = [
-    process.env.PI_DESKTOP_SPAWN_EXT,
-    fileURLToPath(new URL("../../pi-spawn/index.ts", import.meta.url)),
-    fileURLToPath(new URL("../node_modules/pi-spawn/index.ts", import.meta.url)),
-  ].filter(Boolean);
+  // Subagents (pi-spawn) load from the user's own pi packages, exactly
+  // like shadow-browser — never injected here. A vendored --extension copy
+  // + the user's own install of the same extension is a FATAL tool
+  // conflict (different paths don't dedupe; pi exits, procs go zombie).
+  // Only an explicit PI_DESKTOP_SPAWN_EXT override is honored.
+  const spawnCandidates = [process.env.PI_DESKTOP_SPAWN_EXT].filter(Boolean);
   for (const spawnExt of spawnCandidates) {
     try {
       fs.statSync(spawnExt);

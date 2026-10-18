@@ -22,56 +22,20 @@ use tauri_plugin_global_shortcut::ShortcutState;
 // gambling. web-backend.mjs reads the same file for browser dev.
 const MEDIA_PRIMER: &str = include_str!("../../src/media-primer.md");
 
-// Subagents (pi-spawn package — see the pi-spawn repo, SPAWN.md there): one
-// primitive, sessions all the way down. The extension is a single
-// dependency-free TS file, so the installer vendors it as a resource and
-// every pi child loads it via --extension: desktop users get subagents with
-// no `pi install` step. Resolved at runtime so dev (sibling repo present)
-// and installed builds (resource bundle, env override) all work; missing
-// file means the flag is skipped and pi runs without spawn (graceful).
-// Shadow-browser is NOT injected here: it carries heavy native deps
-// (camoufox) and loads from the user's own pi packages instead.
-fn spawn_ext_path(app: &AppHandle) -> Option<PathBuf> {
+// Subagents (pi-spawn package) load from the USER's own pi packages
+// (`pi install git:github.com/pi-ecosystem/pi-spawn`), exactly like
+// shadow-browser — never via --extension from here. Rationale: pi dedupes
+// an identical --extension path but FATALS on the same tool from two
+// DIFFERENT paths (vendored copy + user install = dead child, zombie
+// proc, everything RPC-shaped breaks at once). The only exception is an
+// explicit PI_DESKTOP_SPAWN_EXT override (dev escape hatch).
+fn spawn_ext_path(_app: &AppHandle) -> Option<PathBuf> {
+    // Explicit override only (dev escape hatch):
+    // PI_DESKTOP_SPAWN_EXT=/path/to/index.ts
     if let Ok(p) = std::env::var("PI_DESKTOP_SPAWN_EXT") {
         let pb = PathBuf::from(p);
         if pb.is_file() {
             return Some(pb);
-        }
-    }
-    // Installed bundle: Tauri `bundle.resources` places it here. The
-    // `..` segments survive as `_up_` dirs (verified in the deb:
-    // `resource_dir/_up_/_up_/pi-spawn/index.ts` for a `../../` entry),
-    // so try the plausible layouts; existence-checked, first hit wins.
-    if let Ok(rd) = app.path().resource_dir() {
-        for rel in [
-            "pi-spawn/index.ts",
-            "_up_/_up_/pi-spawn/index.ts",
-            "_up_/pi-spawn/index.ts",
-        ] {
-            let bundled = rd.join(rel);
-            if bundled.is_file() {
-                return Some(bundled);
-            }
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // Dev layout: src-tauri/target/<profile>/pi-desktop → sibling
-            // pi-spawn repo, or file: dep under the desktop node_modules.
-            for rel in [
-                "../../../../pi-spawn/index.ts",
-                "../../../node_modules/pi-spawn/index.ts",
-            ] {
-                let dev = dir.join(rel);
-                if dev.is_file() {
-                    return Some(dev);
-                }
-            }
-            // Installed layout: <dir>/pi-spawn/index.ts next to the binary.
-            let next = dir.join("pi-spawn").join("index.ts");
-            if next.is_file() {
-                return Some(next);
-            }
         }
     }
     None
@@ -244,7 +208,8 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // App-owned subagents ride along with every child; absence is fine.
+    // Spawn extension only on explicit PI_DESKTOP_SPAWN_EXT override;
+    // normally subagents come from the user's own pi packages.
     if let Some(ext) = spawn_ext_path(&app) {
         cmd.arg("--extension").arg(ext);
     }

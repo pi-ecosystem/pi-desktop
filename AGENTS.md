@@ -18,7 +18,6 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 - `npm run build && npx tauri build --bundles deb` (release Rust build takes minutes — background it, poll the log)
 - Install binary (no sudo):
   - `cp -f src-tauri/target/release/pi-desktop ~/.local/bin/pi-desktop-bin`
-  - `mkdir -p ~/.local/bin/pi-spawn && cp -f ../pi-spawn/index.ts ~/.local/bin/pi-spawn/index.ts` (binary-copy installs carry no resource bundle; the backend resolves `<bindir>/pi-spawn/index.ts`. Path is repo-relative — after `npm publish pi-spawn`, source becomes `node_modules/pi-spawn/index.ts`)
   - wrapper `~/.local/bin/pi-desktop`: `exec env WEBKIT_DISABLE_DMABUF_RENDERER=1 "$HOME/.local/bin/pi-desktop-bin" "$@"`
 - Flags (single-instance — they toggle the running app): `--toggle-quickbar`, `--toggle-main`
 - KDE fallback shortcuts + autostart: see README "Wayland / KDE fallback".
@@ -27,7 +26,11 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 
 - `src-tauri/src/lib.rs` is truth. `server/web-backend.mjs` must mirror it (same commands, same semantics). Change both or neither.
 - History reads are windowed (`read_session_messages`: byte budget + offset). Never load full transcripts.
-- Extensions: spawn is vendored (`pi-spawn/index.ts` via Tauri resources); shadow-browser loads from the user's own pi packages. Don't add `--extension` flags without reading the resource discussion in `lib.rs`.
+- Extensions: never `--extension` anything by default. pi dedupes an
+  identical path but FATALS on the same tool from two different paths
+  (vendored copy + user install = dead child). Both pi-spawn and
+  shadow-browser load from the user's own pi packages; only an explicit
+  `PI_DESKTOP_SPAWN_EXT` override is honored.
 
 ## Env overrides
 

@@ -14,10 +14,11 @@ Common prerequisites (all platforms): the [`pi` CLI](https://pi.dev)
 on PATH and Node.js 22+.
 
 ```bash
+pi install git:github.com/pi-ecosystem/pi-spawn   # subagents (Agents panel)
+```
+
+```bash
 git clone git@github.com:pi-ecosystem/pi-desktop.git ~/Projects/pi-desktop
-# Sibling checkout: build resources + the vendored subagent extension come
-# from here until pi-spawn is on npm (then this step goes away).
-git clone git@github.com:pi-ecosystem/pi-spawn.git ~/Projects/pi-spawn
 cd ~/Projects/pi-desktop
 npm install
 ```
@@ -78,13 +79,6 @@ Develop / build / install:
 npx tauri dev                       # use WEBKIT_DISABLE_DMABUF_RENDERER=1 below on NVIDIA+Wayland
 npm run build && npx tauri build --bundles deb   # (or --bundles appimage)
 cp -f src-tauri/target/release/pi-desktop ~/.local/bin/pi-desktop-bin
-# Subagents ride along via --extension: place the vendored copy next to the
-# binary (binary-copy installs carry no Tauri resource bundle). Source is
-# the sibling pi-spawn checkout (also used at build time via
-# `bundle.resources`); after `npm publish pi-spawn` this becomes
-# `node_modules/pi-spawn/index.ts` instead.
-mkdir -p ~/.local/bin/pi-spawn
-cp -f ../pi-spawn/index.ts ~/.local/bin/pi-spawn/index.ts
 printf '#!/bin/sh\nexec env WEBKIT_DISABLE_DMABUF_RENDERER=1 "$HOME/.local/bin/pi-desktop-bin" "$@"\n' > ~/.local/bin/pi-desktop
 chmod +x ~/.local/bin/pi-desktop
 ```
@@ -159,12 +153,12 @@ windows stay hidden until a hotkey, unless `--toggle-quickbar` is passed).
   JSONL forwarded as `pi-record` events; session sidebar scans pi's own
   `~/.pi/agent/sessions` files (cwd in header, name in `session_info`).
 - No index DB, no reimplementation: new/resume/switch/fork state all live in pi.
-- Extensions: [`pi-spawn`](https://github.com/pi-ecosystem/pi-spawn) is vendored
-  as a Tauri resource and loaded into every pi child via `--extension`, so
-  subagents work with no install step. Shadow-browser
-  ([`pi-shadow-browser`](https://github.com/pi-ecosystem/pi-shadow-browser))
-  is NOT bundled (native deps) — `pi install` it and every desktop session
-  picks it up from your pi packages.
+- Extensions: [`pi-spawn`](https://github.com/pi-ecosystem/pi-spawn) provides
+  subagents (Agents panel) — install it with the `pi install` above; every
+  desktop session picks it up from your pi packages, same as
+  [`pi-shadow-browser`](https://github.com/pi-ecosystem/pi-shadow-browser).
+  Desktop never injects extensions itself (a second copy of the same
+  extension from a different path is a fatal tool conflict).
 
 ## Layout
 
