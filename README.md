@@ -11,7 +11,7 @@ Common prerequisites (all platforms): the [`pi` CLI](https://pi.dev)
 on PATH and Node.js 22+.
 
 ```bash
-git clone git@github.com:Sheerabth/pi-desktop.git ~/Projects/pi-desktop
+git clone git@github.com:pi-ecosystem/pi-desktop.git ~/Projects/pi-desktop
 cd ~/Projects/pi-desktop
 npm install
 ```
