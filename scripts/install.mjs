@@ -32,7 +32,6 @@ for (const a of args) {
 const EXTENSIONS = [
   "git:github.com/pi-ecosystem/pi-spawn",           // subagents (Agents panel)
   "git:github.com/pi-ecosystem/pi-shadow-browser", // browser_* tools
-  "git:github.com/pi-ecosystem/pi-computer-use",   // computer_* tools
 ];
 
 function run(cmd, cmdArgs, opts = {}) {

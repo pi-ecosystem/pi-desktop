@@ -16,7 +16,7 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 ## Build + install (all platforms)
 
 - Standard: `node scripts/install.mjs` — release build + app install +
-  owned pi extensions (`pi install` for pi-spawn/shadow-browser/computer-use).
+  owned pi extensions (`pi install` for pi-spawn/shadow-browser).
   Flags: `--skip-build`, `--extensions-only`, `--skip-extensions`.
 - Manual (Linux): `npm run build && npx tauri build --bundles deb`, then copy
   `src-tauri/target/release/pi-desktop` to `~/.local/bin/pi-desktop-bin` plus
