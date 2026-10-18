@@ -13,12 +13,15 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 - `npx tauri dev` (cargo must be on PATH; NVIDIA+Wayland: prefix `WEBKIT_DISABLE_DMABUF_RENDERER=1`)
 - Global hotkeys need Accessibility permission, else they fire only when focused.
 
-## Build + install (Linux)
+## Build + install (all platforms)
 
-- `npm run build && npx tauri build --bundles deb` (release Rust build takes minutes — background it, poll the log)
-- Install binary (no sudo):
-  - `cp -f src-tauri/target/release/pi-desktop ~/.local/bin/pi-desktop-bin`
-  - wrapper `~/.local/bin/pi-desktop`: `exec env WEBKIT_DISABLE_DMABUF_RENDERER=1 "$HOME/.local/bin/pi-desktop-bin" "$@"`
+- Standard: `node scripts/install.mjs` — release build + app install +
+  owned pi extensions (`pi install` for pi-spawn/shadow-browser/computer-use).
+  Flags: `--skip-build`, `--extensions-only`, `--skip-extensions`.
+- Manual (Linux): `npm run build && npx tauri build --bundles deb`, then copy
+  `src-tauri/target/release/pi-desktop` to `~/.local/bin/pi-desktop-bin` plus
+  the wrapper (see README). Release Rust builds take minutes — background
+  them, poll the log. No sudo anywhere.
 - Flags (single-instance — they toggle the running app): `--toggle-quickbar`, `--toggle-main`
 - KDE fallback shortcuts + autostart: see README "Wayland / KDE fallback".
 

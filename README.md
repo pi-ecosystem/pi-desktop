@@ -73,7 +73,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-Develop / build / install:
+Standard install (all platforms — builds, installs the app, and installs
+the owned pi extensions via `pi install`):
+
+```bash
+node scripts/install.mjs                  # full: build + install + extensions
+node scripts/install.mjs --skip-build      # reuse target/release binary
+node scripts/install.mjs --extensions-only # just (re)install pi extensions
+```
+
+Manual equivalent (Linux):
 
 ```bash
 npx tauri dev                       # use WEBKIT_DISABLE_DMABUF_RENDERER=1 below on NVIDIA+Wayland
