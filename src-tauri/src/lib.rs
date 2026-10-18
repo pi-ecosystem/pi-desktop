@@ -674,19 +674,29 @@ fn read_session_messages(path: String, session_root: Option<String>, max_bytes: 
     // honest transfer bytes); always take ≥1 so oversized singletons
     // can't trap the pager on an empty window with has_more set.
     let end = total - off;
+    // Budget counts render-weight, not raw transfer bytes: a single
+    // multi-MB message (screenshot blobs in tool results transfer but
+    // render as one line) must not eat a whole page and strand paging
+    // at one invisible row per click. Each message counts at most 32KB
+    // toward the stop condition; `bytes` still reports actual transfer
+    // size (refreshMsgs re-reads by it — capping it would shrink the
+    // window and lose messages).
+    const MSG_BUDGET_CAP: usize = 32 * 1024;
     let mut acc: usize = 0;
+    let mut bytes: usize = 0;
     let mut start = end;
     while start > 0 {
         let size = serde_json::to_string(&messages[start - 1]).map(|s| s.len()).unwrap_or(0);
-        if acc + size > budget && start < end {
+        if acc + size.min(MSG_BUDGET_CAP) > budget && start < end {
             break;
         }
-        acc += size;
+        acc += size.min(MSG_BUDGET_CAP);
+        bytes += size;
         start -= 1;
     }
     let window = messages[start..end].to_vec();
     let has_more = start > 0;
-    Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more, "bytes": acc }))
+    Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more, "bytes": bytes }))
 }
 
 /// Run-lifecycle snapshot for sidebar status dots: {bootId, runs:

@@ -438,13 +438,20 @@ const handlers = {
     const budget = Math.min(Math.max(p.maxBytes || 262144, 4096), 8388608);
     const end = total - off;
     // Always take ≥1 so an oversized singleton can't trap the pager.
-    let acc = 0, start = end;
+    // Budget counts render-weight, not raw transfer bytes: a single
+    // multi-MB message (screenshot blobs in tool results transfer but
+    // render as one line) must not eat a whole page and strand paging
+    // at one invisible row per click. Each message counts at most 32KB
+    // toward the stop condition; `bytes` still reports actual transfer
+    // size (refreshMsgs re-reads by it). Mirrors the Tauri backend.
+    const MSG_BUDGET_CAP = 32 * 1024;
+    let acc = 0, bytes = 0, start = end;
     while (start > 0) {
       const size = JSON.stringify(messages[start - 1]).length;
-      if (acc + size > budget && start < end) break;
-      acc += size; start--;
+      if (acc + Math.min(size, MSG_BUDGET_CAP) > budget && start < end) break;
+      acc += Math.min(size, MSG_BUDGET_CAP); bytes += size; start--;
     }
-    return { messages: messages.slice(start, end), total, has_more: start > 0, bytes: acc };
+    return { messages: messages.slice(start, end), total, has_more: start > 0, bytes };
   },
   read_spawn_transcript: (p) => {
     const runId = p.run_id ?? p.runId ?? "";
