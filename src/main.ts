@@ -2850,6 +2850,13 @@ async function switchSession(path: string) {
     viewKey = key;
     viewPath = path;
     curFile = path;
+    // Optimistic chrome: highlight + title straight from the sidebar
+    // cache. Both used to wait behind proc boot (refreshState), leaving
+    // the fresh transcript visibly unselected for ~1s on cold switches.
+    // refreshState refines both once the proc answers (live rename wins).
+    listActive(path);
+    const pre = sessCache.find((x) => x.path === path);
+    if (pre) $("sesstitle").textContent = titleText(pre);
     refreshSessions();
     refreshCommands().catch(() => {});
     await refreshMsgs();
