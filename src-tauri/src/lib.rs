@@ -196,10 +196,18 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     // Make sure the dir exists (default Q&A dir may not yet).
     let _ = fs::create_dir_all(&cwd);
 
-    let mut cmd = Command::new(pi_bin());
+    let bin = pi_bin();
+    let mut cmd = Command::new(&bin);
     // Marker for boot-time orphan reaping (see reap_stale_children):
     // survives in /proc/<pid>/environ, invisible everywhere else.
     cmd.env("PI_DESKTOP_CHILD", "1");
+    // Grandchildren (pi-spawn subagents) exec `process.env.PI_BIN || "pi"`:
+    // a bare "pi" relies on PATH, which is minimal under a KDE-launched
+    // desktop (no ~/.pi/agent/bin) while pi's own bash tool prepends its
+    // bin dir — so `which pi` succeeds yet spawn fails ENOENT. Hand the
+    // resolved path down; an explicit PI_BIN override passes through
+    // unchanged (pi_bin() returns it first).
+    cmd.env("PI_BIN", &bin);
     cmd.arg("--mode")
         .arg("rpc")
         .arg("--append-system-prompt")

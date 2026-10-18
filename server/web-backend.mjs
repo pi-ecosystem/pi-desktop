@@ -127,8 +127,15 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
   }
   if (sessionDir) args.push("--session-dir", sessionDir);
   if (sessionPath) args.push("--session", sessionPath);
+  const bin = piBin();
+  // Grandchildren (pi-spawn subagents) exec `process.env.PI_BIN || "pi"`:
+  // a bare "pi" relies on PATH, which is minimal under a KDE-launched
+  // desktop (no ~/.pi/agent/bin) while pi's own bash tool prepends its
+  // bin dir — so `which pi` succeeds yet spawn fails ENOENT. Hand the
+  // resolved path down; an explicit PI_BIN override passes through
+  // unchanged (piBin() returns it first). Mirrors the Tauri backend.
   // Marker for boot-time orphan reaping (see reapStaleChildren).
-  const child = spawn(piBin(), args, { cwd, stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, PI_DESKTOP_CHILD: "1" } });
+  const child = spawn(bin, args, { cwd, stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, PI_DESKTOP_CHILD: "1", PI_BIN: process.env.PI_BIN || bin } });
   const entry = { child, alive: true };
   child.on("exit", () => (entry.alive = false));
   child.on("error", () => (entry.alive = false));
