@@ -1,5 +1,8 @@
 # Pi Desktop
 
+[![Node 22+](https://img.shields.io/badge/Node-22+-green.svg)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Thin Tauri shell over the `pi` coding agent. Pi owns the agent, sessions,
 skills, and models — this app is just a hotkey popup + sessions window.
 
@@ -146,6 +149,12 @@ windows stay hidden until a hotkey, unless `--toggle-quickbar` is passed).
   JSONL forwarded as `pi-record` events; session sidebar scans pi's own
   `~/.pi/agent/sessions` files (cwd in header, name in `session_info`).
 - No index DB, no reimplementation: new/resume/switch/fork state all live in pi.
+- Extensions: [`pi-spawn`](https://github.com/pi-ecosystem/pi-spawn) is vendored
+  as a Tauri resource and loaded into every pi child via `--extension`, so
+  subagents work with no install step. Shadow-browser
+  ([`pi-shadow-browser`](https://github.com/pi-ecosystem/pi-shadow-browser))
+  is NOT bundled (native deps) — `pi install` it and every desktop session
+  picks it up from your pi packages.
 
 ## Layout
 

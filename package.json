@@ -1,8 +1,23 @@
 {
-  "name": "pi-quickbar",
+  "name": "pi-desktop",
   "private": true,
   "version": "0.1.26",
+  "description": "Hotkey popup + sessions window over the pi coding agent (Tauri, no Electron)",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pi-ecosystem/pi-desktop.git"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "tauri",
+    "coding-agent"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "vite",
     "dev:web": "sh ./scripts/dev-web.sh",
