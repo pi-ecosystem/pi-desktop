@@ -390,6 +390,10 @@ body.qb { background: var(--surface); }
 .qbsp { flex: 1; }
 
 /* spawned subagents via pi-spawn (see SPAWN.md there): one card per child */
+
+.showearlier { display: block; margin: 10px auto 6px; border-radius: 999px; font-size: 12px; opacity: 0.85; }
+.showearlier:hover:not(:disabled) { opacity: 1; }
+.showearlier:disabled { cursor: wait; opacity: 0.6; }
 details.spawncard { border: 1px solid var(--border); border-radius: 10px; padding: 6px 12px; background: rgba(255, 255, 255, 0.02); }
 details.spawncard > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; }
 details.spawncard > summary::-webkit-details-marker { display: none; }

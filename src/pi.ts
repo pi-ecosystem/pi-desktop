@@ -218,11 +218,13 @@ export const sessions = {
   list: (cwd?: string): Promise<SessionInfo[]> =>
     invoke("list_sessions", { cwdFilter: cwd ?? null, sessionRoot: null }),
   del: (path: string): Promise<void> => invoke("delete_session", { path, sessionRoot: null }),
-  // Full transcript parsed straight from the session file (same shape as
-  // get_messages). The file is the truth every writer shares: immune to
-  // stale/dead/busy pi processes. Falls back to live RPC when needed.
-  read: (path: string): Promise<{ messages: any[] }> =>
-    invoke("read_session_messages", { path, sessionRoot: null }),
+  // Windowed transcript parsed straight from the session file (same shape as
+  // get_messages, plus total/has_more). The file is the truth every writer
+  // shares: immune to stale/dead/busy pi processes. Falls back to live RPC
+  // when needed. limit caps the newest-first window (default 60), offset
+  // skips that many newest (page back with offset = loaded count).
+  read: (path: string, limit?: number, offset?: number): Promise<{ messages: any[]; total: number; has_more: boolean }> =>
+    invoke("read_session_messages", { path, sessionRoot: null, limit: limit ?? null, offset: offset ?? null }),
 };
 
 // Run-lifecycle snapshot across sessions (sidebar status dots).

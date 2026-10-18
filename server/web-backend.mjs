@@ -423,14 +423,16 @@ const handlers = {
       } catch {
         continue; // torn line from a concurrent writer: skip
       }
-      // Ring: keep the NEWEST 2000 (see the Rust backend). Breaking at
-      // the cap would pin the oldest and drop the recent end.
-      if (v.type === "message" && v.message) {
-        messages.push(v.message);
-        if (messages.length === 4000) messages.splice(0, 2000);
-      }
+      if (v.type === "message" && v.message) messages.push(v.message);
     }
-    return { messages: messages.length > 2000 ? messages.slice(-2000) : messages };
+    // Windowed like the Rust backend: only the requested newest-first
+    // window crosses the wire; the full parse stays server-side.
+    const total = messages.length;
+    const off = Math.min(p.offset || 0, total);
+    const lim = Math.min(Math.max(p.limit || 60, 1), 500);
+    const end = total - off;
+    const start = Math.max(end - lim, 0);
+    return { messages: messages.slice(start, end), total, has_more: start > 0 };
   },
   read_spawn_transcript: (p) => {
     const runId = p.run_id ?? p.runId ?? "";

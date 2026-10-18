@@ -1671,9 +1671,10 @@ async function maybeAutoName() {
   try {
     const s = await pi.state(cwd);
     if (s.sessionName || !s.sessionFile || autoNamed.has(s.sessionFile)) return;
-    const data = await pi.messages(cwd);
-    const first = (data.messages ?? []).find((m: any) => m.role === "user");
-    const raw = typeof first?.content === "string" ? first.content : "";
+    // The sidebar already scanned this file's first user text
+    // (list_sessions preview window): titling needs no transcript read.
+    const cached = sessCache.find((x) => x.path === s.sessionFile);
+    const raw = typeof cached?.preview === "string" ? cached.preview : "";
     const text = raw.split(/\s+/).slice(0, 6).join(" ").slice(0, 48);
     if (!text) return;
     autoNamed.add(s.sessionFile);
@@ -2072,6 +2073,47 @@ function replayLiveBuffer(): void {
 }
 
 let rebuildGen = 0;
+
+// History windowing: sessions grow without bound, so the view renders the
+// newest window only and pages back on demand. histArr is the accumulated
+// oldest-first window; histPath keys it (file switches reset). Paging is
+// newest-first: offset = already-loaded count.
+const HIST_INITIAL = 60;
+const HIST_PAGE = 100;
+let histPath: string | null = null;
+let histArr: any[] = [];
+let histTotal = 0;
+let histMore = false;
+let histLoading = false;
+
+// Older-page fetch: prepends the next HIST_PAGE messages and re-renders
+// the accumulated window in one pass (fork ids + spawn tracking keep
+// full-load order). Scroll position survives via delta math in renderHist.
+async function showEarlier() {
+  if (histLoading || !histMore || !histPath) return;
+  histLoading = true;
+  refreshActive = true;
+  const b = document.querySelector("#msgs .showearlier") as HTMLButtonElement | null;
+  if (b) { b.disabled = true; b.textContent = "Loading earlier messages…"; }
+  const myGen = ++rebuildGen;
+  const alive = () => myGen === rebuildGen;
+  try {
+    const data = await sessions.read(histPath, HIST_PAGE, histArr.length);
+    if (!alive()) return;
+    histArr = [...(data.messages ?? []), ...histArr];
+    histTotal = data.total ?? histTotal;
+    histMore = !!data.has_more;
+    // The wipe below detaches any live stream preview: drop the reference
+    // (keep streamBuf) so the next delta rebuilds it in the new tree.
+    // Completion still renders authoritatively via replayLiveBuffer.
+    streamDiv = null;
+    await renderHist($("msgs"), true, alive);
+  } catch { /* button stays for retry */ }
+  finally {
+    histLoading = false;
+    if (alive()) refreshActive = false;
+  }
+}
 async function refreshMsgs() {
   const box = $("msgs");
   box.innerHTML = "";
@@ -2087,7 +2129,6 @@ async function refreshMsgs() {
   hideThinking();
   refreshActive = true;
   liveBuffer = [];
-  renderedKeys.clear();
   // Superseded rebuilds abort at the next await: two interleaved rebuilds
   // would otherwise both write #msgs (scrambled order) and both replay
   // the live buffer (duplicates). Only the latest finishes.
@@ -2097,22 +2138,50 @@ async function refreshMsgs() {
     // History comes from the FILE, not the pi process: the file is the
     // truth every writer shares, so a stale, dead, or busy child can
     // never hide a reply from the view again. Fresh chats have no file
-    // yet — those (and only those) read via live RPC.
+    // yet — those (and only those) read via live RPC. Windowed: only the
+    // newest window loads up front (HIST_INITIAL, or the already-loaded
+    // count when refreshing); older pages arrive via "show earlier"
+    // (showEarlier) — never a full-file parse + transfer + render.
     const fp = viewPath ?? curFile;
-    let arr: any[];
+    if (fp !== histPath) { histPath = fp; histArr = []; histTotal = 0; histMore = false; }
+    const want = Math.max(histArr.length, HIST_INITIAL);
     if (fp) {
       try {
-        const data = await sessions.read(fp);
-        arr = data.messages ?? [];
+        const data = await sessions.read(fp, want, 0);
+        histArr = data.messages ?? [];
+        histTotal = data.total ?? histArr.length;
+        histMore = !!data.has_more;
       } catch {
         const data = await pi.messages(cwd);
-        arr = data.messages ?? [];
+        histArr = data.messages ?? [];
+        histTotal = histArr.length;
+        histMore = false;
       }
     } else {
       const data = await pi.messages(cwd);
-      arr = data.messages ?? [];
+      histArr = data.messages ?? [];
+      histTotal = histArr.length;
+      histMore = false;
     }
     if (!alive()) return;
+    await renderHist(box, false, alive);
+  } catch (e: any) {
+    if (!alive()) return;
+    refreshActive = false;
+    replayLiveBuffer();
+    box.appendChild(el("div", "msg sys", esc(`could not load messages: ${e.message ?? e}`)));
+  }
+}
+// Windowed history render: paints the accumulated newest-first window
+// (histArr) in a single pass. keepScroll preserves position when older
+// pages prepend above (scroll-delta math); otherwise jumps to newest.
+async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => boolean) {
+  renderedKeys.clear();
+  const sc = $("scrollwrap");
+  const prevH = sc.scrollHeight, prevT = sc.scrollTop;
+  box.innerHTML = "";
+  const arr = histArr;
+  try {
     // Entry ids so each sent message gets copy + revert (fork) actions.
     // Matched by text (order-independent): index mapping breaks if pi ever
     // returns entries in any other order.
@@ -2190,8 +2259,18 @@ async function refreshMsgs() {
     }
     wireCopy(box);
     markTurnActions();
-    const mp = $("scrollwrap");
-    mp.scrollTop = mp.scrollHeight;
+    // Paging affordance: older history stays on disk until asked for.
+    if (histMore) {
+      const more = Math.max(histTotal - histArr.length, 0);
+      const btn = el("button", "showearlier",
+        esc(more > 0 ? `Show earlier messages (${more} more)` : "Show earlier messages")) as HTMLButtonElement;
+      btn.disabled = histLoading;
+      if (histLoading) btn.textContent = "Loading earlier messages…";
+      else btn.onclick = () => void showEarlier();
+      box.prepend(btn);
+    }
+    if (keepScroll) sc.scrollTop = sc.scrollHeight - prevH + prevT;
+    else sc.scrollTop = sc.scrollHeight;
     if (!alive()) return;
     refreshActive = false;
     // Replay anything that completed during the rebuild window above.

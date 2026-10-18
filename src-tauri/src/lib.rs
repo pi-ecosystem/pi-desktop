@@ -633,13 +633,19 @@ fn delete_session(path: String, session_root: Option<String>) -> Result<(), Stri
     fs::remove_file(&canonical).map_err(|e| e.to_string())
 }
 
-/// Full transcript of ANY session file, parsed straight from disk.
-/// Same shape as get_messages. This is what history rebuilds read:
+/// Windowed transcript of ANY session file, parsed straight from disk.
+/// Same message shape as get_messages. This is what history rebuilds read:
 /// the file is the truth every writer shares, so a stale, dead, or busy
-/// pi process can never hide a reply from the UI again. Torn trailing
+/// pi process can never hide a reply from the view again. Torn trailing
 /// lines (concurrent writers) are skipped, never fatal. Bounded.
+///
+/// Windowing: sessions grow without bound and the view must never parse +
+/// transfer + render the whole thing in one shot. `limit` caps the window
+/// (default 60, max 500), `offset` skips that many NEWEST messages (page
+/// back with offset = already-loaded count). Returns
+/// `{messages, total, has_more}` so the UI can offer "show earlier".
 #[tauri::command]
-fn read_session_messages(path: String, session_root: Option<String>) -> Result<serde_json::Value, String> {
+fn read_session_messages(path: String, session_root: Option<String>, limit: Option<usize>, offset: Option<usize>) -> Result<serde_json::Value, String> {
     let root = session_root.unwrap_or_else(session_root_default);
     let p = PathBuf::from(&path);
     // Containment: the file must live inside the session root.
@@ -653,9 +659,10 @@ fn read_session_messages(path: String, session_root: Option<String>) -> Result<s
         return Err("session file too large (>8MB)".into());
     }
     let text = fs::read_to_string(&canonical).map_err(|e| format!("unreadable session file: {e}"))?;
-    // Ring: keep the NEWEST 2000. Breaking at the cap would pin the
-    // oldest (long sessions would silently lose their recent end).
-    let mut messages = std::collections::VecDeque::with_capacity(2001);
+    // Single pass: collect message payloads oldest-first. The file read +
+    // parse stays server-side (fast even at multi-MB); only the requested
+    // window crosses IPC and reaches the renderer.
+    let mut messages: Vec<serde_json::Value> = vec![];
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -667,14 +674,19 @@ fn read_session_messages(path: String, session_root: Option<String>) -> Result<s
         };
         if v.get("type").and_then(|t| t.as_str()) == Some("message") {
             if let Some(m) = v.get("message").cloned() {
-                messages.push_back(m);
-                if messages.len() > 2000 {
-                    messages.pop_front();
-                }
+                messages.push(m);
             }
         }
     }
-    Ok(serde_json::json!({ "messages": messages }))
+    let total = messages.len();
+    let off = offset.unwrap_or(0).min(total);
+    let lim = limit.unwrap_or(60).clamp(1, 500);
+    // Newest-first paging: window ends `off` before the newest message.
+    let end = total - off;
+    let start = end.saturating_sub(lim);
+    let window = messages[start..end].to_vec();
+    let has_more = start > 0;
+    Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more }))
 }
 
 /// Run-lifecycle snapshot for sidebar status dots: {bootId, runs:
