@@ -112,16 +112,22 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
   } catch {}
   const args = ["--mode", "rpc"];
   if (primer) args.push("--append-system-prompt", primer);
-  // App-owned subagents (see agent/SPAWN.md). Resolved relative to this
-  // file in dev; env override for custom layouts; skipped when absent.
-  let spawnExt =
-    process.env.PI_DESKTOP_SPAWN_EXT ||
-    new URL("../agent/spawn.ts", import.meta.url);
-  try {
-    if (typeof spawnExt !== "string") spawnExt = fileURLToPath(spawnExt);
-    fs.statSync(spawnExt);
-    args.push("--extension", spawnExt);
-  } catch { /* pi runs without spawn */ }
+  // Subagents (pi-spawn package). Resolved relative to this
+  // file in dev (sibling repo); env override for custom layouts;
+  // skipped when absent (pi runs without spawn). Shadow-browser is
+  // NOT injected: it loads from the user's own pi packages.
+  const spawnCandidates = [
+    process.env.PI_DESKTOP_SPAWN_EXT,
+    fileURLToPath(new URL("../../pi-spawn/index.ts", import.meta.url)),
+    fileURLToPath(new URL("../node_modules/pi-spawn/index.ts", import.meta.url)),
+  ].filter(Boolean);
+  for (const spawnExt of spawnCandidates) {
+    try {
+      fs.statSync(spawnExt);
+      args.push("--extension", spawnExt);
+      break;
+    } catch { /* try next candidate */ }
+  }
   if (sessionDir) args.push("--session-dir", sessionDir);
   if (sessionPath) args.push("--session", sessionPath);
   // Marker for boot-time orphan reaping (see reapStaleChildren).

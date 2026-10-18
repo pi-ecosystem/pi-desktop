@@ -642,7 +642,7 @@ function liveToolRow(toolName: string, args: any): HTMLElement {
 
 function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement {
   const role = m.role ?? "unknown";
-  // App-owned subagents (see agent/SPAWN.md): one collapsed card per
+  // Subagents via pi-spawn (see SPAWN.md there): one collapsed card per
   // child — dispatch + result inline, detail behind the click, index in
   // the Agents panel. Tracked here so history rebuilds and live appends
   // share one code path.
@@ -731,7 +731,7 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ---- spawned subagents (app-owned; see agent/SPAWN.md) ----
+// ---- spawned subagents via pi-spawn (see SPAWN.md there) ----
 // Sessions all the way down: the panel is an index over spawn-* messages
 // (dispatch + result inline, detail behind the click). One map, fed by
 // msgNode, so live appends and history rebuilds can never disagree.

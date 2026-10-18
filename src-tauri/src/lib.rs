@@ -22,10 +22,15 @@ use tauri_plugin_global_shortcut::ShortcutState;
 // gambling. web-backend.mjs reads the same file for browser dev.
 const MEDIA_PRIMER: &str = include_str!("../../src/media-primer.md");
 
-// App-owned subagents (see agent/SPAWN.md + agent/spawn.ts): one primitive,
-// sessions all the way down. Resolved at runtime so dev (repo present)
+// Subagents (pi-spawn package — see the pi-spawn repo, SPAWN.md there): one
+// primitive, sessions all the way down. The extension is a single
+// dependency-free TS file, so the installer vendors it as a resource and
+// every pi child loads it via --extension: desktop users get subagents with
+// no `pi install` step. Resolved at runtime so dev (sibling repo present)
 // and installed builds (resource bundle, env override) all work; missing
 // file means the flag is skipped and pi runs without spawn (graceful).
+// Shadow-browser is NOT injected here: it carries heavy native deps
+// (camoufox) and loads from the user's own pi packages instead.
 fn spawn_ext_path(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("PI_DESKTOP_SPAWN_EXT") {
         let pb = PathBuf::from(p);
@@ -35,20 +40,26 @@ fn spawn_ext_path(app: &AppHandle) -> Option<PathBuf> {
     }
     // Installed bundle: Tauri `bundle.resources` places it here.
     if let Ok(rd) = app.path().resource_dir() {
-        let bundled = rd.join("agent").join("spawn.ts");
+        let bundled = rd.join("pi-spawn").join("index.ts");
         if bundled.is_file() {
             return Some(bundled);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Dev layout: src-tauri/target/<profile>/pi-desktop → repo/agent/spawn.ts
-            let dev = dir.join("../../../agent/spawn.ts");
-            if dev.is_file() {
-                return Some(dev);
+            // Dev layout: src-tauri/target/<profile>/pi-desktop → sibling
+            // pi-spawn repo, or file: dep under the desktop node_modules.
+            for rel in [
+                "../../../../pi-spawn/index.ts",
+                "../../../node_modules/pi-spawn/index.ts",
+            ] {
+                let dev = dir.join(rel);
+                if dev.is_file() {
+                    return Some(dev);
+                }
             }
-            // Installed layout: <dir>/agent/spawn.ts next to the binary.
-            let next = dir.join("agent/spawn.ts");
+            // Installed layout: <dir>/pi-spawn/index.ts next to the binary.
+            let next = dir.join("pi-spawn").join("index.ts");
             if next.is_file() {
                 return Some(next);
             }

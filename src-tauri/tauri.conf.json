@@ -47,7 +47,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": ["../agent/spawn.ts"],
+    "resources": ["../../pi-spawn/index.ts"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

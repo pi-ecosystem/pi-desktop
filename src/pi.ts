@@ -234,14 +234,14 @@ export const runStates = {
 };
 
 // Process liveness probe for subagent rows orphaned by a crash/reboot
-// (agent/SPAWN.md). Same command name as the Tauri backend. Only ever
+// (pi-spawn/SPAWN.md). Same command name as the Tauri backend. Only ever
 // marks rows dead (high confidence); a live answer changes nothing, so
 // pid reuse can at worst leave a row "running", never kill a live one.
 export const procAlive = {
   check: (pids: number[]): Promise<boolean[]> => invoke("pids_alive", { pids }),
 };
 
-// Transcript of one spawned subagent (agent/SPAWN.md). Scoped server-side
+// Transcript of one spawned subagent (pi-spawn/SPAWN.md). Scoped server-side
 // to the spawn-sessions root. Returns {messages} in get_messages shape.
 export const spawnTranscript = {
   read: (runId: string): Promise<{ messages: any[] }> =>
