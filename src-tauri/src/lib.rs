@@ -640,12 +640,15 @@ fn delete_session(path: String, session_root: Option<String>) -> Result<(), Stri
 /// lines (concurrent writers) are skipped, never fatal. Bounded.
 ///
 /// Windowing: sessions grow without bound and the view must never parse +
-/// transfer + render the whole thing in one shot. `limit` caps the window
-/// (default 60, max 500), `offset` skips that many NEWEST messages (page
-/// back with offset = already-loaded count). Returns
-/// `{messages, total, has_more}` so the UI can offer "show earlier".
+/// transfer + render the whole thing in one shot. Windows are BYTE-budgeted
+/// (message counts lie: one tool result can outweigh a thousand chats).
+/// `max_bytes` caps the window (default 256KB, clamped 4KB–8MB),
+/// `offset` skips that many NEWEST messages (page back with offset =
+/// already-loaded count). Returns `{messages, total, has_more, bytes}` so
+/// the UI can offer "show earlier". At least one message always returns
+/// (no empty-window spin when a single message exceeds the budget).
 #[tauri::command]
-fn read_session_messages(path: String, session_root: Option<String>, limit: Option<usize>, offset: Option<usize>) -> Result<serde_json::Value, String> {
+fn read_session_messages(path: String, session_root: Option<String>, max_bytes: Option<usize>, offset: Option<usize>) -> Result<serde_json::Value, String> {
     let root = session_root.unwrap_or_else(session_root_default);
     let p = PathBuf::from(&path);
     // Containment: the file must live inside the session root.
@@ -683,13 +686,25 @@ fn read_session_messages(path: String, session_root: Option<String>, limit: Opti
     }
     let total = messages.len();
     let off = offset.unwrap_or(0).min(total);
-    let lim = limit.unwrap_or(60).clamp(1, 500);
+    let budget = max_bytes.unwrap_or(256 * 1024).clamp(4 * 1024, 8 * 1024 * 1024);
     // Newest-first paging: window ends `off` before the newest message.
+    // Spend the byte budget walking back (sizes are serialized lengths —
+    // honest transfer bytes); always take ≥1 so oversized singletons
+    // can't trap the pager on an empty window with has_more set.
     let end = total - off;
-    let start = end.saturating_sub(lim);
+    let mut acc: usize = 0;
+    let mut start = end;
+    while start > 0 {
+        let size = serde_json::to_string(&messages[start - 1]).map(|s| s.len()).unwrap_or(0);
+        if acc + size > budget && start < end {
+            break;
+        }
+        acc += size;
+        start -= 1;
+    }
     let window = messages[start..end].to_vec();
     let has_more = start > 0;
-    Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more }))
+    Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more, "bytes": acc }))
 }
 
 /// Run-lifecycle snapshot for sidebar status dots: {bootId, runs:

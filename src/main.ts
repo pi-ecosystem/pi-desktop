@@ -2075,13 +2075,16 @@ function replayLiveBuffer(): void {
 let rebuildGen = 0;
 
 // History windowing: sessions grow without bound, so the view renders the
-// newest window only and pages back on demand. histArr is the accumulated
-// oldest-first window; histPath keys it (file switches reset). Paging is
-// newest-first: offset = already-loaded count.
-const HIST_INITIAL = 60;
-const HIST_PAGE = 100;
+// newest window only and pages back on demand. Windows are BYTE-budgeted
+// (counts lie: one tool result can outweigh a thousand chats). histArr is
+// the accumulated oldest-first window, histBytes its measured size;
+// histPath keys both (file switches reset). Paging offset stays a plain
+// newest-first message count (offset = already-loaded count).
+const HIST_INITIAL_BYTES = 256 * 1024;
+const HIST_PAGE_BYTES = 512 * 1024;
 let histPath: string | null = null;
 let histArr: any[] = [];
+let histBytes = 0;
 let histTotal = 0;
 let histMore = false;
 let histLoading = false;
@@ -2115,11 +2118,17 @@ async function showEarlier() {
   const myGen = ++rebuildGen;
   const alive = () => myGen === rebuildGen;
   try {
-    const data = await sessions.read(histPath, HIST_PAGE, histArr.length);
+    const data = await sessions.read(histPath, HIST_PAGE_BYTES, histArr.length);
     if (!alive()) return;
-    histArr = [...(data.messages ?? []), ...histArr];
+    // Overlap guard: the file can grow between pages (live run); offset
+    // counts from newest so growth shifts indices. msgKey-dedupe (same
+    // keys as the live replay path) keeps the prepend exact.
+    const seen = new Set(histArr.map((m) => msgKey(m)));
+    const fresh = (data.messages ?? []).filter((m: any) => !seen.has(msgKey(m)));
+    histArr = [...fresh, ...histArr];
     histTotal = data.total ?? histTotal;
     histMore = !!data.has_more;
+    histBytes += data.bytes ?? 0;
     // The wipe below detaches any live stream preview: drop the reference
     // (keep streamBuf) so the next delta rebuilds it in the new tree.
     // Completion still renders authoritatively via replayLiveBuffer.
@@ -2157,30 +2166,34 @@ async function refreshMsgs() {
     // History comes from the FILE, not the pi process: the file is the
     // truth every writer shares, so a stale, dead, or busy child can
     // never hide a reply from the view again. Fresh chats have no file
-    // yet — those (and only those) read via live RPC. Windowed: only the
-    // newest window loads up front (HIST_INITIAL, or the already-loaded
-    // count when refreshing); older pages arrive via "show earlier"
-    // (showEarlier) — never a full-file parse + transfer + render.
+    // yet — those (and only those) read via live RPC. Windowed by bytes:
+    // only the newest window loads up front (HIST_INITIAL_BYTES, or the
+    // already-loaded size when refreshing); older pages arrive via
+    // "show earlier" (showEarlier) — never a full-file parse + transfer
+    // + render.
     const fp = viewPath ?? curFile;
-    if (fp !== histPath) { histPath = fp; histArr = []; histTotal = 0; histMore = false; }
-    const want = Math.max(histArr.length, HIST_INITIAL);
+    if (fp !== histPath) { histPath = fp; histArr = []; histTotal = 0; histMore = false; histBytes = 0; }
+    const want = Math.max(histBytes, HIST_INITIAL_BYTES);
     if (fp) {
       try {
         const data = await sessions.read(fp, want, 0);
         histArr = data.messages ?? [];
         histTotal = data.total ?? histArr.length;
         histMore = !!data.has_more;
+        histBytes = data.bytes ?? 0;
       } catch {
         const data = await pi.messages(cwd);
         histArr = data.messages ?? [];
         histTotal = histArr.length;
         histMore = false;
+        histBytes = 0;
       }
     } else {
       const data = await pi.messages(cwd);
       histArr = data.messages ?? [];
       histTotal = histArr.length;
       histMore = false;
+      histBytes = 0;
     }
     if (!alive()) return;
     // Fork ids need a live proc; a cold switch boots one (~1s+). Race a

@@ -427,14 +427,20 @@ const handlers = {
       }
       if (v.type === "message" && v.message) messages.push(v.message);
     }
-    // Windowed like the Rust backend: only the requested newest-first
-    // window crosses the wire; the full parse stays server-side.
+    // Windowed like the Rust backend: byte-budgeted newest-first window.
+    // Only the window crosses the wire; the full parse stays server-side.
     const total = messages.length;
     const off = Math.min(p.offset || 0, total);
-    const lim = Math.min(Math.max(p.limit || 60, 1), 500);
+    const budget = Math.min(Math.max(p.maxBytes || 262144, 4096), 8388608);
     const end = total - off;
-    const start = Math.max(end - lim, 0);
-    return { messages: messages.slice(start, end), total, has_more: start > 0 };
+    // Always take ≥1 so an oversized singleton can't trap the pager.
+    let acc = 0, start = end;
+    while (start > 0) {
+      const size = JSON.stringify(messages[start - 1]).length;
+      if (acc + size > budget && start < end) break;
+      acc += size; start--;
+    }
+    return { messages: messages.slice(start, end), total, has_more: start > 0, bytes: acc };
   },
   read_spawn_transcript: (p) => {
     const runId = p.run_id ?? p.runId ?? "";
