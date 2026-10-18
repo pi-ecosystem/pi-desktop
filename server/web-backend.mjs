@@ -412,7 +412,9 @@ const handlers = {
     const real = fs.realpathSync(resolved);
     if (!real.startsWith(realRoot)) throw new Error("refusing to read outside session dir");
     const st = fs.statSync(real);
-    if (st.size > 8 * 1024 * 1024) throw new Error("session file too large (>8MB)");
+    // Generous cap, same reasoning as the Rust backend: only the window
+    // crosses the wire, so large files stay windowed, not full-loaded.
+    if (st.size > 64 * 1024 * 1024) throw new Error("session file too large (>64MB)");
     const messages = [];
     for (const line of fs.readFileSync(real, "utf8").split("\n")) {
       const t = line.trim();

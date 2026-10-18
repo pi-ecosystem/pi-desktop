@@ -655,8 +655,11 @@ fn read_session_messages(path: String, session_root: Option<String>, limit: Opti
         return Err("refusing to read outside session dir".into());
     }
     let meta = fs::metadata(&canonical).map_err(|e| format!("unreadable session file: {e}"))?;
-    if meta.len() > 8 * 1024 * 1024 {
-        return Err("session file too large (>8MB)".into());
+    // Generous cap: the full parse stays server-side (fast even at tens of
+    // MB) and only the requested window crosses IPC, so large files stay
+    // on the windowed disk path instead of falling back to a full-RPC load.
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err("session file too large (>64MB)".into());
     }
     let text = fs::read_to_string(&canonical).map_err(|e| format!("unreadable session file: {e}"))?;
     // Single pass: collect message payloads oldest-first. The file read +
