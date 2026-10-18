@@ -2086,6 +2086,23 @@ let histTotal = 0;
 let histMore = false;
 let histLoading = false;
 
+// Fork entry ids for copy/revert buttons. Needs a live proc: fails fast
+// with no proc, waits out a cold boot (~1s+). Fills the passed map in
+// place (shared with the background repaint). Never rejects.
+async function fetchForkMapInto(map: Map<string, string[]>): Promise<void> {
+  try {
+    const fm: any = await pi.forkMessages(cwd);
+    for (const e of fm.messages ?? []) {
+      if (e?.entryId && typeof e?.text === "string") {
+        const k = e.text;
+        if (!map.has(k)) map.set(k, []);
+        map.get(k)!.push(e.entryId);
+      }
+    }
+  } catch { /* forks unavailable; buttons fill on a later refresh */ }
+}
+let lastForkMap = new Map<string, string[]>();
+
 // Older-page fetch: prepends the next HIST_PAGE messages and re-renders
 // the accumulated window in one pass (fork ids + spawn tracking keep
 // full-load order). Scroll position survives via delta math in renderHist.
@@ -2107,7 +2124,7 @@ async function showEarlier() {
     // (keep streamBuf) so the next delta rebuilds it in the new tree.
     // Completion still renders authoritatively via replayLiveBuffer.
     streamDiv = null;
-    await renderHist($("msgs"), true, alive);
+    await renderHist($("msgs"), true, alive, lastForkMap);
   } catch { /* button stays for retry */ }
   finally {
     histLoading = false;
@@ -2116,7 +2133,9 @@ async function showEarlier() {
 }
 async function refreshMsgs() {
   const box = $("msgs");
-  box.innerHTML = "";
+  // No wipe here: the old view stays visible until the new window is
+  // fetched (tens of ms from disk), then renderHist swaps it in. Wiping
+  // first is what made every switch flash blank through the whole load.
   spawns.clear();
   // Authoritative wipe: drop live partials too (stream preview, partial
   // Activity, half-streamed thought). Post-wipe deltas rebuild cleanly;
@@ -2164,7 +2183,17 @@ async function refreshMsgs() {
       histMore = false;
     }
     if (!alive()) return;
-    await renderHist(box, false, alive);
+    // Fork ids need a live proc; a cold switch boots one (~1s+). Race a
+    // short timeout so the transcript paints from disk immediately: warm
+    // procs answer in ms (single pass, buttons included), cold ones
+    // repaint with buttons when the fetch lands (scroll preserved).
+    const forkByText = new Map<string, string[]>();
+    lastForkMap = forkByText;
+    const forkP = fetchForkMapInto(forkByText);
+    const forkFast = await Promise.race([forkP.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 250))]);
+    if (!alive()) return;
+    await renderHist(box, false, alive, forkByText);
+    if (!forkFast) void forkP.then(() => { if (alive()) void renderHist(box, true, alive, forkByText); });
   } catch (e: any) {
     if (!alive()) return;
     refreshActive = false;
@@ -2175,7 +2204,7 @@ async function refreshMsgs() {
 // Windowed history render: paints the accumulated newest-first window
 // (histArr) in a single pass. keepScroll preserves position when older
 // pages prepend above (scroll-delta math); otherwise jumps to newest.
-async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => boolean) {
+async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => boolean, forkMap: Map<string, string[]>) {
   renderedKeys.clear();
   const sc = $("scrollwrap");
   const prevH = sc.scrollHeight, prevT = sc.scrollTop;
@@ -2184,18 +2213,10 @@ async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => bo
   try {
     // Entry ids so each sent message gets copy + revert (fork) actions.
     // Matched by text (order-independent): index mapping breaks if pi ever
-    // returns entries in any other order.
-    let forkByText = new Map<string, string[]>();
-    try {
-      const fm: any = await pi.forkMessages(cwd);
-      for (const e of fm.messages ?? []) {
-        if (e?.entryId && typeof e?.text === "string") {
-          const k = e.text;
-          if (!forkByText.has(k)) forkByText.set(k, []);
-          forkByText.get(k)!.push(e.entryId);
-        }
-      }
-    } catch { /* forks unavailable */ }
+    // returns entries in any other order. Cloned per render: takeForkId
+    // consumes queues, and one map serves first paint + background repaint.
+    const forkByText = new Map<string, string[]>();
+    for (const [k, v] of forkMap) forkByText.set(k, [...v]);
     if (!alive()) return;
     const takeForkId = (text: string): string | undefined => {
       const q = forkByText.get(text);
@@ -2803,25 +2824,36 @@ async function switchSession(path: string) {
   const key = fileToKey.get(path) ?? path;
   try {
     resetRunState();
-    await ensure(cwd, key, path);
+    // Paint-first order: history reads straight from disk (no proc
+    // needed), so the transcript lands in ~tens of ms. Booting a cold
+    // `pi --mode rpc` child costs ~1s+ of extension loading — awaiting it
+    // before the first paint is what made every cold switch stare blank.
+    // Proc-dependent bits (fork buttons on a cold open, title, run dots,
+    // stream reseed) fill in right after, same relative order as before:
+    // rebuild, then state, then sync — so dots/stream re-arm correctly.
+    // ensure failing now leaves a readable (if idle) view, not the old
+    // session: reselect to retry the proc.
     setKey(key);
     viewKey = key;
     viewPath = path;
     curFile = path;
+    refreshSessions();
+    refreshCommands().catch(() => {});
+    await refreshMsgs();
+    await ensure(cwd, key, path);
+    await refreshState();
+    // AFTER the rebuild: re-arming here is the only order that survives.
+    // Returning to a still-running session shows its thinking indicator
+    // again, with the live stream continuing underneath.
+    await syncRunFlag();
   } catch (e: any) {
     toastErr(`switch failed: ${e.message ?? e}`);
+    // View already moved (paint-first): at least leave the header naming
+    // the session actually shown. Reselect retries the proc.
+    const cached = sessCache.find((x) => x.path === path);
+    if (cached) $("sesstitle").textContent = titleText(cached);
     return;
   }
-  // AWAITED deliberately: refreshMsgs wipes #msgs, and syncRunFlag's
-  // dots + stream reseed must land AFTER the rebuild. Unawaited, the two
-  // race: dots get suppressed by refreshActive and never re-arm, the
-  // seeded stream lands mid-list, and the returned-to run looks dead.
-  // (That was the send+switch symptom: no thinking, no live response.)
-  await refreshAll(false);
-  // AFTER the rebuild: re-arming here is the only order that survives.
-  // Returning to a still-running session shows its thinking indicator
-  // again, with the live stream continuing underneath.
-  await syncRunFlag();
 }
 
 // If the session we just opened is still running server-side, reflect it
