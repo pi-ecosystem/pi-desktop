@@ -1244,6 +1244,8 @@ function appendMsgList(
     if (m.role === "assistant") run = null;
     shown++;
   }
+  // Thought-only containers never earn a dropdown: unwrap them into flow.
+  box.querySelectorAll("details.runact").forEach((r) => maybeUnwrapRun(r as HTMLElement));
   return shown;
 }
 
@@ -1953,10 +1955,21 @@ function finishRun() {
   pin();
   markTurnActions();
   if (lastRun && runT0 > 0) {
-    const sum = lastRun.querySelector(":scope > summary");
+    // Thought-only tail: unwrap into flow instead of labeling a box.
+    maybeUnwrapRun(lastRun);
+    const sum = lastRun.isConnected ? lastRun.querySelector(":scope > summary") : null;
     if (sum) {
       const secs = ((Date.now() - runT0) / 1000).toFixed(1);
-      sum.innerHTML = `Activity · ${secs}s${runTok ? ` · ${fmtTok(runTok)} tokens` : ""} ${CHEV}`;
+      const label = (((lastRun as any)._label as string) || "Activity");
+      // "Ran N commands" already counts the tools — don't append a
+      // redundant "· N tools" after it.
+      const isRan = label.startsWith("Ran ");
+      const nTools = isRan ? 0 : lastRun.querySelectorAll(":scope .tgbody > details.toolrow").length;
+      const nFail = lastRun.querySelectorAll(":scope .tgbody .tstat.err").length;
+      sum.innerHTML = `<span class="tgsum-txt">${esc(label)}` +
+        `${nTools ? ` · ${nTools} tool${nTools === 1 ? "" : "s"}` : ""}` +
+        ` · ${secs}s${runTok ? ` · ${fmtTok(runTok)} tokens` : ""}</span>` +
+        `${nFail ? ` <span class="tstat err">· ${nFail} failed</span>` : ""} ${CHEV}`;
     }
     lastRun = null;
   }
@@ -2197,7 +2210,53 @@ function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement)
     box.appendChild(run);
   }
   run.querySelector(".tgbody")!.appendChild(item);
+  // Claude-style: the collapsed container says what happened instead of
+  // repeating "Activity" — a thought's first sentence, or (for a pure
+  // burst of tool calls with no thinking) an aggregate "Ran N commands".
+  // Raw commands never become the header.
+  refreshRunLabel(run);
   return run;
+}
+
+// Recompute a runact container's collapsed label from its whole body.
+// Pure tool bursts aggregate ("Ran 4 commands"); anything with thinking
+// leads with the latest thought's first sentence.
+function refreshRunLabel(run: HTMLElement): void {
+  try {
+    const body = run.querySelector(":scope > .tgbody");
+    if (!body) return;
+    const tools = body.querySelectorAll(":scope > details.toolrow").length;
+    const thoughts: string[] = [];
+    body.querySelectorAll(":scope > div.runthought").forEach((d) => {
+      const t = (d.textContent ?? "").replace(/\s+/g, " ").trim();
+      if (t && t !== "Thought") thoughts.push(t.split(/[.?!]\s/)[0].slice(0, 110));
+    });
+    let base = "";
+    if (tools > 0 && thoughts.length === 0) base = `Ran ${tools} command${tools === 1 ? "" : "s"}`;
+    else if (thoughts.length) base = thoughts[thoughts.length - 1];
+    else return;
+    (run as any)._label = base;
+    const sum = run.querySelector(":scope > summary");
+    if (sum) sum.innerHTML = `<span class="tgsum-txt">${esc(base)}</span> ${CHEV}`;
+  } catch { /* keep previous label */ }
+}
+
+// A dropdown with no tool rows behind it is chrome around plain musing —
+// unwrap it into flow text. Thought-only bursts ("Clarifying capabilities…"
+// with nothing run) never earn a box; the dim runthought style already
+// marks them as asides.
+function maybeUnwrapRun(run: HTMLElement): void {
+  try {
+    if (run.querySelector(":scope > .tgbody > details.toolrow")) return;
+    const body = run.querySelector(":scope > .tgbody");
+    const keep: Node[] = [];
+    body?.childNodes.forEach((n) => {
+      const t = (n.textContent ?? "").replace(/\s+/g, " ").trim();
+      if (t && t !== "Thought") keep.push(n);
+    });
+    if (keep.length) run.replaceWith(...keep);
+    else run.remove();
+  } catch { /* leave boxed */ }
 }
 
 function thoughtDiv(text: string): HTMLElement {

@@ -51,6 +51,30 @@ function esc(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+// Long raw URLs as link text are the #1 blob-maker (amazon slugs wrapping
+// 2 lines in blue). Display host + trimmed path, keep the full URL in
+// href (+title on hover). Short/human link text passes through untouched.
+function shortUrlDisplay(escapedUrl: string): string {
+  const raw = escapedUrl.replace(/&amp;/g, "&");
+  const hadExtra = /[?#]/.test(raw);
+  // Query strings and hashes are tracking/session noise (?ie=UTF8&node=…):
+  // the path already identifies the page. Display host+path only.
+  let d = raw.replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[?#]/, 1)[0];
+  // Search/filter pages live in the query string (?k=asus+vivobook…): a bare
+  // stub path (amazon.in/s) alone says nothing, so hint that more follows.
+  if (hadExtra && /^[^/]+\/[^/]{0,2}\/?$/.test(d)) d = d.replace(/\/?$/, "/") + "?\u2026";
+  else if (d.length > 44) d = d.slice(0, 43) + "\u2026";
+  return esc(d);
+}
+function linkTag(hrefEscaped: string, textEscaped: string): string {
+  const rawText = textEscaped.replace(/&amp;/g, "&");
+  const isUrl = /^https?:\/\//.test(rawText);
+  const long = rawText.length > 44;
+  const display = isUrl && long ? shortUrlDisplay(textEscaped) : textEscaped;
+  const title = isUrl && long ? ` title="${hrefEscaped}"` : "";
+  return `<a href="${hrefEscaped}" target="_blank" rel="noreferrer"${title}>${display}</a>`;
+}
+
 // ---- media embeds (images + video) ----
 
 const IMAGE_EXTS = new Set([
@@ -426,7 +450,7 @@ function inline(s: string): string {
   h = h.replace(/(^|[^*\w])\*([^\s*][^*\n]*?)\*(?![*\w])/g, "$1<em>$2</em>");
   // Link URLs may contain balanced parens (Wikipedia…): match one level
   // instead of stopping at the first `)`.
-  h = h.replace(/\[([^\]]+)\]\((https?:[^()\s]*(?:\([^)]*\)[^()\s]*)*)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  h = h.replace(/\[([^\]]+)\]\((https?:[^()\s]*(?:\([^)]*\)[^()\s]*)*)\)/g, (_m, text, url) => linkTag(url, text));
   // Bare URLs → links, but never inside code spans, existing anchors, or
   // already-built media figures (their src="..." must not be linkified).
   h = h.split(/(\u0001[\s\S]*?\u0002|\u0005\d+\u0006|<a\b.*?<\/a>|<figure\b.*?<\/figure>)/g).map((part) => {
@@ -441,7 +465,7 @@ function inline(s: string): string {
       const m = url.match(/^(.*?)([.,;:!?)\]]+)$/);
       const clean = m ? m[1] : url;
       const trail = m ? m[2] : "";
-      return `<a href="${clean}" target="_blank" rel="noreferrer">${clean}</a>${trail}`;
+      return `${linkTag(clean, clean)}${trail}`;
     });
   }).join("");
   h = h.replace(/\u0001([\s\S]*?)\u0002/g, "<code>$1</code>");

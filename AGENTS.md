@@ -36,6 +36,11 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 
 - `PI_BIN` — pi binary path (default: PATH lookup, `~/.pi/agent/bin/pi`)
 - `PI_DESKTOP_SPAWN_EXT` — spawn extension path override
+- `PI_DESKTOP_APP_PROMPT` — prompt file override: path to a replacement for
+  the bundled `src/system-prompt.md`, or `0`/`off` to skip it. The effective
+  text is passed to pi children via `--append-system-prompt` plus
+  `PI_DESKTOP_APP_PROMPT_TEXT` env so pi-spawn grandchildren re-append it.
+  Prompt changes edit the md file only — never the backends.
 - `PORT` — web-backend port (default 1423)
 
 ## Process hygiene

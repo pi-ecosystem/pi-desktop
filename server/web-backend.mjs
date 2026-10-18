@@ -104,14 +104,28 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
     procs.delete(pkey);
   }
   fs.mkdirSync(cwd, { recursive: true });
-  // Same media primer as the Tauri backend (see src/media-primer.md):
-  // capability + agent knowledge ship together, no skill install step.
-  let primer = null;
+  // Bundled app prompt (src/system-prompt.md): capability + formatting
+  // knowledge ship as one unit, no skill install step. THE single prompt
+  // call site — prompt changes edit the md file only, never this code.
+  // Override: PI_DESKTOP_APP_PROMPT=/path/to/file.md, disable: =0/off.
+  // The effective text also rides PI_DESKTOP_APP_PROMPT_TEXT down to
+  // pi-spawn grandchildren (CLI flags don't propagate; env does).
+  let prompt = null;
   try {
-    primer = fs.readFileSync(new URL("../src/media-primer.md", import.meta.url), "utf8");
+    prompt = fs.readFileSync(new URL("../src/system-prompt.md", import.meta.url), "utf8");
   } catch {}
+  {
+    const ov = process.env.PI_DESKTOP_APP_PROMPT;
+    if (ov === "0" || (ov && ov.toLowerCase() === "off")) prompt = null;
+    else if (ov) {
+      try {
+        const s = fs.readFileSync(ov, "utf8");
+        if (s.trim()) prompt = s;
+      } catch { /* bad override path: fall back to bundled */ }
+    }
+  }
   const args = ["--mode", "rpc"];
-  if (primer) args.push("--append-system-prompt", primer);
+  if (prompt && prompt.trim()) args.push("--append-system-prompt", prompt);
   // Subagents (pi-spawn) load from the user's own pi packages, exactly
   // like shadow-browser — never injected here. A vendored --extension copy
   // + the user's own install of the same extension is a FATAL tool
@@ -135,7 +149,12 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
   // resolved path down; an explicit PI_BIN override passes through
   // unchanged (piBin() returns it first). Mirrors the Tauri backend.
   // Marker for boot-time orphan reaping (see reapStaleChildren).
-  const child = spawn(bin, args, { cwd, stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, PI_DESKTOP_CHILD: "1", PI_BIN: process.env.PI_BIN || bin } });
+  // PI_DESKTOP_APP_PROMPT_TEXT transports the effective prompt text down
+  // to pi-spawn grandchildren (mirrors lib.rs); absent when disabled.
+  const childEnv = { ...process.env, PI_DESKTOP_CHILD: "1", PI_BIN: process.env.PI_BIN || bin };
+  if (prompt && prompt.trim()) childEnv.PI_DESKTOP_APP_PROMPT_TEXT = prompt;
+  else delete childEnv.PI_DESKTOP_APP_PROMPT_TEXT;
+  const child = spawn(bin, args, { cwd, stdio: ["pipe", "pipe", "ignore"], env: childEnv });
   const entry = { child, alive: true };
   child.on("exit", () => (entry.alive = false));
   child.on("error", () => (entry.alive = false));

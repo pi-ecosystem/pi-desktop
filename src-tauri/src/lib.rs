@@ -14,13 +14,26 @@ use base64::Engine as _;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
 
-// Media primer: what the desktop chat can render (mirrors src/md.ts —
-// keep the extension lists and syntax forms in sync). Embedded at
-// compile time so installed builds carry it with no repo present, and
-// appended to every pi child's system prompt: capability and agent
-// knowledge ship as one unit, no separate skill install, no trigger
-// gambling. web-backend.mjs reads the same file for browser dev.
-const MEDIA_PRIMER: &str = include_str!("../../src/media-primer.md");
+// Bundled app prompt (src/system-prompt.md): what the transcript can render
+// plus how to format answers for it. Embedded at compile time so installed
+// builds carry it with no repo present. THE single prompt call site — prompt
+// changes edit the md file only, never this code. Override with
+// PI_DESKTOP_APP_PROMPT=/path/to/file.md, disable with PI_DESKTOP_APP_PROMPT=0.
+// The effective text also rides PI_DESKTOP_APP_PROMPT_TEXT down to pi-spawn
+// grandchildren (CLI flags don't propagate; env does). web-backend.mjs
+// mirrors this exactly for browser dev.
+const SYSTEM_PROMPT: &str = include_str!("../../src/system-prompt.md");
+
+fn bundled_prompt_text() -> Option<String> {
+    match std::env::var("PI_DESKTOP_APP_PROMPT") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => None,
+        Ok(p) => match fs::read_to_string(&p) {
+            Ok(s) if !s.trim().is_empty() => Some(s),
+            _ => Some(SYSTEM_PROMPT.to_string()),
+        },
+        Err(_) => Some(SYSTEM_PROMPT.to_string()),
+    }
+}
 
 // Subagents (pi-spawn package) load from the USER's own pi packages
 // (`pi install git:github.com/pi-ecosystem/pi-spawn`), exactly like
@@ -210,12 +223,18 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     cmd.env("PI_BIN", &bin);
     cmd.arg("--mode")
         .arg("rpc")
-        .arg("--append-system-prompt")
-        .arg(MEDIA_PRIMER)
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Single bundled prompt (mirrors web-backend.mjs): capability primer +
+    // formatting guide, one flag. Grandchild subagents don't inherit CLI
+    // flags, so the effective text also rides the env down for pi-spawn
+    // to re-append (absent when disabled via PI_DESKTOP_APP_PROMPT=0).
+    if let Some(prompt) = bundled_prompt_text() {
+        cmd.arg("--append-system-prompt").arg(&prompt);
+        cmd.env("PI_DESKTOP_APP_PROMPT_TEXT", prompt);
+    }
     // Spawn extension only on explicit PI_DESKTOP_SPAWN_EXT override;
     // normally subagents come from the user's own pi packages.
     if let Some(ext) = spawn_ext_path(&app) {
