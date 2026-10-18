@@ -45,12 +45,9 @@
           </button>
           <span id="sesstitle">—</span>
           <span class="hsp"></span>
-          <button id="diffbtn" class="iconbtn" title="Show file changes">
+          <button id="panebtn" class="iconbtn" title="Show side panel">
             <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="3" y="4" width="14" height="12" rx="2" stroke="currentColor" stroke-width="1.5"/><line x1="10" y1="4" x2="10" y2="16" stroke="currentColor" stroke-width="1.5"/></svg>
-          </button>
-          <button id="agentsbtn" class="iconbtn" title="Show subagents">
-            <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="7" cy="7" r="3" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="8.5" r="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M2.5 16c.6-2.6 2.4-4 4.5-4s3.9 1.4 4.5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M12.5 12.6c2 .2 3.4 1.4 3.9 3.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-            <span id="agentsbadge" class="hidden"></span>
+            <span id="panebadge" class="hidden"></span>
           </button>
         </header>
         <div id="scrollwrap">
@@ -94,6 +91,7 @@
         <div id="sidetabs">
           <button id="tabchanges" class="sidetab" data-tab="changes" title="Show file changes">Changes</button>
           <button id="tabagents" class="sidetab" data-tab="agents" title="Show subagents">Subagents</button>
+          <button id="tabprocs" class="sidetab" data-tab="procs" title="Show background processes">Processes</button>
           <span class="hsp"></span>
           <button id="sideclose" class="iconbtn" title="Close panel">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -111,6 +109,13 @@
           </div>
           <div id="agentsbody"></div>
           <div id="agenttranscript"></div>
+        </div>
+        <div id="procswrap" class="hidden">
+          <div id="procsbar">
+            <span id="procstitle">Processes</span>
+          </div>
+          <div id="procsbody"></div>
+          <div id="proctranscript"></div>
         </div>
       </aside>
     </div>

@@ -429,7 +429,19 @@ const handlers = {
       } catch {
         continue; // torn line from a concurrent writer: skip
       }
-      if (v.type === "message" && v.message) messages.push(v.message);
+      if (v.type === "message" && v.message) messages.push([v.message, false]);
+      else if (v.type === "custom_message") {
+        // Spawn cards/notes: shape like live RPC so rebuilds track and
+        // render exactly what live did (mirrors the Rust backend).
+        // Customs ALWAYS ride along (own cap below): the side panels
+        // are an index over them — paging them out wipes the panels on
+        // every revisit of a long session.
+        const m = { role: "custom" };
+        for (const k of ["customType", "content", "display", "details"]) {
+          if (v[k] !== undefined) m[k] = v[k];
+        }
+        messages.push([m, true]);
+      }
     }
     // Windowed like the Rust backend: byte-budgeted newest-first window.
     // Only the window crosses the wire; the full parse stays server-side.
@@ -445,16 +457,39 @@ const handlers = {
     // toward the stop condition; `bytes` still reports actual transfer
     // size (refreshMsgs re-reads by it). Mirrors the Tauri backend.
     const MSG_BUDGET_CAP = 32 * 1024;
-    let acc = 0, bytes = 0, start = end;
+    const CUSTOM_BUDGET = 512 * 1024;
+    const selected = new Array(end).fill(false);
+    let acc = 0, customAcc = 0, bytes = 0, start = end;
+    // Pass 1: newest-first budget walk over regulars; customs encountered
+    // ride free under their own cap.
     while (start > 0) {
-      const size = JSON.stringify(messages[start - 1]).length;
+      const [m, isCustom] = messages[start - 1];
+      const size = JSON.stringify(m).length;
+      if (isCustom) {
+        if (customAcc + size <= CUSTOM_BUDGET) {
+          customAcc += size; bytes += size; selected[start - 1] = true;
+        }
+        start--;
+        continue;
+      }
       if (acc + Math.min(size, MSG_BUDGET_CAP) > budget && start < end) break;
-      acc += Math.min(size, MSG_BUDGET_CAP); bytes += size; start--;
+      acc += Math.min(size, MSG_BUDGET_CAP); bytes += size; selected[start - 1] = true; start--;
     }
-    return { messages: messages.slice(start, end), total, has_more: start > 0, bytes };
+    // Pass 2: the walk stops at the first over-budget regular, stranding
+    // older customs. Sweep them up so the panels' index stays complete.
+    if (start > 0) {
+      for (let i = start - 1; i >= 0; i--) {
+        if (!messages[i][1]) continue;
+        const size = JSON.stringify(messages[i][0]).length;
+        if (customAcc + size <= CUSTOM_BUDGET) {
+          customAcc += size; bytes += size; selected[i] = true;
+        }
+      }
+    }
+    const window = messages.slice(0, end).filter((_, i) => selected[i]).map(([m]) => m);
+    return { messages: window, total, has_more: start > 0, bytes };
   },
-  read_spawn_transcript: (p) => {
-    const runId = p.run_id ?? p.runId ?? "";
+  read_spawn_transcript: (p) => {    const runId = p.run_id ?? p.runId ?? "";
     if (!runId || runId.length > 128 || !/^[A-Za-z0-9_-]+$/.test(runId)) throw new Error("invalid run id");
     const dir = path.join(HOME, ".pi", "agent", "spawn-sessions", runId);
     let file = null;
@@ -481,9 +516,43 @@ const handlers = {
       if (v.type === "message" && v.message) {
         messages.push(v.message);
         if (messages.length === 4000) messages.splice(0, 2000);
+      } else if (v.type === "custom_message") {
+        const m = { role: "custom" };
+        for (const k of ["customType", "content", "display", "details"]) {
+          if (v[k] !== undefined) m[k] = v[k];
+        }
+        messages.push(m);
+        if (messages.length === 4000) messages.splice(0, 2000);
       }
     }
     return { messages: messages.length > 2000 ? messages.slice(-2000) : messages };
+  },
+  read_spawn_log: (p) => {
+    const runId = p.run_id ?? p.runId ?? "";
+    if (!runId || runId.length > 128 || !/^[A-Za-z0-9_-]+$/.test(runId)) throw new Error("invalid run id");
+    const root = path.join(HOME, ".pi", "agent", "spawn-sessions");
+    const file = path.resolve(root, runId, "output.log");
+    const realRoot = fs.realpathSync(root);
+    const real = fs.realpathSync(file);
+    if (!real.startsWith(realRoot)) throw new Error("refusing to read outside spawn root");
+    const HEAD_CAP = 8 * 1024 * 1024, WINDOW = 256 * 1024;
+    const st = fs.statSync(real);
+    const size = st.size;
+    const fd = fs.openSync(real, "r");
+    try {
+      const start = Math.max(0, size - HEAD_CAP);
+      const len = Math.min(size, HEAD_CAP);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, start);
+      let off = Math.max(0, len - WINDOW);
+      if (off > 0) {
+        const nl = buf.indexOf(0x0a, off);
+        off = nl >= 0 ? nl + 1 : len;
+      }
+      return { text: buf.slice(off).toString("utf8"), size, truncated: off > 0 || start > 0 };
+    } finally {
+      fs.closeSync(fd);
+    }
   },
   delete_spawn_run: (p) => {
     const runId = p.runId ?? "";

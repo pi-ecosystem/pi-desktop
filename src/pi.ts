@@ -255,6 +255,14 @@ export const spawnTranscript = {
     invoke("delete_spawn_run", { runId }),
 };
 
+// Tail of one background process's log (pi-spawn/SPAWN.md, spawn_bg).
+// Scoped server-side to the spawn-sessions root. Returns the last 256KB
+// starting on a line boundary: {text, size, truncated}.
+export const spawnLog = {
+  read: (runId: string): Promise<{ text: string; size: number; truncated: boolean }> =>
+    invoke("read_spawn_log", { runId }),
+};
+
 export interface AppConfig {
   quickbar_hotkey: string;
   main_hotkey: string;

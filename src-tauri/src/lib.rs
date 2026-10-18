@@ -647,10 +647,14 @@ fn read_session_messages(path: String, session_root: Option<String>, max_bytes: 
         return Err("session file too large (>64MB)".into());
     }
     let text = fs::read_to_string(&canonical).map_err(|e| format!("unreadable session file: {e}"))?;
-    // Single pass: collect message payloads oldest-first. The file read +
-    // parse stays server-side (fast even at multi-MB); only the requested
-    // window crosses IPC and reaches the renderer.
-    let mut messages: Vec<serde_json::Value> = vec![];
+    // Single pass: collect entries oldest-first, tagged by kind.
+    // Regular messages spend the byte budget below; custom messages
+    // (spawn cards/notes) ALWAYS ride along under their own generous
+    // cap. The side panels are an index over customs — paging them out
+    // would wipe the panels on every revisit of a long session.
+    // The file read + parse stays server-side (fast even at multi-MB);
+    // only the requested window crosses IPC and reaches the renderer.
+    let mut messages: Vec<(serde_json::Value, bool)> = vec![];
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -662,8 +666,21 @@ fn read_session_messages(path: String, session_root: Option<String>, max_bytes: 
         };
         if v.get("type").and_then(|t| t.as_str()) == Some("message") {
             if let Some(m) = v.get("message").cloned() {
-                messages.push(m);
+                messages.push((m, false));
             }
+        } else if v.get("type").and_then(|t| t.as_str()) == Some("custom_message") {
+            // Custom messages (spawn cards/notes): shape them like live
+            // RPC so history rebuilds track and render exactly what live
+            // did. Without this, spawn rows/cards exist only until the
+            // next revisit — switching sessions wipes the panels.
+            let mut m = serde_json::Map::new();
+            m.insert("role".into(), serde_json::Value::String("custom".into()));
+            for k in ["customType", "content", "display", "details"] {
+                if let Some(val) = v.get(k).cloned() {
+                    m.insert(k.into(), val);
+                }
+            }
+            messages.push((serde_json::Value::Object(m), true));
         }
     }
     let total = messages.len();
@@ -682,19 +699,59 @@ fn read_session_messages(path: String, session_root: Option<String>, max_bytes: 
     // size (refreshMsgs re-reads by it — capping it would shrink the
     // window and lose messages).
     const MSG_BUDGET_CAP: usize = 32 * 1024;
+    const CUSTOM_BUDGET: usize = 512 * 1024;
+    let mut selected = vec![false; end];
     let mut acc: usize = 0;
+    let mut custom_acc: usize = 0;
     let mut bytes: usize = 0;
     let mut start = end;
+    // Pass 1: newest-first budget walk over regulars; customs encountered
+    // ride free under their own cap.
     while start > 0 {
-        let size = serde_json::to_string(&messages[start - 1]).map(|s| s.len()).unwrap_or(0);
+        let (m, is_custom) = &messages[start - 1];
+        let size = serde_json::to_string(m).map(|s| s.len()).unwrap_or(0);
+        let custom = *is_custom;
+        if custom {
+            if custom_acc + size <= CUSTOM_BUDGET {
+                custom_acc += size;
+                bytes += size;
+                selected[start - 1] = true;
+            }
+            start -= 1;
+            continue;
+        }
         if acc + size.min(MSG_BUDGET_CAP) > budget && start < end {
             break;
         }
         acc += size.min(MSG_BUDGET_CAP);
         bytes += size;
+        selected[start - 1] = true;
         start -= 1;
     }
-    let window = messages[start..end].to_vec();
+    // Pass 2: the walk stops at the first over-budget regular, stranding
+    // older customs. Sweep them up so the panels' index is complete no
+    // matter how long the session grows.
+    if start > 0 {
+        let mut i = start;
+        while i > 0 {
+            i -= 1;
+            if !messages[i].1 {
+                continue;
+            }
+            let size = serde_json::to_string(&messages[i].0).map(|s| s.len()).unwrap_or(0);
+            if custom_acc + size <= CUSTOM_BUDGET {
+                custom_acc += size;
+                bytes += size;
+                selected[i] = true;
+            }
+        }
+    }
+    let window: Vec<serde_json::Value> = messages[..end]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| selected[*i])
+        .map(|(_, (m, _))| m.clone())
+        .collect();
     let has_more = start > 0;
     Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more, "bytes": bytes }))
 }
@@ -795,6 +852,48 @@ fn read_spawn_transcript(run_id: String) -> Result<serde_json::Value, String> {
         }
     }
     Ok(serde_json::json!({ "messages": messages }))
+}
+
+/// Tail of one background process's log (see agent/SPAWN.md). Scoped to
+/// the spawn-sessions root exactly like read_spawn_transcript: run ids
+/// are `[A-Za-z0-9_-]+`, resolved path must stay inside the root.
+/// Returns `{text, size, truncated}` — the last 256KB starting on a line
+/// boundary. Never parses: raw bytes for the UI to render as text.
+#[tauri::command]
+fn read_spawn_log(run_id: String) -> Result<serde_json::Value, String> {
+    if run_id.is_empty()
+        || run_id.len() > 128
+        || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("invalid run id".into());
+    }
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let root = home.join(".pi").join("agent").join("spawn-sessions");
+    let file = root.join(&run_id).join("output.log");
+    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable spawn root: {e}"))?;
+    let canonical = fs::canonicalize(&file).map_err(|e| format!("unreadable spawn log: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("refusing to read outside spawn root".into());
+    }
+    const HEAD_CAP: u64 = 8 * 1024 * 1024;
+    const WINDOW: usize = 256 * 1024;
+    let mut f = fs::File::open(&canonical).map_err(|e| format!("unreadable spawn log: {e}"))?;
+    let size = f.metadata().map_err(|e| format!("unreadable spawn log: {e}"))?.len();
+    use std::io::{Read, Seek, SeekFrom};
+    if size > HEAD_CAP {
+        f.seek(SeekFrom::Start(size - HEAD_CAP)).map_err(|e| e.to_string())?;
+    }
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).map_err(|e| format!("unreadable spawn log: {e}"))?;
+    let mut start = bytes.len().saturating_sub(WINDOW);
+    if start > 0 {
+        // Align to the next line boundary (skip a torn first line).
+        if let Some(pos) = bytes[start..].iter().position(|&b| b == b'\n') {
+            start += pos + 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    Ok(serde_json::json!({ "text": text, "size": size, "truncated": (start > 0) || (size > bytes.len() as u64) }))
 }
 
 /// Delete one spawned subagent's run dir (see agent/SPAWN.md). Scoped to
@@ -1173,6 +1272,7 @@ pub fn run() {
             media_stat,
             read_session_messages,
             read_spawn_transcript,
+            read_spawn_log,
             delete_spawn_run,
             get_config,
             set_config,

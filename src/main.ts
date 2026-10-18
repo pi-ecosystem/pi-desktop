@@ -3,7 +3,7 @@
 
 import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
-import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -297,7 +297,9 @@ function renderDiffPane() {
 // One shared sidebar, two tabs, one visible at a time. Changes and
 // Subagents share the pane, the resize handle, and the saved width —
 // never side by side, never crammed together.
-let sideTabCur: "changes" | "agents" = "changes";
+let sideTabCur: "changes" | "agents" | "procs" = "changes";
+// Last non-null tab, so the single header toggle reopens where you were.
+let sideTabLast: "changes" | "agents" | "procs" = "changes";
 function sideIsOpen(): boolean {
   return !$("sidepane").classList.contains("hidden");
 }
@@ -307,28 +309,35 @@ function changesVisible(): boolean {
 function agentsVisible(): boolean {
   return sideIsOpen() && sideTabCur === "agents";
 }
-function setSidePane(tab: "changes" | "agents" | null) {
+function procsVisible(): boolean {
+  return sideIsOpen() && sideTabCur === "procs";
+}
+function setSidePane(tab: "changes" | "agents" | "procs" | null) {
   if (tab === null) {
     $("sidepane").classList.add("hidden");
   } else {
     sideTabCur = tab;
+    sideTabLast = tab;
     $("sidepane").classList.remove("hidden");
     document.querySelectorAll("#sidetabs .sidetab").forEach((b) =>
       b.classList.toggle("cur", (b as HTMLElement).dataset.tab === tab));
     $("diffwrap").classList.toggle("hidden", tab !== "changes");
     $("agentswrap").classList.toggle("hidden", tab !== "agents");
+    $("procswrap").classList.toggle("hidden", tab !== "procs");
     if (tab === "changes") renderDiffPane();
-    else {
+    else if (tab === "agents") {
       renderAgents();
       // Opening the panel is the moment stale rows matter: force a probe.
+      void reconcileSpawns(true);
+    } else {
+      renderProcs();
       void reconcileSpawns(true);
     }
   }
   syncPaneBtns();
 }
 function syncPaneBtns() {
-  ($("diffbtn") as HTMLButtonElement).classList.toggle("open", changesVisible());
-  ($("agentsbtn") as HTMLButtonElement).classList.toggle("open", agentsVisible());
+  ($("panebtn") as HTMLButtonElement).classList.toggle("open", sideIsOpen());
 }
 const toolElapsed = new Map<string, number>(); // toolCallId -> durationMs (server-reported)
 let runT0 = 0;
@@ -735,7 +744,7 @@ function esc(s: string): string {
 // Sessions all the way down: the panel is an index over spawn-* messages
 // (dispatch + result inline, detail behind the click). One map, fed by
 // msgNode, so live appends and history rebuilds can never disagree.
-type SpawnInfo = { id: string; label: string; state: string; startedAt?: number; durationMs?: number; runId?: string; result?: string; pid?: number };
+type SpawnInfo = { id: string; label: string; state: string; kind: "agent" | "proc"; startedAt?: number; durationMs?: number; runId?: string; pid?: number; logFile?: string; exitCode?: number; command?: string };
 const spawns = new Map<string, SpawnInfo>();
 
 function threadOf(d: any): string {
@@ -756,9 +765,11 @@ function trackSpawn(m: any): void {
     }
     updateAgentsBtn();
     if (agentsVisible()) renderAgents();
+    if (procsVisible()) renderProcs();
     return;
   }
-  if (ct === "spawn-started" && d.id) {
+  if (ct === "spawn-started" || ct === "spawn-bg-started") {
+    if (!d.id) return;
     const tid = threadOf(d);
     if (isBuried(tid)) return;
     const prev = spawns.get(tid);
@@ -768,9 +779,12 @@ function trackSpawn(m: any): void {
       id: tid,
       label: prev?.label ?? d.label ?? tid,
       state: "running",
+      kind: ct === "spawn-bg-started" ? "proc" : (prev?.kind ?? "agent"),
       startedAt: prev?.startedAt ?? (typeof d.startedAt === "number" ? d.startedAt : undefined),
       runId: d.id,
       ...(typeof d.pid === "number" ? { pid: d.pid } : {}),
+      ...(typeof d.logFile === "string" ? { logFile: d.logFile } : {}),
+      ...(typeof d.command === "string" ? { command: d.command } : {}),
     };
     if (!refreshActive) {
       // Live start supersedes any stale mark (e.g. an explicit
@@ -782,20 +796,20 @@ function trackSpawn(m: any): void {
       entry.state = "lost";
     }
     spawns.set(tid, entry);
-  } else if ((ct === "spawn-done" || ct === "spawn-stopped") && d.id) {
+  } else if (ct === "spawn-done" || ct === "spawn-stopped" || ct === "spawn-bg-done" || ct === "spawn-bg-stopped") {
+    if (!d.id) return;
     const tid = threadOf(d);
     if (isBuried(tid)) return;
     // Completion is authoritative: clears any stale mark (the run did
     // finish — e.g. its done note simply arrived after the marking).
     staleDrop(tid);
-    const s: SpawnInfo = spawns.get(tid) ?? { id: tid, label: d.label ?? tid, state: "running" };
-    s.state = d.status ?? (ct === "spawn-done" ? "done" : "stopped");
+    const isProc = ct.startsWith("spawn-bg-");
+    const s: SpawnInfo = spawns.get(tid) ?? { id: tid, label: d.label ?? tid, state: "running", kind: isProc ? "proc" : "agent" };
+    s.state = d.status ?? (ct.endsWith("-done") ? "done" : "stopped");
     s.runId = d.id;
     if (typeof d.durationMs === "number") s.durationMs = d.durationMs;
-    // The report lives on the dispatch card: stash it for morph.
-    // Completions are display:false (tracked, never rendered as cards).
-    if (typeof m.content === "string" && m.content) s.result = m.content.slice(0, 12000);
-    else if (textOf(m.content)) s.result = textOf(m.content).slice(0, 12000);
+    if (typeof d.exitCode === "number") s.exitCode = d.exitCode;
+    if (typeof d.logFile === "string") s.logFile = d.logFile;
     spawns.set(tid, s);
     morphSpawnCards(tid);
   } else {
@@ -803,6 +817,7 @@ function trackSpawn(m: any): void {
   }
   updateAgentsBtn();
   if (agentsVisible()) renderAgents();
+  if (procsVisible()) renderProcs();
 }
 
 function spawnElapsed(s: SpawnInfo): string {
@@ -820,101 +835,87 @@ function spawnDot(state: string): string {
 
 function spawnSummaryHTML(s: SpawnInfo): string {
   const running = s.state === "running";
+  const isProc = s.kind === "proc";
   // Actions target the live RUN; rows and deletes target the THREAD.
   const run = s.runId ?? s.id;
+  const exit = isProc && typeof s.exitCode === "number" ? `<span class="spexit">exit ${s.exitCode}</span>` : "";
+  const acts = running
+    ? `<span class="spacts">` +
+      (isProc ? "" : `<button class="ssteer" data-id="${esc(run)}" title="Steer this subagent">steer</button>`) +
+      `<button class="sstop" data-id="${esc(run)}"${isProc ? ` data-kind="proc"` : ""} title="Stop this ${isProc ? "process" : "subagent"}">stop</button></span>`
+    : "";
   return spawnDot(s.state) +
     `<span class="splabel">${esc(s.label)}</span>` +
     `<span class="spsid">${esc(s.id.slice(-6))}</span>` +
     `<span class="spelapsed">${esc(spawnElapsed(s))}</span>` +
-    (running
-      ? `<span class="spacts"><button class="ssteer" data-id="${esc(run)}" title="Steer this subagent">steer</button>` +
-        `<button class="sstop" data-id="${esc(run)}" title="Stop this subagent">stop</button></span>`
-      : "");
+    exit + acts;
 }
 
-// A done/stopped notice supersedes its dispatch card: morph the old card
-// in place (state, elapsed, buttons) so no stale "running + stop"
-// lingers. New card still renders below with the full report.
+// A done/stopped notice supersedes its dispatch receipt: morph the
+// summary in place (state, elapsed, buttons) so no stale "running +
+// stop" lingers. Receipts never grow a body — detail lives in the panel.
 function morphSpawnCards(id: string): void {
   const s = spawns.get(id);
   if (!s) return;
-  for (const card of Array.from(document.querySelectorAll(`details.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
-    const sum = card.querySelector(":scope > summary");
+  for (const card of Array.from(document.querySelectorAll(`.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
+    const sum = card.querySelector(":scope > .spsum");
     if (sum) sum.innerHTML = spawnSummaryHTML(s);
     (card as HTMLElement).dataset.state = s.state;
-    // Orphaned rows (crash/reboot): no result can ever arrive. Retire the
-    // "Running…" placeholder honestly instead of pulsing forever.
-    const ph = card.querySelector(":scope > .spbody[data-ph]");
-    if (s.state === "lost" && ph) {
-      ph.removeAttribute("data-ph");
-      ph.innerHTML = `<span class="dim">Ended before reporting — the backend restarted or crashed mid-run.</span>`;
-    }
-    // The answer lands in the ORIGINAL card: fill the running placeholder
-    // or append the report once. Never a second card.
-    if (s.result && ph) {
-      ph.removeAttribute("data-ph");
-      ph.innerHTML = renderMd(s.result);
-      wireCopy(card as HTMLElement);
-    } else if (s.result && !card.querySelector(":scope > .spbody")) {
-      const body = document.createElement("div");
-      body.className = "spbody";
-      body.innerHTML = renderMd(s.result);
-      card.appendChild(body);
-      wireCopy(card as HTMLElement);
-    }
   }
 }
 
 function spawnCard(m: any): HTMLElement {
   trackSpawn(m);
   const ct: string = m.customType ?? "";
+  const isProc = ct.startsWith("spawn-bg-");
   const d = m.details ?? {};
   const id: string = d.id ?? "";
   if (ct === "spawn-note") {
     return el("div", "msg sys spawnnote", renderMd(textOf(m.content).slice(0, 2000)));
   }
-  const label = d.label ?? "subagent";
-  const running = ct === "spawn-started";
+  const label = d.label ?? (isProc ? "process" : "subagent");
+  const running = ct === "spawn-started" || ct === "spawn-bg-started";
   // Rebuilds may know more than the bare message (stale/lost orphans):
   // prefer the tracked state so dead rows never render "Running…".
   // (trackSpawn ran first, above, so this is fresh.)
   const tracked = d.id ? spawns.get(threadOf(d)) : undefined;
-  const state = tracked?.state ?? (running ? "running" : (d.status ?? (ct === "spawn-done" ? "done" : "stopped")));
+  const state = tracked?.state ?? (running ? "running" : (d.status ?? (ct.endsWith("-done") ? "done" : "stopped")));
   const info: SpawnInfo = {
-    id, label, state,
+    id, label, state, kind: isProc ? "proc" : "agent",
     ...(typeof d.durationMs === "number" ? { durationMs: d.durationMs } : {}),
     ...(typeof d.startedAt === "number" ? { startedAt: d.startedAt } : {}),
+    ...(typeof d.exitCode === "number" ? { exitCode: d.exitCode } : {}),
+    ...(typeof d.logFile === "string" ? { logFile: d.logFile } : {}),
   };
-  const wrap = el("details", "spawncard");
-  // Dispatch cards start collapsed; old completed cards (pre-silent era)
-  // keep their open report. Answers land here via morph, never as new cards.
-  (wrap as HTMLDetailsElement).open = !running && ct === "spawn-done";
-  // Card identity is the THREAD: continuations morph the same cards.
+  const wrap = el("div", "spawncard");
+  // Receipt identity is the THREAD: continuations morph the same receipt.
+  // No expandable body — clicking jumps to the row in the side panel,
+  // where the transcript/log detail lives.
   if (d.id) wrap.dataset.spawnId = threadOf(d);
   wrap.dataset.state = state;
-  wrap.appendChild(el("summary", "spsum", spawnSummaryHTML(info)));
-  if (!running) {
-    const body = el("div", "spbody", renderMd(textOf(m.content).slice(0, 12000)));
-    wrap.appendChild(body);
-    wireCopy(wrap);
-  } else if (state === "lost") {
-    // Tracked orphan (see above): honest body, no placeholder for morph.
-    wrap.appendChild(el("div", "spbody", `<span class="dim">Ended before reporting — the backend restarted or crashed mid-run.</span>`));
-  } else {
-    const ph = el("div", "spbody", `<span class="dim">Running…</span>`);
-    (ph as HTMLElement).dataset.ph = "1";
-    wrap.appendChild(ph);
-  }
+  wrap.dataset.kind = isProc ? "proc" : "agent";
+  wrap.title = isProc ? "Open in Processes tab" : "Open in Subagents tab";
+  wrap.appendChild(el("div", "spsum", spawnSummaryHTML(info)));
+  wrap.addEventListener("click", (e) => {
+    // Steer/stop buttons handle themselves (see the delegated send).
+    if ((e.target as HTMLElement).closest?.(".ssteer,.sstop")) return;
+    if (d.id) gotoSpawnPanel(threadOf(d));
+  });
   // Late supersede: if done already arrived, morph immediately.
   if (d.id && !running) morphSpawnCards(threadOf(d));
   return wrap;
 }
 
 function updateAgentsBtn(): void {
-  const n = [...spawns.values()].filter((s) => s.state === "running").length;
-  const badge = $("agentsbadge");
+  const all = [...spawns.values()];
+  const n = all.filter((s) => s.state === "running").length;
+  const badge = $("panebadge");
   badge.textContent = n ? String(n) : "";
   badge.classList.toggle("hidden", !n);
+  const na = all.filter((s) => s.kind !== "proc" && s.state === "running").length;
+  const np = all.filter((s) => s.kind === "proc" && s.state === "running").length;
+  $("tabagents").textContent = na ? `Subagents ·${na}` : "Subagents";
+  $("tabprocs").textContent = np ? `Processes ·${np}` : "Processes";
 }
 
 function renderAgents(): void {
@@ -1054,6 +1055,7 @@ function markAllSpawnsStale(): void {
   if (any) {
     updateAgentsBtn();
     if (agentsVisible()) renderAgents();
+    if (procsVisible()) renderProcs();
   }
 }
 
@@ -1083,6 +1085,7 @@ async function reconcileSpawns(force = false): Promise<void> {
     if (changed) {
       updateAgentsBtn();
       if (agentsVisible()) renderAgents();
+      if (procsVisible()) renderProcs();
     }
   } catch {
     // Render-path failures are surfaced by their synchronous callers;
@@ -1095,13 +1098,13 @@ async function reconcileSpawns(force = false): Promise<void> {
 function renderAgentsList(): void {
   const body = $("agentsbody");
   $("agentstitle").textContent = "Subagents";
-  if (!spawns.size) {
+  const all = [...spawns.values()].filter((s) => s.kind !== "proc");
+  if (!all.length) {
     listSig = "";
     body.innerHTML = "";
     body.appendChild(el("div", "msg sys", "No subagents this session. Ask Pi to spawn one."));
     return;
   }
-  const all = [...spawns.values()];
   const running = all.filter((s) => s.state === "running");
   const past = all.filter((s) => s.state !== "running");
   const sig = `sel=${selSpawn}|` + all.map((s) => `${s.id}:${s.state}`).join("|");
@@ -1115,12 +1118,16 @@ function renderAgentsList(): void {
 }
 
 function agentRow(s: SpawnInfo, selected: boolean): HTMLElement {
+  const isProc = s.kind === "proc";
+  const sub = s.state +
+    (isProc && typeof s.exitCode === "number" ? ` · exit ${s.exitCode}` : "") +
+    (spawnElapsed(s) ? ` · ${spawnElapsed(s)}` : "");
   const row = el("button", "agentrow" + (selected ? " cur" : ""),
     spawnDot(s.state) +
     `<span class="fname">${esc(s.label)}</span>` +
-    `<span class="fcount">${esc(s.state)}${spawnElapsed(s) ? ` · ${esc(spawnElapsed(s))}` : ""}</span>`) as HTMLButtonElement;
+    `<span class="fcount">${esc(sub)}</span>`) as HTMLButtonElement;
   row.title = s.id;
-  row.addEventListener("click", () => openSpawn(s.id));
+  row.addEventListener("click", () => isProc ? openProc(s.id) : openSpawn(s.id));
   const reveal = el("button", "sreveal", "chat") as HTMLButtonElement;
   reveal.title = "Reveal in chat";
   reveal.addEventListener("click", (e) => {
@@ -1129,25 +1136,27 @@ function agentRow(s: SpawnInfo, selected: boolean): HTMLElement {
   });
   row.appendChild(reveal);
   if (s.state === "running") {
-    const steer = el("button", "ssteer", "steer") as HTMLButtonElement;
-    steer.title = "Steer this subagent";
-    steer.addEventListener("click", (e) => {
-      e.stopPropagation();
-      prefillSteer(s.runId ?? s.id);
-    });
-    row.appendChild(steer);
+    if (!isProc) {
+      const steer = el("button", "ssteer", "steer") as HTMLButtonElement;
+      steer.title = "Steer this subagent";
+      steer.addEventListener("click", (e) => {
+        e.stopPropagation();
+        prefillSteer(s.runId ?? s.id);
+      });
+      row.appendChild(steer);
+    }
     const x = el("button", "sstop", "stop") as HTMLButtonElement;
-    x.title = "Stop this subagent";
+    x.title = isProc ? "Stop this process" : "Stop this subagent";
     // Direct send: stopPropagation here would also hide the click from
     // the document-level delegation, so don't rely on it.
     x.addEventListener("click", (e) => {
       e.stopPropagation();
-      sendAgentCmd(`/agent-stop ${s.runId ?? s.id}`);
+      sendAgentCmd(isProc ? `/proc-stop ${s.runId ?? s.id}` : `/agent-stop ${s.runId ?? s.id}`);
     });
     row.appendChild(x);
   }
   const del = el("button", "sdel", "×") as HTMLButtonElement;
-  del.title = "Delete this subagent and its transcript files";
+  del.title = isProc ? "Delete this process and its log files" : "Delete this subagent and its transcript files";
   del.dataset.id = s.id;
   del.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1157,6 +1166,87 @@ function agentRow(s: SpawnInfo, selected: boolean): HTMLElement {
   return row;
 }
 
+// Index ToolCall blocks by id so rows can show what ran.
+function indexToolCalls(messages: any[]): Map<string, any> {
+  const calls = new Map<string, any>();
+  for (const m of messages) {
+    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (b && b.type === "toolCall" && b.id) calls.set(b.id, b);
+    }
+  }
+  return calls;
+}
+
+// One message loop for main history and the subagent detail pane: same
+// blocks, same order, same renderer. Callers differ only in options, so
+// message-handling fixes can never land in one view and miss the other.
+// (Live-vs-poll stays a caller concern: detail re-renders whole from the
+// transcript file; main chat streams live elsewhere.)
+function appendMsgList(
+  box: HTMLElement,
+  messages: any[],
+  calls: Map<string, any>,
+  opts: {
+    // Which customs render (via msgNode, which tracks spawns itself).
+    // Main history renders every non-silent custom; the detail pane
+    // only spawn-* ones.
+    keepCustom?: (m: any) => boolean;
+    // Silent customs still feed the spawn index in main history, so
+    // tombstones re-bury on rebuild. The detail pane skips them cold.
+    trackSilent?: boolean;
+    // Fork/revert entry ids for user bubbles (main chat only).
+    takeForkId?: (text: string) => string | undefined;
+    // Rendered-key dedup hook (main history only).
+    onRendered?: (m: any) => void;
+  } = {},
+): number {
+  const isTool = (m: any) => m.role === "toolResult" || m.role === "bashExecution";
+  let shown = 0;
+  // One Activity container per user request: thoughts and tool rows
+  // interleave chronologically. A new user message starts a new one.
+  let run: HTMLElement | null = null;
+  for (const m of messages) {
+    if (m.role === "system") continue;
+    if (m.role === "user") run = null;
+    if (m.role === "assistant" && Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && b.type === "thinking" && b.thinking) {
+          run = runAppend(box, run, thoughtDiv(b.thinking));
+        }
+      }
+    }
+    if (isTool(m)) {
+      opts.onRendered?.(m);
+      run = runAppend(box, run, msgNode(m, calls));
+      shown++;
+      continue;
+    }
+    // Textless assistant turns (tool-call-only) would flash as empty
+    // boxes; their content already lives in the Activity container.
+    if (m.role === "assistant" && !textOf(m.content)) { opts.onRendered?.(m); continue; }
+    // Silent customs: track (tombstones) but never render.
+    if (m.role === "custom" && (m as any).display === false) {
+      opts.onRendered?.(m);
+      if (opts.trackSilent) trackSpawn(m);
+      continue;
+    }
+    if (m.role === "custom" && opts.keepCustom && !opts.keepCustom(m)) continue;
+    // Mirror: repeats render. (Dedup was ours; pi shows them.)
+    const fid = m.role === "user" ? opts.takeForkId?.(textOf(m.content)) : undefined;
+    opts.onRendered?.(m);
+    const n = msgNode(m, calls, fid);
+    box.appendChild(n);
+    // Rendered text splits the Activity stream: thoughts/tools after
+    // this bubble belong to a NEW container below it, not clumped
+    // into the one above. (User messages already reset; textless
+    // assistant turns continued out earlier.)
+    if (m.role === "assistant") run = null;
+    shown++;
+  }
+  return shown;
+}
+
 // One transcript at a time: click a child → its full session transcript
 // renders here (same renderer as chat). Running ones re-poll; the count
 // guard avoids clobbering scroll when nothing changed.
@@ -1164,11 +1254,24 @@ let selSpawn: string | null = null;
 let detailCount = -1;
 
 function gotoSpawn(id: string): void {
-  const cards = Array.from(document.querySelectorAll(`details.spawncard[data-spawn-id="${CSS.escape(id)}"]`)) as HTMLElement[];
+  const cards = Array.from(document.querySelectorAll(`.spawncard[data-spawn-id="${CSS.escape(id)}"]`)) as HTMLElement[];
   const card = cards[cards.length - 1];
   if (!card) return;
-  if (card.tagName === "DETAILS") (card as HTMLDetailsElement).open = true;
   card.scrollIntoView({ block: "center" });
+}
+
+// Chat receipt → side panel: open the owning tab and select the row, so
+// the transcript/log detail renders below the list.
+function gotoSpawnPanel(tid: string): void {
+  const s = spawns.get(tid);
+  if (s?.kind === "proc") {
+    selProc = tid;
+    setSidePane("procs");
+  } else {
+    selSpawn = tid;
+    detailCount = -1;
+    setSidePane("agents");
+  }
 }
 
 function openSpawn(id: string): void {
@@ -1207,43 +1310,15 @@ async function renderSpawnDetail(id: string): Promise<void> {
   const nearBottom = body.scrollHeight - keepScroll - body.clientHeight < 120 || !body.hasChildNodes();
   body.innerHTML = "";
   body.dataset.detail = id;
-  const calls = new Map<string, any>();
-  for (const m of messages) {
-    if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
-    for (const b of m.content) {
-      if (b && b.type === "toolCall" && b.id) calls.set(b.id, b);
-    }
-  }
+  const calls = indexToolCalls(messages);
   // Borrow the chat renderer; quarantine its Activity-container pointer
   // so detail containers never leak into the main view's run state.
   const keepRun = lastRun;
   lastRun = null;
   try {
-    let run: HTMLElement | null = null;
-    const isTool = (m: any) => m.role === "toolResult" || m.role === "bashExecution";
-    let shown = 0;
-    for (const m of messages) {
-      if (m.role === "system") continue;
-      if (m.role === "user") run = null;
-      if (m.role === "assistant" && Array.isArray(m.content)) {
-        for (const b of m.content) {
-          if (b && b.type === "thinking" && b.thinking) {
-            run = runAppend(body, run, thoughtDiv(b.thinking));
-          }
-        }
-      }
-      if (isTool(m)) {
-        run = runAppend(body, run, msgNode(m, calls));
-        shown++;
-        continue;
-      }
-      if (m.role === "assistant" && !textOf(m.content)) continue;
-      if (m.role === "custom" && !(typeof m.customType === "string" && m.customType.startsWith("spawn-"))) continue;
-      if (m.role === "custom" && (m as any).display === false) continue;
-      body.appendChild(msgNode(m, calls));
-      if (m.role === "assistant") run = null;
-      shown++;
-    }
+    const shown = appendMsgList(body, messages, calls, {
+      keepCustom: (m) => typeof m.customType === "string" && m.customType.startsWith("spawn-"),
+    });
     if (!shown) body.appendChild(el("div", "msg sys", "No transcript yet — child hasn't produced output."));
     // No collectEdits here: the Changes pane belongs to the main session.
     // Collecting the child's edits would wipe and refill it with another
@@ -1252,6 +1327,91 @@ async function renderSpawnDetail(id: string): Promise<void> {
   } finally {
     lastRun = keepRun;
   }
+  if (nearBottom) body.scrollTop = body.scrollHeight;
+  else body.scrollTop = keepScroll;
+}
+
+// ---- background processes tab (spawn_bg) ------------------------------------
+// Same index map as subagents, filtered on kind === "proc". Detail is a
+// live log tail (read_spawn_log), not a transcript: plain <pre>, same 5s
+// re-poll throttle as the agents panel.
+function renderProcs(): void {
+  renderProcsList();
+  const t = $("proctranscript");
+  if (selProc) {
+    void renderProcDetail(selProc);
+  } else {
+    t.innerHTML = "";
+    t.dataset.detail = "";
+    t.dataset.key = "";
+  }
+}
+
+let procListSig = "";
+function renderProcsList(): void {
+  const body = $("procsbody");
+  $("procstitle").textContent = "Processes";
+  const all = [...spawns.values()].filter((s) => s.kind === "proc");
+  if (!all.length) {
+    procListSig = "";
+    body.innerHTML = "";
+    body.appendChild(el("div", "msg sys", "No background processes this session."));
+    return;
+  }
+  const running = all.filter((s) => s.state === "running");
+  const past = all.filter((s) => s.state !== "running");
+  const sig = `sel=${selProc}|` + all.map((s) => `${s.id}:${s.state}`).join("|");
+  if (sig === procListSig && body.dataset.sig === sig) return;
+  procListSig = sig;
+  body.dataset.sig = sig;
+  body.innerHTML = "";
+  // Flat list, running first: no collapsing. One glance, everything.
+  for (const s of running) body.appendChild(agentRow(s, s.id === selProc));
+  for (const s of past) body.appendChild(agentRow(s, s.id === selProc));
+}
+
+let selProc: string | null = null;
+function openProc(id: string): void {
+  // Split view: log tail renders below the list, no navigation.
+  // Clicking the selected row again collapses it.
+  selProc = selProc === id ? null : id;
+  renderProcs();
+}
+
+let lastProcDetailRead = 0;
+async function renderProcDetail(id: string): Promise<void> {
+  const body = $("proctranscript");
+  if (body.dataset.detail === id && Date.now() - lastProcDetailRead < 5000) return;
+  lastProcDetailRead = Date.now();
+  const s = spawns.get(id);
+  let text = "";
+  let size = 0;
+  let truncated = false;
+  try {
+    const data = await spawnLog.read(s?.runId ?? id);
+    text = data.text ?? "";
+    size = data.size ?? 0;
+    truncated = !!data.truncated;
+  } catch (e: any) {
+    body.innerHTML = "";
+    body.dataset.detail = "";
+    body.dataset.key = "";
+    body.appendChild(el("div", "msg sys", esc(`log unavailable: ${e.message ?? e}`)));
+    return;
+  }
+  if (selProc !== id) return;
+  const key = `${text.length}:${size}:${s?.state ?? ""}`;
+  if (body.dataset.detail === id && body.dataset.key === key) return;
+  body.dataset.detail = id;
+  body.dataset.key = key;
+  const keepScroll = body.scrollTop;
+  const nearBottom = body.scrollHeight - keepScroll - body.clientHeight < 120 || !body.hasChildNodes();
+  body.innerHTML = "";
+  if (s?.logFile) body.appendChild(el("div", "msg sys", esc(s.logFile)));
+  if (truncated) body.appendChild(el("div", "msg sys", esc(`… showing last ${text.length} chars of ${size}`)));
+  const pre = document.createElement("pre");
+  pre.textContent = text || "(no output yet)";
+  body.appendChild(pre);
   if (nearBottom) body.scrollTop = body.scrollHeight;
   else body.scrollTop = keepScroll;
 }
@@ -1274,8 +1434,9 @@ async function deleteSpawn(id: string): Promise<void> {
   // The old stop prompt + blind sleep + direct remove raced the backend's
   // own shutdown: files removed mid-shutdown could be recreated by the
   // dying child after we deleted them.
+  const isProc = spawns.get(id)?.kind === "proc";
   try {
-    await pi.prompt(cwd, `/agent-delete ${id}`, undefined, dk || undefined);
+    await pi.prompt(cwd, `${isProc ? "/proc-delete" : "/agent-delete"} ${id}`, undefined, dk || undefined);
   } catch (e: any) {
     if (stillHere()) {
       $("msgs").appendChild(el("div", "msg sys", esc(`delete failed: ${e.message ?? e}`)));
@@ -1294,9 +1455,12 @@ async function deleteSpawn(id: string): Promise<void> {
     selSpawn = null;
     detailCount = -1;
   }
+  if (selProc === id) selProc = null;
   listSig = "";
+  procListSig = "";
   updateAgentsBtn();
   if (agentsVisible()) renderAgents();
+  if (procsVisible()) renderProcs();
 }
 
 // Fire-and-forget agent command (handled disposition: no run starts, no
@@ -1625,6 +1789,15 @@ function appendMessageEnd(message: any): void {
     return;
   }
   if (m.role === "assistant" && !textOf(m.content)) return;
+  // Proc completions (display:false) carry no card-worthy content — id +
+  // exit + log path, already morphed into the dispatch card. Track (row
+  // state) but render nothing, so procs show once. Legacy agent
+  // done/stopped keep their report card below (behavior unchanged).
+  if (m.role === "custom" && (m as any).display === false
+    && typeof (m as any).customType === "string" && (m as any).customType.startsWith("spawn-bg-")) {
+    trackSpawn(m);
+    return;
+  }
   // Mirror: every assistant text renders, even exact repeats. pi shows
   // them; suppressing was our invention (streaming made benign dupes,
   // but the transcript must never disagree with pi's history).
@@ -2262,55 +2435,12 @@ async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => bo
       return q?.length ? (q.shift() as string) : undefined;
     };
     // Index ToolCall blocks so rows can show what ran.
-    const calls = new Map<string, any>();
-    for (const m of arr) {
-      if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
-      for (const b of m.content) {
-        if (b && b.type === "toolCall" && b.id) calls.set(b.id, b);
-      }
-    }
-    let shown = 0;
-    let run: HTMLElement | null = null;
-    const isTool = (m: any) => m.role === "toolResult" || m.role === "bashExecution";
-    for (const m of arr) {
-      if (m.role === "system") continue;
-      // One Activity container per user request: thoughts and tool rows
-      // interleave chronologically. A new user message starts a new one.
-      if (m.role === "user") run = null;
-      if (m.role === "assistant" && Array.isArray(m.content)) {
-        for (const b of m.content) {
-          if (b && b.type === "thinking" && b.thinking) {
-            run = runAppend(box, run, thoughtDiv(b.thinking));
-          }
-        }
-      }
-      if (isTool(m)) {
-        renderedKeys.add(msgKey(m));
-        run = runAppend(box, run, msgNode(m, calls));
-        shown++;
-        continue;
-      }
-      // Textless assistant turns (tool-call-only) would flash as empty
-      // boxes; their content already lives in the Activity container.
-      if (m.role === "assistant" && !textOf(m.content)) { renderedKeys.add(msgKey(m)); continue; }
-      // Silent customs (display:false): track (tombstones) but never render.
-      if (m.role === "custom" && (m as any).display === false) {
-        renderedKeys.add(msgKey(m));
-        trackSpawn(m);
-        continue;
-      }
-      // Mirror: repeats render. (Dedup was ours; pi shows them.)
-      const fid = m.role === "user" ? takeForkId(textOf(m.content)) : undefined;
-      renderedKeys.add(msgKey(m));
-      const n = msgNode(m, calls, fid);
-      box.appendChild(n);
-      // Rendered text splits the Activity stream: thoughts/tools after
-      // this bubble belong to a NEW container below it, not clumped
-      // into the one above. (User messages already reset; textless
-      // assistant turns continued out earlier.)
-      if (m.role === "assistant") run = null;
-      shown++;
-    }
+    const calls = indexToolCalls(arr);
+    const shown = appendMsgList(box, arr, calls, {
+      trackSilent: true,
+      takeForkId,
+      onRendered: (m) => renderedKeys.add(msgKey(m)),
+    });
     collectEdits(arr, calls);
     if (changesVisible()) renderDiffPane();
     if (!shown) {
@@ -2743,10 +2873,13 @@ function resetRunState() {
   freshUnsent = false;
   spawns.clear();
   selSpawn = null;
+  selProc = null;
   detailCount = -1;
   listSig = "";
+  procListSig = "";
   updateAgentsBtn();
   if (agentsVisible()) renderAgents();
+  if (procsVisible()) renderProcs();
   streamDiv?.remove();
   streamDiv = null;
   streamBuf = "";
@@ -3528,7 +3661,7 @@ async function openSettings() {
     const sstop = (e.target as HTMLElement).closest?.(".sstop") as HTMLButtonElement | null;
     if (sstop?.dataset.id) {
       e.stopPropagation();
-      sendAgentCmd(`/agent-stop ${sstop.dataset.id}`);
+      sendAgentCmd(sstop.dataset.kind === "proc" ? `/proc-stop ${sstop.dataset.id}` : `/agent-stop ${sstop.dataset.id}`);
       return;
     }
     const ssteer = (e.target as HTMLElement).closest?.(".ssteer") as HTMLButtonElement | null;
@@ -3658,11 +3791,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     ($("scrollbtn") as HTMLButtonElement).classList.toggle("hidden", away < 200);
   };
   scrollerEl.addEventListener("scroll", scroller);
-  ($("diffbtn") as HTMLButtonElement).addEventListener("click", () => {
-    setSidePane(changesVisible() ? null : "changes");
-  });
-  ($("agentsbtn") as HTMLButtonElement).addEventListener("click", () => {
-    setSidePane(agentsVisible() ? null : "agents");
+  ($("panebtn") as HTMLButtonElement).addEventListener("click", () => {
+    setSidePane(sideIsOpen() ? null : sideTabLast);
   });
   ($("sideclose") as HTMLButtonElement).addEventListener("click", () => {
     setSidePane(null);
@@ -3672,6 +3802,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   ($("tabagents") as HTMLButtonElement).addEventListener("click", () => {
     setSidePane("agents");
+  });
+  ($("tabprocs") as HTMLButtonElement).addEventListener("click", () => {
+    setSidePane("procs");
   });
   // Covers any stuck state (missed settled event, lost subscription,
   // wedged flag): if the agent runs but we show idle, re-arm dots and
@@ -3769,14 +3902,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     for (const [id, s] of spawns) {
       if (s.state !== "running") continue;
       anyRunning = true;
-      for (const card of Array.from(document.querySelectorAll(`details.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
-        const t = card.querySelector(":scope > summary .spelapsed");
+      for (const card of Array.from(document.querySelectorAll(`.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
+        const t = card.querySelector(":scope > .spsum .spelapsed");
         if (t) t.textContent = spawnElapsed(s);
       }
     }
     if (!anyRunning) return;
     updateAgentsBtn();
     if (agentsVisible()) renderAgents();
+    if (procsVisible()) renderProcs();
   }, 5000);
   const rp = $("sidepane");
   const savedW = Number(localStorage.getItem("sidepane-w") || localStorage.getItem("diffpane-w") || 0);
