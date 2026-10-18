@@ -112,7 +112,12 @@ fn save_config(c: &AppConfig) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(raw) = serde_json::to_string_pretty(c) {
-        let _ = fs::write(p, raw);
+        // Atomic: a crash mid-write must never leave a torn config
+        // behind (load falls back to defaults on parse failure).
+        let tmp = p.with_extension("json.tmp");
+        if fs::write(&tmp, raw).is_ok() {
+            let _ = fs::rename(&tmp, &p);
+        }
     }
 }
 
@@ -126,6 +131,15 @@ struct PiProc {
 struct AppState {
     procs: Mutex<HashMap<String, PiProc>>,
     config: Mutex<AppConfig>,
+    // Run lifecycle per session key ("tag\nkey"): true while its agent
+    // runs. Maintained by watching forwarded records (agent_start /
+    // agent_settled) — no pi roundtrips needed. Backs sidebar run dots
+    // so any session's live/idle state is visible without viewing it.
+    run_states: Mutex<HashMap<String, bool>>,
+    // Random per backend boot. Frontends clear their run tracking when
+    // it changes: a reboot ends every supervised run (or reaps orphans),
+    // so pre-reboot liveness is never carried forward.
+    boot_id: String,
 }
 
 fn session_root_default() -> String {
@@ -199,6 +213,9 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     let _ = fs::create_dir_all(&cwd);
 
     let mut cmd = Command::new(pi_bin());
+    // Marker for boot-time orphan reaping (see reap_stale_children):
+    // survives in /proc/<pid>/environ, invisible everywhere else.
+    cmd.env("PI_DESKTOP_CHILD", "1");
     cmd.arg("--mode")
         .arg("rpc")
         .arg("--append-system-prompt")
@@ -246,6 +263,18 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
             }
             let record: serde_json::Value =
                 serde_json::from_str(&line).unwrap_or(serde_json::Value::String(line));
+            // Track run lifecycle for cross-session status (sidebar dots).
+            // try_state per event is fine: two events per run, no hot path.
+            if let Some(t) = record.get("type").and_then(|v| v.as_str()) {
+                if t == "agent_start" || t == "agent_settled" {
+                    let rk = format!("{}\n{}", tag2, key2);
+                    if let Some(st) = app2.try_state::<AppState>() {
+                        if let Ok(mut rs) = st.run_states.lock() {
+                            rs.insert(rk, t == "agent_start");
+                        }
+                    }
+                }
+            }
             let _ = app2.emit(
                 "pi-record",
                 serde_json::json!({ "cwd": cwd2, "tag": tag2, "key": key2, "record": record }),
@@ -255,12 +284,21 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
 
     let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
     procs.insert(
-        pkey,
+        pkey.clone(),
         PiProc {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
         },
     );
+    drop(procs);
+    // A (re)spawned proc has no live run by definition — a run cannot
+    // survive its process. Drop any stale lifecycle mark (crashed pi
+    // with no settled event), or the sidebar dot sticks until reboot.
+    // The alive fast-path above deliberately skips this: mid-run
+    // ensures must never erase a true mark.
+    if let Ok(mut rs) = state.run_states.lock() {
+        rs.remove(&pkey);
+    }
     // Remember as last used. Quickbar dirs stay out of the shared recents:
     // its throwaway Q&A dirs would drown the real project list.
     if tag.as_deref() != Some("quickbar") {
@@ -300,11 +338,19 @@ fn pi_send(_cwd: String, payload: serde_json::Value, tag: Option<String>, key: S
 
 #[tauri::command]
 fn pi_stop(_cwd: String, tag: Option<String>, key: String, state: State<AppState>) -> Result<(), String> {
-    let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
-    if let Some(p) = procs.remove(&proc_key(&tag, &key)) {
-        if let Ok(mut c) = p.child.lock() {
-            let _ = c.kill();
+    let pkey = proc_key(&tag, &key);
+    {
+        let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
+        if let Some(p) = procs.remove(&pkey) {
+            if let Ok(mut c) = p.child.lock() {
+                let _ = c.kill();
+            }
         }
+    }
+    // A stopped run is over: drop its lifecycle mark too, or run_states
+    // (and every sidebar snapshot) accumulates dead keys forever.
+    if let Ok(mut rs) = state.run_states.lock() {
+        rs.remove(&pkey);
     }
     Ok(())
 }
@@ -376,8 +422,52 @@ fn scan_preview(blob: &str) -> Option<String> {
     None
 }
 
+/// Bounded windows of a session file for the sidebar: header line,
+/// preview window (first 256KB), name window (last 16KB). Transcripts
+/// grow to multi-MB; the listing must never read them whole. Lossy
+/// UTF-8 is fine — both scanners are best-effort text searches.
+/// Returns (header_line, preview_window, tail_window). None = unreadable.
+fn read_session_windows(p: &PathBuf) -> Option<(String, String, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(p).ok()?;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut head = vec![0u8; (len.min(262144)) as usize];
+    let mut n = 0;
+    while n < head.len() {
+        match f.read(&mut head[n..]) {
+            Ok(0) => break, // concurrent truncate: take what we got
+            Ok(m) => n += m,
+            Err(_) => return None,
+        }
+    }
+    head.truncate(n);
+    let line_end = head
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(head.len().min(2000));
+    let header = String::from_utf8_lossy(&head[..line_end]).into_owned();
+    let preview_win = String::from_utf8_lossy(&head).into_owned();
+    let tail_len = (len.min(16384)) as usize;
+    let mut tail = vec![0u8; tail_len];
+    if tail_len > 0 {
+        if f.seek(SeekFrom::End(-(tail_len as i64))).is_err() {
+            return Some((header, preview_win, String::new()));
+        }
+        let mut m = 0;
+        while m < tail.len() {
+            match f.read(&mut tail[m..]) {
+                Ok(0) => break,
+                Ok(k) => m += k,
+                Err(_) => return Some((header, preview_win, String::new())),
+            }
+        }
+        tail.truncate(m);
+    }
+    Some((header, preview_win, String::from_utf8_lossy(&tail).into_owned()))
+}
+
 /// List session files (newest first), optionally filtered to one cwd.
-/// Reads only the header line + a small tail per file. KISS: no index DB.
+/// Reads only the header line + small windows per file. KISS: no index DB.
 #[tauri::command]
 fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Result<Vec<SessionInfo>, String> {
     let root = session_root.unwrap_or_else(session_root_default);
@@ -397,12 +487,13 @@ fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Re
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let content = match fs::read_to_string(&p) {
-                Ok(c) => c,
-                Err(_) => continue,
+            // Bounded windows (see read_session_windows): a sidebar row
+            // must never load a whole multi-MB transcript.
+            let (header, preview_win, tail_win) = match read_session_windows(&p) {
+                Some(w) => w,
+                None => continue,
             };
-            let head_end = content.find('\n').unwrap_or(content.len().min(2000));
-            let head: serde_json::Value = match serde_json::from_str(&content[..head_end]) {
+            let head: serde_json::Value = match serde_json::from_str(&header) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -414,11 +505,8 @@ fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Re
             }
             let id = head.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let timestamp = head.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let tail_start = content.len().saturating_sub(16384);
-            let name = scan_name(&content[tail_start..]);
-            // Preview: first user text (cap scan at 256KB for huge files).
-            let preview = scan_preview(&content[..content.len().min(262144)]);
-            let _ = head_end;
+            let name = scan_name(&tail_win);
+            let preview = scan_preview(&preview_win);
             out.push(SessionInfo {
                 path: p.to_string_lossy().into_owned(),
                 id,
@@ -443,8 +531,9 @@ fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Re
 /// IPC scheme fall back with "Load failed" once assetProtocol is
 /// touched), while plain invoke round-trips fine. Data URIs use no
 /// custom scheme at all.
-#[tauri::command]
-fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, String> {
+/// Shared media path resolution for read_media + media_stat: ~ expansion,
+/// absolute use, base-relative join, file:// strip. One rule, both doors.
+fn resolve_media_path(path: &str, base: &Option<String>) -> Result<PathBuf, String> {
     let p = if let Some(rest) = path.strip_prefix("~/") {
         // Frontend can't expand ~ (it doesn't know HOME); backend can.
         match dirs::home_dir() {
@@ -453,7 +542,7 @@ fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, S
         }
     } else if std::path::Path::new(&path).is_absolute() {
         PathBuf::from(&path)
-    } else if let Some(b) = base.filter(|b| !b.is_empty()) {
+    } else if let Some(b) = base.clone().filter(|b| !b.is_empty()) {
         PathBuf::from(b).join(&path)
     } else {
         return Err("relative media path with no base dir".into());
@@ -461,7 +550,32 @@ fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, S
     // file:// prefix from markdown ("file:///x/y.png" -> "/x/y.png").
     let s = p.to_string_lossy();
     let s = s.strip_prefix("file://").unwrap_or(&s);
-    let p = PathBuf::from(s);
+    Ok(PathBuf::from(s))
+}
+
+fn media_stat_json(meta: &fs::Metadata) -> serde_json::Value {
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    serde_json::json!({ "mtimeMs": mtime_ms, "size": meta.len() })
+}
+
+/// Cheap stat for the frontend's media cache: lets it revalidate bytes
+/// without re-transferring them (same-path rewrites re-read, unchanged
+/// files never do). Mirrors read_media's resolution exactly.
+#[tauri::command]
+fn media_stat(path: String, base: Option<String>) -> Result<serde_json::Value, String> {
+    let p = resolve_media_path(&path, &base)?;
+    let meta = fs::metadata(&p).map_err(|e| format!("unreadable media file: {e}"))?;
+    Ok(media_stat_json(&meta))
+}
+
+#[tauri::command]
+fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, String> {
+    let p = resolve_media_path(&path, &base)?;
     let meta = fs::metadata(&p).map_err(|e| format!("unreadable media file: {e}"))?;
     if meta.len() > 12 * 1024 * 1024 {
         return Err("media file too large for inline display (>12MB)".into());
@@ -483,17 +597,115 @@ fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, S
         "ogv" => "video/ogg",
         _ => return Err(format!("unsupported media type: .{ext}")),
     };
-    Ok(serde_json::json!({ "mime": mime, "base64": base64::engine::general_purpose::STANDARD.encode(&bytes) }))
+    // Stat rides along so the frontend can revalidate its cache without
+    // re-transferring bytes (see media_stat + the data-fast loop).
+    let stat = media_stat_json(&meta);
+    Ok(serde_json::json!({
+        "mime": mime,
+        "base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "mtimeMs": stat.get("mtimeMs"),
+        "size": stat.get("size"),
+    }))
 }
 
 #[tauri::command]
 fn delete_session(path: String, session_root: Option<String>) -> Result<(), String> {
     let root = session_root.unwrap_or_else(session_root_default);
+    // Canonicalize: lexical starts_with is fooled by `..` segments
+    // ("/root/../evil" starts with "/root" component-wise).
+    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable session root: {e}"))?;
     let p = PathBuf::from(&path);
-    if !p.starts_with(&root) {
+    let canonical = fs::canonicalize(&p).map_err(|e| format!("unreadable session file: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
         return Err("refusing to delete outside session dir".into());
     }
-    fs::remove_file(&p).map_err(|e| e.to_string())
+    fs::remove_file(&canonical).map_err(|e| e.to_string())
+}
+
+/// Full transcript of ANY session file, parsed straight from disk.
+/// Same shape as get_messages. This is what history rebuilds read:
+/// the file is the truth every writer shares, so a stale, dead, or busy
+/// pi process can never hide a reply from the UI again. Torn trailing
+/// lines (concurrent writers) are skipped, never fatal. Bounded.
+#[tauri::command]
+fn read_session_messages(path: String, session_root: Option<String>) -> Result<serde_json::Value, String> {
+    let root = session_root.unwrap_or_else(session_root_default);
+    let p = PathBuf::from(&path);
+    // Containment: the file must live inside the session root.
+    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable session root: {e}"))?;
+    let canonical = fs::canonicalize(&p).map_err(|e| format!("unreadable session file: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("refusing to read outside session dir".into());
+    }
+    let meta = fs::metadata(&canonical).map_err(|e| format!("unreadable session file: {e}"))?;
+    if meta.len() > 8 * 1024 * 1024 {
+        return Err("session file too large (>8MB)".into());
+    }
+    let text = fs::read_to_string(&canonical).map_err(|e| format!("unreadable session file: {e}"))?;
+    // Ring: keep the NEWEST 2000. Breaking at the cap would pin the
+    // oldest (long sessions would silently lose their recent end).
+    let mut messages = std::collections::VecDeque::with_capacity(2001);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue, // torn line from a concurrent writer: skip
+        };
+        if v.get("type").and_then(|t| t.as_str()) == Some("message") {
+            if let Some(m) = v.get("message").cloned() {
+                messages.push_back(m);
+                if messages.len() > 2000 {
+                    messages.pop_front();
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "messages": messages }))
+}
+
+/// Run-lifecycle snapshot for sidebar status dots: {bootId, runs:
+/// Process liveness probe (kill(pid, 0): no signal sent). Lets the UI
+/// reconcile subagent rows orphaned by a crash/reboot: no completion
+/// event can ever arrive for those, so their history would otherwise
+/// read "running" forever. EPERM still means alive (exists, foreign uid).
+#[tauri::command]
+fn pids_alive(pids: Vec<i32>) -> Vec<bool> {
+    pids.iter()
+        .map(|pid| {
+            if *pid <= 0 {
+                return false;
+            }
+            unsafe {
+                if libc::kill(*pid, 0) == 0 {
+                    true
+                } else {
+                    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                }
+            }
+        })
+        .collect()
+}
+
+/// [{tag, key, streaming}]}. Read from the tracked map (no pi traffic).
+/// Unknown sessions are simply absent (= idle).
+#[tauri::command]
+fn pi_states(state: State<AppState>) -> serde_json::Value {
+    let runs = match state.run_states.lock() {
+        Ok(rs) => rs
+            .iter()
+            .map(|(k, v)| {
+                let mut parts = k.splitn(2, '\n');
+                let tag = parts.next().unwrap_or("").to_string();
+                let key = parts.next().unwrap_or("").to_string();
+                serde_json::json!({ "tag": tag, "key": key, "streaming": v })
+            })
+            .collect(),
+        Err(_) => vec![],
+    };
+    serde_json::json!({ "bootId": state.boot_id, "runs": runs })
 }
 
 /// Transcript of one spawned subagent (see agent/SPAWN.md). Scoped to the
@@ -528,20 +740,25 @@ fn read_spawn_transcript(run_id: String) -> Result<serde_json::Value, String> {
         return Err("spawn transcript too large (>2MB)".into());
     }
     let text = fs::read_to_string(&file).map_err(|e| format!("unreadable session file: {e}"))?;
-    let mut messages = Vec::new();
+    // Ring: keep the NEWEST 2000. Breaking at the cap would pin the
+    // oldest (long sessions would silently lose their recent end).
+    let mut messages = std::collections::VecDeque::with_capacity(2001);
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("bad session line: {e}"))?;
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue, // torn line from a concurrent writer: skip
+        };
         if v.get("type").and_then(|t| t.as_str()) == Some("message") {
             if let Some(m) = v.get("message").cloned() {
-                messages.push(m);
+                messages.push_back(m);
+                if messages.len() > 2000 {
+                    messages.pop_front();
+                }
             }
-        }
-        if messages.len() >= 2000 {
-            break;
         }
     }
     Ok(serde_json::json!({ "messages": messages }))
@@ -783,8 +1000,64 @@ async fn pick_dir(app: AppHandle) -> Result<Option<String>, String> {
 
 // ---------------------------------------------------------------- run
 
+/// Kill pi children orphaned by an unclean shutdown (SIGKILL, dev-server
+/// restart, crash): same-uid processes carrying our PI_DESKTOP_CHILD
+/// marker whose parent is gone (ppid 1). Never touches live supervised
+/// children (ppid != 1) or anyone else's processes. Without this, an
+/// orphan keeps running its turn and writing the session file while a
+/// fresh backend serves a stale in-memory view of the same session —
+/// replies land on disk but never reach the UI. Linux only; elsewhere
+/// this is a no-op (orphans there are the OS's problem).
+#[cfg(target_os = "linux")]
+fn reap_stale_children() {
+    let me = std::process::id();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == me {
+            continue;
+        }
+        let env = match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let marked = env.split(|b| *b == 0).any(|kv| kv == b"PI_DESKTOP_CHILD=1");
+        if !marked {
+            continue;
+        }
+        let ppid: u32 = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rfind(')').and_then(|i| {
+                    s[i + 2..].split_whitespace().nth(1)?.parse().ok()
+                })
+            })
+            .unwrap_or(0);
+        if ppid == 1 {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reap_stale_children() {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Unclean shutdowns (SIGKILL, dev restarts) orphan pi children that
+    // keep running + writing while a fresh backend serves stale views.
+    // Reap them before anything else. Our own live children (if any)
+    // are never reaped: only ppid-1 processes carry the marker check.
+    reap_stale_children();
     let cfg = load_config();
     // Ensure default Q&A dir exists so first run just works.
     let _ = fs::create_dir_all(&cfg.default_dir);
@@ -812,6 +1085,15 @@ pub fn run() {
         .manage(AppState {
             procs: Mutex::new(HashMap::new()),
             config: Mutex::new(cfg.clone()),
+            run_states: Mutex::new(HashMap::new()),
+            boot_id: {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u128)
+                    .unwrap_or(0);
+                format!("{:x}-{}", nanos, std::process::id())
+            },
         })
         .setup(move |app| {
             // First-launch flags (also used by the KDE custom shortcut).
@@ -850,9 +1132,13 @@ pub fn run() {
             pi_ensure,
             pi_send,
             pi_stop,
+            pi_states,
+            pids_alive,
             list_sessions,
             delete_session,
             read_media,
+            media_stat,
+            read_session_messages,
             read_spawn_transcript,
             delete_spawn_run,
             get_config,

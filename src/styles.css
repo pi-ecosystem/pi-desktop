@@ -279,6 +279,7 @@ details.toolrow > summary:hover { color: var(--text); }
 .msg h1, #qbanswer h1 { margin: 10px 0 4px; font-size: 24px; font-weight: 600; line-height: 31px; }
 .msg h2, #qbanswer h2 { margin: 10px 0 4px; font-size: 20px; font-weight: 600; line-height: 28px; }
 .msg h3, #qbanswer h3 { margin: 8px 0 4px; font-size: 18px; font-weight: 600; line-height: 28px; letter-spacing: -0.72px; }
+.msg h4, .msg h5, .msg h6, #qbanswer h4, #qbanswer h5, #qbanswer h6 { margin: 8px 0 4px; font-size: 15px; font-weight: 600; line-height: 22px; }
 .msg ul, #qbanswer ul { margin: 4px 0; padding-left: 22px; }
 .msg code, #qbanswer code { background: #3a3a3a; padding: 0 4px; border-radius: 4px; font-family: var(--mono); font-size: 12px; }
 .msg pre, #qbanswer pre { background: var(--code); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
@@ -401,6 +402,9 @@ details.spawncard > summary::-webkit-details-marker { display: none; }
 .sdot.running { color: #7aa2f7; animation: pulse 1.2s ease-in-out infinite; }
 .sdot.done { color: #8fce8f; }
 .sdot.stopped { color: #e89b8b; }
+/* Orphaned rows (backend reboot/crash): hollow, dimmed, honest. */
+.sdot.lost { color: var(--dim); }
+details.spawncard[data-state="lost"] > summary { opacity: 0.7; }
 @keyframes pulse { 50% { opacity: 0.35; } }
 .spbody { margin-top: 8px; line-height: 1.65; }
 .msg.sys.spawnnote { border-style: solid; }
@@ -437,3 +441,8 @@ details.spawncard > summary::-webkit-details-marker { display: none; }
 .agentrow .sdel:hover { color: #e89b8b; }
 .agentrow .sstop, .agentrow .ssteer, .agentrow .sreveal { flex: none; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; padding: 2px 10px; color: var(--text); background: none; }
 .agentrow .sstop:hover, .agentrow .ssteer:hover, .agentrow .sreveal:hover { background: rgba(255, 255, 255, 0.08); }
+.sess.pending { opacity: 0.65; }
+.sess.pending .stitle::after { content: " · sending"; color: var(--dim); font-size: 12px; }
+.errtoast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 200; background: #3a1f1f; color: #f0b0b0; border: 1px solid #7a3a3a; border-radius: 10px; padding: 8px 14px; font-size: 13px; max-width: 80vw; }
+/* Cross-session run status: pulsing dot on chats with a live agent. */
+.sess.live .stitle::before { content: "● "; color: #7aa2f7; animation: pulse 1.2s ease-in-out infinite; }

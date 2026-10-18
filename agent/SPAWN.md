@@ -63,4 +63,7 @@ No other types. The Agents panel renders these; nothing else to parse.
 3. No TUI chrome for children. No session-file repointing (spawn fresh).
 4. Extension scoping is selection from loaded, not independent install.
 5. Children die with the parent session (`session_shutdown` kills all).
-   No orphans, no cross-reload persistence (foreground-first by design).
+   Crash-orphans are still possible (dead parent, live child): a backend
+   reboot reaps stragglers, and the desktop UI marks rows no completion
+   can reach as lost instead of "running" forever. No cross-reload
+   adoption — a new host never drives an old child (foreground-first).

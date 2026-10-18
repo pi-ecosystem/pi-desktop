@@ -2554,6 +2554,7 @@ version = "0.1.26"
 dependencies = [
  "base64 0.22.1",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

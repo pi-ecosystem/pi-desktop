@@ -43,7 +43,10 @@ function loadConfig() {
 function saveConfig(c) {
   try {
     fs.mkdirSync(path.dirname(configPath()), { recursive: true });
-    fs.writeFileSync(configPath(), JSON.stringify(c, null, 2));
+    // Atomic: a crash mid-write must never leave a torn config behind.
+    const tmp = configPath() + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(c, null, 2));
+    fs.renameSync(tmp, configPath());
   } catch {}
 }
 
@@ -70,6 +73,11 @@ function piBin() {
 // key: `${tag}\n${key}` -> { child, alive }
 const procs = new Map();
 const sseClients = new Set();
+// Random per backend boot: frontends drop pre-reboot liveness on change.
+const BOOT_ID = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+// Run lifecycle per session key (`tag\nkey`): true while its agent runs.
+// Maintained by watching forwarded records. Backs sidebar run dots.
+const runStates = new Map();
 
 function broadcast(obj) {
   const line = `data: ${JSON.stringify(obj)}\n\n`;
@@ -116,7 +124,8 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
   } catch { /* pi runs without spawn */ }
   if (sessionDir) args.push("--session-dir", sessionDir);
   if (sessionPath) args.push("--session", sessionPath);
-  const child = spawn(piBin(), args, { cwd, stdio: ["pipe", "pipe", "ignore"] });
+  // Marker for boot-time orphan reaping (see reapStaleChildren).
+  const child = spawn(piBin(), args, { cwd, stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, PI_DESKTOP_CHILD: "1" } });
   const entry = { child, alive: true };
   child.on("exit", () => (entry.alive = false));
   child.on("error", () => (entry.alive = false));
@@ -135,10 +144,19 @@ function ensureProc({ cwd, sessionDir, tag, key, sessionPath }) {
       } catch {
         record = line;
       }
+      if (record && (record.type === "agent_start" || record.type === "agent_settled")) {
+        runStates.set(`${tagName}\n${key}`, record.type === "agent_start");
+      }
       broadcast({ cwd, tag: tagName, key, record });
     }
   });
   procs.set(pkey, entry);
+  // A (re)spawned proc has no live run by definition — a run cannot
+  // survive its process. Drop any stale lifecycle mark (crashed pi with
+  // no settled event), or the sidebar dot sticks until reboot. The alive
+  // fast-path above deliberately skips this: mid-run ensures must never
+  // erase a true mark.
+  runStates.delete(pkey);
   if (tag !== "quickbar") {
     CONFIG.last_cwd = cwd;
     CONFIG.recents = pushRecent(CONFIG.recents, cwd);
@@ -164,6 +182,9 @@ function stopProc({ tag, key }) {
     } catch {}
     procs.delete(pkey);
   }
+  // A stopped run is over: drop its lifecycle mark too, or runStates
+  // (and every sidebar snapshot) accumulates dead keys forever.
+  runStates.delete(pkey);
 }
 
 // ---------------------------------------------------------------- sessions
@@ -219,6 +240,46 @@ function scanPreview(blob) {
   return null;
 }
 
+// Bounded windows of a session file for the sidebar: header line,
+// preview window (first 256KB), name window (last 16KB). Null = unreadable.
+function readSessionWindows(p) {
+  let fd;
+  try {
+    fd = fs.openSync(p, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const len = fs.fstatSync(fd).size;
+    const headLen = Math.min(len, 262144);
+    const headBuf = Buffer.alloc(headLen);
+    let n = 0;
+    while (n < headBuf.length) {
+      const r = fs.readSync(fd, headBuf, n, headBuf.length - n, n);
+      if (r <= 0) break; // concurrent truncate: take what we got
+      n += r;
+    }
+    const headStr = headBuf.slice(0, n).toString("utf8");
+    const nl = headStr.indexOf("\n");
+    const header = nl < 0 ? headStr.slice(0, 2000) : headStr.slice(0, nl);
+    const tailLen = Math.min(len, 16384);
+    const tailBuf = Buffer.alloc(tailLen);
+    let m = 0;
+    while (m < tailBuf.length) {
+      const r = fs.readSync(fd, tailBuf, m, tailBuf.length - m, len - tailLen + m);
+      if (r <= 0) break;
+      m += r;
+    }
+    return { header, previewWin: headStr, tail: tailBuf.slice(0, m).toString("utf8") };
+  } catch {
+    return null;
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
+}
+
 function listSessions(cwdFilter, sessionRoot) {
   const root = sessionRoot || sessionRootDefault();
   const out = [];
@@ -240,30 +301,27 @@ function listSessions(cwdFilter, sessionRoot) {
     for (const f of files) {
       if (!f.endsWith(".jsonl")) continue;
       const p = path.join(gp, f);
-      let content;
-      try {
-        content = fs.readFileSync(p, "utf8");
-      } catch {
-        continue;
-      }
-      const nl = content.indexOf("\n");
+      // Bounded windows (see readSessionWindows): a sidebar row must
+      // never load a whole multi-MB transcript.
+      const win = readSessionWindows(p);
+      if (!win) continue;
       let head;
       try {
-        head = JSON.parse(content.slice(0, nl < 0 ? Math.min(content.length, 2000) : nl));
+        head = JSON.parse(win.header);
       } catch {
         continue;
       }
       const cwd = head.cwd || "";
       if (cwdFilter && cwd !== cwdFilter) continue;
-      const tail = content.slice(Math.max(0, content.length - 16384));
-      out.push({
+      const entry = {
         path: p,
         id: head.id || "",
         timestamp: head.timestamp || "",
         cwd,
-        name: scanName(tail),
-        preview: scanPreview(content.slice(0, Math.min(content.length, 262144))),
-      });
+        name: scanName(win.tail),
+        preview: scanPreview(win.previewWin),
+      };
+      out.push(entry);
     }
   }
   out.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
@@ -280,7 +338,7 @@ const MEDIA_MIME = {
   mov: "video/quicktime", ogv: "video/ogg",
 };
 
-function readMedia(mediaPath, base) {
+function resolveMediaPath(mediaPath, base) {
   let p = mediaPath;
   if (p.startsWith("~/")) p = path.join(HOME, p.slice(2));
   else if (p.startsWith("file://")) p = decodeURI(p.replace(/^file:\/\//, ""));
@@ -288,26 +346,85 @@ function readMedia(mediaPath, base) {
     if (!base) throw new Error("relative media path with no base dir");
     p = path.join(base, p);
   }
+  return p;
+}
+function mediaStatJson(st) {
+  return { mtimeMs: Math.floor(st.mtimeMs), size: st.size };
+}
+function readMedia(mediaPath, base) {
+  const p = resolveMediaPath(mediaPath, base);
   const st = fs.statSync(p);
   if (st.size > 12 * 1024 * 1024) throw new Error("media file too large for inline display (>12MB)");
   const ext = (path.extname(p).slice(1) || "").toLowerCase();
   const mime = MEDIA_MIME[ext];
   if (!mime) throw new Error(`unsupported media type: .${ext}`);
-  return { mime, base64: fs.readFileSync(p).toString("base64") };
+  // Stat rides along so the frontend can revalidate its cache without
+  // re-transferring bytes (see media_stat).
+  return { mime, base64: fs.readFileSync(p).toString("base64"), ...mediaStatJson(st) };
 }
 
 const handlers = {
   read_media: (p) => readMedia(p.path, p.base ?? null),
+  // Cheap stat for the frontend's media cache (see readMedia).
+  media_stat: (p) => mediaStatJson(fs.statSync(resolveMediaPath(p.path, p.base ?? null))),
   pi_ensure: (p) => ensureProc(p),
   pi_send: (p) => (sendProc(p), null),
   pi_stop: (p) => (stopProc(p), null),
+  pi_states: () => {
+    const runs = [...runStates.entries()].map(([k, streaming]) => {
+      const i = k.indexOf("\n");
+      return { tag: i < 0 ? k : k.slice(0, i), key: i < 0 ? "" : k.slice(i + 1), streaming };
+    });
+    return { bootId: BOOT_ID, runs };
+  },
+  // Process liveness probe for orphaned subagent rows (see pids_alive
+  // in the Tauri backend). EPERM means alive (exists, foreign uid).
+  pids_alive: (p) => (Array.isArray(p.pids) ? p.pids : []).map((pid) => {
+    if (typeof pid !== "number" || !(pid > 0)) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return (e && e.code) === "EPERM";
+    }
+  }),
   list_sessions: (p) => listSessions(p.cwdFilter ?? null, p.sessionRoot ?? null),
   delete_session: (p) => {
     const root = p.sessionRoot || sessionRootDefault();
-    const resolved = path.resolve(p.path);
-    if (!resolved.startsWith(root)) throw new Error("refusing to delete outside session dir");
-    fs.unlinkSync(resolved);
+    // Canonicalize like the Tauri backend: lexical startsWith is fooled
+    // by symlinks pointing outside the session root.
+    const canonicalRoot = fs.realpathSync(root);
+    const canonical = fs.realpathSync(path.resolve(p.path));
+    if (!canonical.startsWith(canonicalRoot)) throw new Error("refusing to delete outside session dir");
+    fs.unlinkSync(canonical);
     return null;
+  },
+  read_session_messages: (p) => {
+    const root = p.sessionRoot || sessionRootDefault();
+    const resolved = path.resolve(p.path);
+    const realRoot = fs.realpathSync(root);
+    const real = fs.realpathSync(resolved);
+    if (!real.startsWith(realRoot)) throw new Error("refusing to read outside session dir");
+    const st = fs.statSync(real);
+    if (st.size > 8 * 1024 * 1024) throw new Error("session file too large (>8MB)");
+    const messages = [];
+    for (const line of fs.readFileSync(real, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      let v;
+      try {
+        v = JSON.parse(t);
+      } catch {
+        continue; // torn line from a concurrent writer: skip
+      }
+      // Ring: keep the NEWEST 2000 (see the Rust backend). Breaking at
+      // the cap would pin the oldest and drop the recent end.
+      if (v.type === "message" && v.message) {
+        messages.push(v.message);
+        if (messages.length === 4000) messages.splice(0, 2000);
+      }
+    }
+    return { messages: messages.length > 2000 ? messages.slice(-2000) : messages };
   },
   read_spawn_transcript: (p) => {
     const runId = p.run_id ?? p.runId ?? "";
@@ -326,11 +443,20 @@ const handlers = {
     for (const line of fs.readFileSync(file, "utf8").split("\n")) {
       const t = line.trim();
       if (!t) continue;
-      const v = JSON.parse(t);
-      if (v.type === "message" && v.message) messages.push(v.message);
-      if (messages.length >= 2000) break;
+      let v;
+      try {
+        v = JSON.parse(t);
+      } catch {
+        continue; // torn line from a concurrent writer: skip
+      }
+      // Ring: keep the NEWEST 2000 (see the Rust backend). Breaking at
+      // the cap would pin the oldest and drop the recent end.
+      if (v.type === "message" && v.message) {
+        messages.push(v.message);
+        if (messages.length === 4000) messages.splice(0, 2000);
+      }
     }
-    return { messages };
+    return { messages: messages.length > 2000 ? messages.slice(-2000) : messages };
   },
   delete_spawn_run: (p) => {
     const runId = p.runId ?? "";
@@ -410,6 +536,44 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404);
   res.end("pi-desktop web backend. POST /api/invoke, GET /api/events");
 });
+
+// Kill pi children orphaned by an unclean shutdown (same rule as the
+// Tauri backend's reap_stale_children): our marker + reparented to init.
+function reapStaleChildren() {
+  if (process.platform !== "linux") return;
+  let dirs;
+  try {
+    dirs = fs.readdirSync("/proc");
+  } catch {
+    return;
+  }
+  const me = String(process.pid);
+  for (const d of dirs) {
+    if (!/^\d+$/.test(d) || d === me) continue;
+    let env;
+    try {
+      env = fs.readFileSync(`/proc/${d}/environ`, "utf8");
+    } catch {
+      continue;
+    }
+    if (!env.split("\0").includes("PI_DESKTOP_CHILD=1")) continue;
+    let ppid = null;
+    try {
+      const stat = fs.readFileSync(`/proc/${d}/stat`, "utf8");
+      const after = stat.slice(stat.lastIndexOf(")") + 2);
+      ppid = after.split(/\s+/)[1];
+    } catch {
+      continue;
+    }
+    if (ppid === "1") {
+      try {
+        process.kill(Number(d), "SIGKILL");
+      } catch { /* already gone */ }
+    }
+  }
+}
+
+reapStaleChildren();
 
 server.listen(PORT, () => console.log(`[web-backend] listening on http://localhost:${PORT}`));
 

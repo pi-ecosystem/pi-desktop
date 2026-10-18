@@ -3,7 +3,7 @@
 
 import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
-import { awaitSession, config, ensure, onRecord, pi, sessions, setKey, setTag, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -23,7 +23,16 @@ let streaming = false;
 let awaitingResponse = false;
 let streamBuf = "";
 let streamDiv: HTMLElement | null = null;
+// True once the current message completed: late deltas are dropped
+// instead of opening a duplicate bubble. Reopened by the next
+// turn_start / message_start / agent_start.
+let streamClosed = false;
+// Partial stream text per session key. A rebuild (switch/revisit) wipes
+// #msgs, and partial text lives nowhere in history — without this cache
+// the pre-switch portion of a live answer vanishes and the stream
+// appears to stall on return. Seeded back in syncRunFlag.
 let lastStreamWire = 0; // throttle: full wire at most every ~1.5s mid-stream
+let lastStreamRender = 0; // throttle: full re-parse at most every ~250ms mid-stream
 let unsub: (() => void) | null = null;
 let sessCache: SessionInfo[] = [];
 
@@ -68,42 +77,102 @@ function syncSendBtn() {
 // Mirror of pi's own queue, data-driven (see renderQueued). queue_update
 // carries the live {steering[], followUp[]} arrays; cleared on view
 // switch and refined by syncRunFlag's pendingMessageCount.
+// queuedCount covers the gap before the first queue_update: a background
+// queue predates our view, so only its COUNT is known (never invent
+// texts). It suppresses settled rows exactly like a real queue, and a
+// new turn clears it — held messages going live means queue consumed.
 type AgentQueue = { steering: string[]; followUp: string[] };
 let lastQueue: AgentQueue | null = null;
+let queuedCount = 0; // pendingMessageCount fallback, see comment above
+// Last transmit timestamp (any send path): Stop ignores presses inside
+// the debounce window so a double-Enter / double-click can't send-then-
+// instantly-abort — the second press lands on the emptied composer and
+// would otherwise read as "stop". Deliberate stops just click again.
+let lastTransmit = 0;
 // Fire-and-forget stop (button/Escape). Completion settles via agent_settled.
 function stopOnly() {
+  if (Date.now() - lastTransmit < 800) return;
   awaitingResponse = false;
   try {
     pi.abort(cwd).catch(() => {});
   } catch { /* ignore */ }
+  // Wedge guard: if the proc is already gone (crashed pi, reaped child)
+  // the abort fails silently and no settled event will ever unlock the
+  // composer. Settle locally, but only on repeated corroboration — a
+  // single failed sample is just backend busy, and the settled event
+  // (if one comes) settles first and disarms this via !streaming.
+  let n = 0;
+  const t = setInterval(async () => {
+    if (!streaming || ++n > 3) {
+      clearInterval(t);
+      return;
+    }
+    try {
+      await pi.state(cwd);
+      clearInterval(t); // proc answers: settled event owns completion
+    } catch {
+      if (n >= 3 && streaming) {
+        clearInterval(t);
+        finishRun();
+      }
+    }
+  }, 2000);
 }
 const ICO_COPY = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="6.5" y="6.5" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 6.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" stroke="currentColor" stroke-width="1.5"/></svg>`;
 const ICO_REVERT = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3.5 8a6.5 6.5 0 1 1-1 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3.5 3.5V8H8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const ICO_SPEAK = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 7.5v5h2.5L10 16V4L5.5 7.5H3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M13 7.5a4 4 0 0 1 0 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+async function copyText(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch { /* WebKitGTK/Tauri may reject it: legacy path below */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
 async function doCopy(btn: HTMLButtonElement) {
-  const msg = btn.closest(".msg");
+  // User-bubble buttons live in .actions.overlay, a SIBLING after .msg
+  // inside .umsgwrap — closest(".msg") misses them (null → copied "").
+  // Assistant buttons sit inside their .msg. Cover both.
+  const msg = btn.closest(".msg")
+    ?? btn.closest(".umsgwrap")?.querySelector(":scope > .msg");
   const clone = msg?.cloneNode(true) as HTMLElement | null;
   clone?.querySelector(".mmenu-wrap")?.remove();
   const text = clone?.textContent?.trim() ?? "";
   const isIcon = btn.classList.contains("act-copy");
   const orig = btn.innerHTML;
-  try {
-    await navigator.clipboard.writeText(text);
-    if (isIcon) {
-      btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M4 10.5l4 4 7-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-      btn.title = "Copied";
-      setTimeout(() => {
-        btn.innerHTML = orig;
-        btn.title = "Copy";
-      }, 1200);
-    }
-  } catch { /* ignore */ }
+  const ok = await copyText(text);
+  if (!isIcon) return;
+  btn.innerHTML = ok
+    ? `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M4 10.5l4 4 7-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+    : `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+  btn.title = ok ? "Copied" : "Copy failed";
+  setTimeout(() => {
+    btn.innerHTML = orig;
+    btn.title = "Copy";
+  }, 1200);
 }
 // ---- changes pane (Claude-style diff sidebar) ----
 type DiffRef = { tool: string; path: string; args: any; out: string };
 const diffFiles = new Map<string, DiffRef>(); // path -> latest edit/write, this view
 let selKey: string | null = null; // selected file in the pane list
 let viewRef: DiffRef | null = null; // pinned read, or selected file
+// True once the user explicitly picks a file (pane click / expanding its
+// row): live edits then only extend the list, never yank the view away.
+// Rebuilds and view switches clear it back to follow-latest.
+let selPinned = false;
 function diffKey(tool: string, path: string): string {
   return path && path !== tool ? path : `${tool}:${path}`;
 }
@@ -117,13 +186,14 @@ function collectEdits(arr: any[], calls: Map<string, any>) {
   diffFiles.clear();
   selKey = null;
   viewRef = null;
+  selPinned = false;
   for (const m of arr) {
     if (m?.role !== "toolResult") continue;
     const tn = (m.toolName ?? "").toLowerCase();
     if (tn !== "edit" && tn !== "write") continue;
     const a = calls.get(m.toolCallId);
     const p = a?.arguments?.path ?? tn;
-    trackDiff({ tool: m.toolName, path: p, args: a?.arguments ?? {}, out: textOf(m.content) });
+    trackDiff({ tool: m.toolName, path: p, args: a?.arguments ?? {}, out: textOf(m.content).slice(0, 8000) });
   }
 }
 // Live tool result: edits/writes join the file list, reads pin view-only.
@@ -132,7 +202,12 @@ function collectEdits(arr: any[], calls: Map<string, any>) {
 function noteDiff(ref: DiffRef) {
   const tn = (ref.tool || "").toLowerCase();
   if (tn !== "edit" && tn !== "write") return;
-  trackDiff(ref);
+  if (selPinned && selKey) {
+    // User is reading a pinned file: extend the list, keep the view.
+    diffFiles.set(diffKey(ref.tool, ref.path), ref);
+  } else {
+    trackDiff(ref);
+  }
   if (changesVisible()) renderDiffPane();
 }
 function refCounts(r: DiffRef): string {
@@ -144,9 +219,11 @@ function refCounts(r: DiffRef): string {
 // Code block with line numbers (reads in the Changes pane).
 function codeLines(src: string): HTMLElement {
   const box = el("div", "codelines");
-  for (const ln of src.split("\n").slice(0, 400)) {
+  const lines = src.split("\n");
+  for (const ln of lines.slice(0, 400)) {
     box.appendChild(el("div", "cl", esc(ln || " ")));
   }
+  if (lines.length > 400) box.appendChild(el("div", "cl dim", `…(${lines.length - 400} more lines)`));
   return box;
 }
 function renderDiffBody(ref: DiffRef): HTMLElement {
@@ -191,19 +268,25 @@ function renderDiffPane() {
       o.addEventListener("click", () => {
         selKey = k;
         viewRef = r;
+        selPinned = true; // explicit pick: live edits stop following
         renderDiffPane();
       });
       list.appendChild(o);
     }
     body.appendChild(list);
   }
-  if (!viewRef) {
+  // Resolve the selection through the map: a pinned file shows its LATEST
+  // snapshot, not the object identity from click time (edits replace map
+  // entries). Unmapped pinned reads fall back to viewRef.
+  let shown: DiffRef | null = viewRef;
+  if (selKey) shown = diffFiles.get(selKey) ?? viewRef;
+  if (!shown) {
     title.textContent = "Changes";
     if (!diffFiles.size) body.appendChild(el("div", "msg sys", "No changes to show"));
     return;
   }
-  title.textContent = viewRef.path.split("/").pop() || viewRef.path;
-  body.appendChild(renderDiffBody(viewRef));
+  title.textContent = shown.path.split("/").pop() || shown.path;
+  body.appendChild(renderDiffBody(shown));
   wireCopy(body);
 }
 // One shared sidebar, two tabs, one visible at a time. Changes and
@@ -230,7 +313,11 @@ function setSidePane(tab: "changes" | "agents" | null) {
     $("diffwrap").classList.toggle("hidden", tab !== "changes");
     $("agentswrap").classList.toggle("hidden", tab !== "agents");
     if (tab === "changes") renderDiffPane();
-    else renderAgents();
+    else {
+      renderAgents();
+      // Opening the panel is the moment stale rows matter: force a probe.
+      void reconcileSpawns(true);
+    }
   }
   syncPaneBtns();
 }
@@ -291,6 +378,7 @@ function editDiff(name: string, p: any): HTMLElement | null {
       for (const e of p.edits.slice(0, 5)) {
         wrap.appendChild(lineDiffBlock(String(e?.oldText ?? ""), String(e?.newText ?? "")));
       }
+      if (p.edits.length > 5) wrap.appendChild(el("div", "dim", `…(${p.edits.length - 5} more edits)`));
       return wrap;
     }
     // A new file is a diff with an empty old side: same hunks, gutters
@@ -299,9 +387,11 @@ function editDiff(name: string, p: any): HTMLElement | null {
       const wrap = el("div", "diffblock");
       wrap.appendChild(el("div", "diffhead", esc(p.path ?? "write")));
       const box = el("div", "dlblock");
-      for (const t of p.content.slice(0, 4000).split("\n").slice(0, 400)) {
+      const lines = p.content.slice(0, 4000).split("\n");
+      for (const t of lines.slice(0, 400)) {
         box.appendChild(el("div", "dlline dl-add", `<span class="dlgutter">+</span><code>${esc(t) || " "}</code>`));
       }
+      if (lines.length > 400) box.appendChild(el("div", "dlline dl-ctx", `<span class="dlgutter"> </span><code>…(${lines.length - 400} more lines)</code>`));
       wrap.appendChild(box);
       return wrap;
     }
@@ -318,10 +408,17 @@ function lineDiffBlock(oldS: string, newS: string): HTMLElement {
   const line = (cls: string, sig: string, t: string) => {
     box.appendChild(el("div", "dlline " + cls, `<span class="dlgutter">${sig}</span><code>${esc(t) || " "}</code>`));
   };
-  a.slice(Math.max(0, pre - 2), pre).forEach((t) => line("dl-ctx", " ", t));
-  a.slice(pre, a.length - suf).forEach((t) => line("dl-del", "−", t));
-  b.slice(pre, b.length - suf).forEach((t) => line("dl-add", "+", t));
-  b.slice(b.length - suf, b.length - suf + 2).forEach((t) => line("dl-ctx", " ", t));
+  // Cap per-hunk lines: a whole-file replacement would otherwise render
+  // tens of thousands of divs and freeze the view. Context slices are
+  // already tiny; the cap only bites on del/add walls.
+  const show = (arr: string[], cls: string, sig: string) => {
+    arr.slice(0, 200).forEach((t) => line(cls, sig, t));
+    if (arr.length > 200) line("dl-ctx", " ", `…(${arr.length - 200} more lines)`);
+  };
+  show(a.slice(Math.max(0, pre - 2), pre), "dl-ctx", " ");
+  show(a.slice(pre, a.length - suf), "dl-del", "−");
+  show(b.slice(pre, b.length - suf), "dl-add", "+");
+  show(b.slice(b.length - suf, b.length - suf + 2), "dl-ctx", " ");
   if (!a.length && !b.length) line("", " ", "(empty)");
   return box;
 }
@@ -357,21 +454,54 @@ function turnText(row: HTMLElement): string {
 function copyTurn(btn: HTMLButtonElement) {
   const row = btn.closest(".turn-tools") as HTMLElement | null;
   if (!row) return;
-  navigator.clipboard.writeText(turnText(row)).catch(() => {});
+  copyText(turnText(row));
 }
-let speakingTurn: HTMLElement | null = null;
+// Identity of the turn currently being spoken. Button ELEMENTS don't
+// survive re-renders (markTurnActions rebuilds rows), so toggling by
+// element broke after any refresh. Fork entry ids are stable across
+// rebuilds; text-hash fallback covers pre-fork turns.
+let speakingTurnId: string | null = null;
+function turnId(row: HTMLElement): string {
+  let n: Element | null = row.closest(".msg.assistant");
+  while (n) {
+    const prev = n.previousElementSibling;
+    if (!prev) break;
+    if ((prev as HTMLElement).classList?.contains("umsgwrap")) {
+      const rid = ((prev as HTMLElement).querySelector(".act-revert") as HTMLElement | null)?.dataset?.entry;
+      if (rid) return `fork:${rid}`;
+      break;
+    }
+    n = prev;
+  }
+  const t = turnText(row);
+  let h = 0;
+  for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
+  return `txt:${h}:${t.length}`;
+}
 function speakTurn(btn: HTMLButtonElement) {
   try {
     const row = btn.closest(".turn-tools") as HTMLElement | null;
-    if (speakingTurn === btn || !row) {
+    if (!row) {
       speechSynthesis.cancel();
-      speakingTurn = null;
+      speakingTurnId = null;
       return;
     }
+    const id = turnId(row);
     speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(turnText(row).slice(0, 2000));
-    u.onend = () => (speakingTurn = null);
-    speakingTurn = btn;
+    if (speakingTurnId === id) {
+      speakingTurnId = null; // same turn: toggle off
+      return;
+    }
+    const text = turnText(row).slice(0, 2000);
+    if (!text) {
+      speakingTurnId = null;
+      return;
+    }
+    const u = new SpeechSynthesisUtterance(text);
+    u.onend = () => {
+      if (speakingTurnId === id) speakingTurnId = null;
+    };
+    speakingTurnId = id;
     speechSynthesis.speak(u);
   } catch { /* no TTS in this WebView */ }
 }
@@ -381,7 +511,12 @@ function markTurnActions() {
   // `#msgs > .turn-tools` never matched and rows duplicated on every
   // message_end/finish/refresh. One row per user turn, rebuilt each call.
   document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
-  if (streaming) return;
+  // Copy/speak appear only in true quiet: run settled AND nothing queued
+  // behind it. A settle with queued follow-ups (or an accepted-but-silent
+  // follow-up) means more output is coming — showing actions now reads
+  // as "done" prematurely and they flicker when the next turn lands.
+  const queued = (lastQueue != null && (lastQueue.steering.length > 0 || lastQueue.followUp.length > 0)) || queuedCount > 0;
+  if (streaming || awaitingResponse || queued) return;
   const kids = Array.from(document.querySelectorAll("#msgs > *")) as HTMLElement[];
   let hasAsst = false;
   let lastIdx = -1;
@@ -415,6 +550,51 @@ function markTurnActions() {
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
+
+// Non-blocking error surface. Native alert()/confirm() are routed by
+// Tauri to the dialog plugin, which this app doesn't permit — they
+// throw ("dialog.confirm not allowed") instead of asking. So errors
+// toast, and destructive buttons arm-to-confirm in place.
+function toastErr(msg: string): void {
+  try {
+    const t = el("div", "errtoast", esc(msg.slice(0, 300)));
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 6000);
+  } catch { /* ignore */ }
+}
+
+// Crash catcher: any uncaught error or unhandled rejection surfaces as a
+// toast AND persists to a 20-entry ring in localStorage. Silent death is
+// how send+switch style races hide; this makes the next repro self-reporting.
+function trapErrors(): void {
+  const show = (msg: string) => {
+    try {
+      const t = el("div", "errtoast", esc(msg.slice(0, 300)));
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 9000);
+    } catch { /* last resort: stay silent */ }
+  };
+  const log = (msg: string) => {
+    try {
+      const raw = localStorage.getItem("errlog");
+      const arr = raw ? (JSON.parse(raw) as unknown[]) : [];
+      const list = Array.isArray(arr) ? arr : [];
+      list.push({ at: new Date().toISOString(), msg: msg.slice(0, 500) });
+      localStorage.setItem("errlog", JSON.stringify(list.slice(-20)));
+    } catch { /* private mode */ }
+  };
+  window.addEventListener("error", (e) => {
+    const msg = `Error: ${(e as ErrorEvent).message || String((e as ErrorEvent).error ?? e)}`;
+    log(msg);
+    show(msg);
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = (e as PromiseRejectionEvent).reason;
+    const msg = `Unhandled: ${(r as any)?.message ?? String(r ?? e)}`;
+    log(msg);
+    show(msg);
+  });
+}
 
 function el(tag: string, cls: string, html = ""): HTMLElement {
   const d = document.createElement(tag);
@@ -505,7 +685,7 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
       if (ran) d.appendChild(el("div", "tgrun", `<code>${ran}</code>`));
       if (out) d.appendChild(el("div", "tgout", renderMd(out)));
     }
-    (d as any)._diff = { tool: m.toolName ?? "tool", path: params.path ?? (m.toolName ?? "tool"), args: params, out: textOf(m.content) };
+    (d as any)._diff = { tool: m.toolName ?? "tool", path: params.path ?? (m.toolName ?? "tool"), args: params, out: textOf(m.content).slice(0, 8000) };
     wireCopy(d);
     return d;
   }
@@ -530,7 +710,7 @@ function esc(s: string): string {
 // Sessions all the way down: the panel is an index over spawn-* messages
 // (dispatch + result inline, detail behind the click). One map, fed by
 // msgNode, so live appends and history rebuilds can never disagree.
-type SpawnInfo = { id: string; label: string; state: string; startedAt?: number; durationMs?: number; runId?: string; result?: string };
+type SpawnInfo = { id: string; label: string; state: string; startedAt?: number; durationMs?: number; runId?: string; result?: string; pid?: number };
 const spawns = new Map<string, SpawnInfo>();
 
 function threadOf(d: any): string {
@@ -555,20 +735,34 @@ function trackSpawn(m: any): void {
   }
   if (ct === "spawn-started" && d.id) {
     const tid = threadOf(d);
-    if (tombstones().has(tid)) return;
+    if (isBuried(tid)) return;
     const prev = spawns.get(tid);
     // One row per conversation: continuations flip the SAME row back to
     // running and retarget it at the new run. First-seen label wins.
-    spawns.set(tid, {
+    const entry: SpawnInfo = {
       id: tid,
       label: prev?.label ?? d.label ?? tid,
       state: "running",
       startedAt: prev?.startedAt ?? (typeof d.startedAt === "number" ? d.startedAt : undefined),
       runId: d.id,
-    });
+      ...(typeof d.pid === "number" ? { pid: d.pid } : {}),
+    };
+    if (!refreshActive) {
+      // Live start supersedes any stale mark (e.g. an explicit
+      // continuation of a lost thread): this run is real. A later probe
+      // re-marks it if the process is actually gone.
+      staleDrop(tid);
+    } else if (staleHas(tid)) {
+      // Rebuild: the backend can no longer settle this run.
+      entry.state = "lost";
+    }
+    spawns.set(tid, entry);
   } else if ((ct === "spawn-done" || ct === "spawn-stopped") && d.id) {
     const tid = threadOf(d);
-    if (tombstones().has(tid)) return;
+    if (isBuried(tid)) return;
+    // Completion is authoritative: clears any stale mark (the run did
+    // finish — e.g. its done note simply arrived after the marking).
+    staleDrop(tid);
     const s: SpawnInfo = spawns.get(tid) ?? { id: tid, label: d.label ?? tid, state: "running" };
     s.state = d.status ?? (ct === "spawn-done" ? "done" : "stopped");
     s.runId = d.id;
@@ -594,8 +788,8 @@ function spawnElapsed(s: SpawnInfo): string {
 }
 
 function spawnDot(state: string): string {
-  const cls = state === "running" ? "running" : state === "done" ? "done" : "stopped";
-  const glyph = state === "running" ? "◌" : state === "done" ? "●" : "■";
+  const cls = state === "running" ? "running" : state === "done" ? "done" : state === "lost" ? "lost" : "stopped";
+  const glyph = state === "running" ? "◌" : state === "done" ? "●" : state === "lost" ? "○" : "■";
   return `<span class="sdot ${cls}">${glyph}</span>`;
 }
 
@@ -623,9 +817,15 @@ function morphSpawnCards(id: string): void {
     const sum = card.querySelector(":scope > summary");
     if (sum) sum.innerHTML = spawnSummaryHTML(s);
     (card as HTMLElement).dataset.state = s.state;
+    // Orphaned rows (crash/reboot): no result can ever arrive. Retire the
+    // "Running…" placeholder honestly instead of pulsing forever.
+    const ph = card.querySelector(":scope > .spbody[data-ph]");
+    if (s.state === "lost" && ph) {
+      ph.removeAttribute("data-ph");
+      ph.innerHTML = `<span class="dim">Ended before reporting — the backend restarted or crashed mid-run.</span>`;
+    }
     // The answer lands in the ORIGINAL card: fill the running placeholder
     // or append the report once. Never a second card.
-    const ph = card.querySelector(":scope > .spbody[data-ph]");
     if (s.result && ph) {
       ph.removeAttribute("data-ph");
       ph.innerHTML = renderMd(s.result);
@@ -650,7 +850,11 @@ function spawnCard(m: any): HTMLElement {
   }
   const label = d.label ?? "subagent";
   const running = ct === "spawn-started";
-  const state = running ? "running" : (d.status ?? (ct === "spawn-done" ? "done" : "stopped"));
+  // Rebuilds may know more than the bare message (stale/lost orphans):
+  // prefer the tracked state so dead rows never render "Running…".
+  // (trackSpawn ran first, above, so this is fresh.)
+  const tracked = d.id ? spawns.get(threadOf(d)) : undefined;
+  const state = tracked?.state ?? (running ? "running" : (d.status ?? (ct === "spawn-done" ? "done" : "stopped")));
   const info: SpawnInfo = {
     id, label, state,
     ...(typeof d.durationMs === "number" ? { durationMs: d.durationMs } : {}),
@@ -668,6 +872,9 @@ function spawnCard(m: any): HTMLElement {
     const body = el("div", "spbody", renderMd(textOf(m.content).slice(0, 12000)));
     wrap.appendChild(body);
     wireCopy(wrap);
+  } else if (state === "lost") {
+    // Tracked orphan (see above): honest body, no placeholder for morph.
+    wrap.appendChild(el("div", "spbody", `<span class="dim">Ended before reporting — the backend restarted or crashed mid-run.</span>`));
   } else {
     const ph = el("div", "spbody", `<span class="dim">Running…</span>`);
     (ph as HTMLElement).dataset.ph = "1";
@@ -718,12 +925,146 @@ function tombstones(): Set<string> {
   }
   return tombCache;
 }
+function isBuried(id: string): boolean {
+  if (tombstones().has(id)) return true;
+  // Deletes made under the fresh key must hold after key migration.
+  if (curFile && curFile !== viewKey) {
+    try {
+      const raw = localStorage.getItem("spawn-deleted:" + curFile);
+      const arr = raw ? (JSON.parse(raw) as unknown[]) : [];
+      if (Array.isArray(arr) && arr.includes(id)) return true;
+    } catch { /* ignore */ }
+  }
+  return false;
+}
+// Key-explicit tombstone write (no cache): for burials whose view is
+// already gone (see deleteSpawn's fence) — the viewKey-bound cache would
+// poison the wrong session's set.
+function buryUnder(key: string, id: string): void {
+  try {
+    const raw = localStorage.getItem("spawn-deleted:" + key);
+    const arr = raw ? (JSON.parse(raw) as unknown[]) : [];
+    const set = new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
+    if (set.has(id)) return;
+    set.add(id);
+    localStorage.setItem("spawn-deleted:" + key, JSON.stringify([...set]));
+  } catch { /* private mode */ }
+}
 function burySpawn(id: string): void {
+  staleDrop(id); // a deleted row needs no orphan mark either
   const s = tombstones();
   s.add(id);
   try {
     localStorage.setItem(tombCacheKey, JSON.stringify([...s]));
   } catch { /* private mode */ }
+  // A thread viewed under its fresh key buries under the file path on
+  // revisit: record both so deletes survive the key migration.
+  if (curFile && curFile !== viewKey) buryUnder(curFile, id);
+}
+
+// Orphan marks: subagent threads whose backend can no longer settle them
+// (backend reboot or parent crash — no spawn-done can ever arrive, so the
+// row would read "running" forever). Persisted per session like
+// tombstones. Keyed by the session FILE when known (stable across the
+// fresh-key -> file migration); fresh views fall back to the view key.
+// Deletes (tombstones) win over stale; completions clear it.
+let staleCacheKey = "";
+let staleCache = new Set<string>();
+function staleKey(): string {
+  return "spawn-stale:" + (curFile ?? viewKey);
+}
+function staleSet(): Set<string> {
+  const key = staleKey();
+  if (key !== staleCacheKey) {
+    staleCacheKey = key;
+    try {
+      const raw = localStorage.getItem(key);
+      const arr = raw ? JSON.parse(raw) as unknown : [];
+      staleCache = new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
+    } catch {
+      staleCache = new Set();
+    }
+  }
+  return staleCache;
+}
+function stalePersist(): void {
+  try {
+    localStorage.setItem(staleCacheKey, JSON.stringify([...staleCache]));
+  } catch { /* private mode */ }
+}
+function staleHas(id: string): boolean {
+  return staleSet().has(id);
+}
+function staleAdd(id: string): void {
+  staleSet().add(id);
+  stalePersist();
+}
+function staleDrop(id: string): void {
+  if (staleSet().delete(id)) stalePersist();
+}
+
+// Flip one running row to "lost" (shared by the boot tripwire and the
+// pid probe). Freezes elapsed at the moment of marking. Returns true if
+// flipped. Cards morph in place, badge/handlers follow from state,
+// transcripts stay viewable.
+function loseSpawn(id: string): boolean {
+  const s = spawns.get(id);
+  if (!s || s.state !== "running") return false;
+  s.state = "lost";
+  if (typeof s.startedAt === "number" && typeof s.durationMs !== "number") {
+    s.durationMs = Date.now() - s.startedAt;
+  }
+  staleAdd(id);
+  morphSpawnCards(id);
+  return true;
+}
+
+// Flip every running row to "lost": the backend underneath them is gone
+// (reboot tripwire, see the 20s interval).
+function markAllSpawnsStale(): void {
+  let any = false;
+  for (const id of [...spawns.keys()]) {
+    if (loseSpawn(id)) any = true;
+  }
+  if (any) {
+    updateAgentsBtn();
+    if (agentsVisible()) renderAgents();
+  }
+}
+
+// Probe recorded child pids and retire the dead. Only ever marks dead
+// (high confidence): pid reuse or a missing backend command leaves rows
+// alone, so this can never kill a live row — worst case, status quo.
+let spawnProbeInFlight = false;
+let lastSpawnProbe = 0;
+async function reconcileSpawns(force = false): Promise<void> {
+  const running = [...spawns.values()].filter(
+    (s) => s.state === "running" && typeof s.pid === "number" && (s.pid as number) > 0);
+  if (!running.length || spawnProbeInFlight) return;
+  if (!force && Date.now() - lastSpawnProbe < 30_000) return;
+  lastSpawnProbe = Date.now();
+  spawnProbeInFlight = true;
+  try {
+    let alive: boolean[];
+    try {
+      alive = await procAlive.check(running.map((s) => s.pid as number));
+    } catch {
+      return; // backend without pids_alive: the boot rule still applies
+    }
+    let changed = false;
+    running.forEach((s, i) => {
+      if (!alive[i] && loseSpawn(s.id)) changed = true;
+    });
+    if (changed) {
+      updateAgentsBtn();
+      if (agentsVisible()) renderAgents();
+    }
+  } catch {
+    // Render-path failures are surfaced by their synchronous callers;
+    // this floating probe must never become an unhandled rejection.
+  } finally {
+    spawnProbeInFlight = false;
+  }
 }
 
 function renderAgentsList(): void {
@@ -813,8 +1154,16 @@ function openSpawn(id: string): void {
   renderAgents();
 }
 
+// Throttle for the transcript re-read below: the 5s elapsed ticker
+// re-renders the panel, and without this every beat re-reads + re-parses
+// the whole file even when nothing changed. Selection changes force via
+// detailCount = -1 (see openSpawn); content changes apply on the next
+// beat (≤5s lag in a side panel, main chat stays live via events).
+let lastDetailRead = 0;
 async function renderSpawnDetail(id: string): Promise<void> {
   const body = $("agenttranscript");
+  if (detailCount >= 0 && body.dataset.detail === id && Date.now() - lastDetailRead < 5000) return;
+  lastDetailRead = Date.now();
   let messages: any[] = [];
   try {
     const data = await spawnTranscript.read(id);
@@ -871,7 +1220,9 @@ async function renderSpawnDetail(id: string): Promise<void> {
       shown++;
     }
     if (!shown) body.appendChild(el("div", "msg sys", "No transcript yet — child hasn't produced output."));
-    collectEdits(messages, calls);
+    // No collectEdits here: the Changes pane belongs to the main session.
+    // Collecting the child's edits would wipe and refill it with another
+    // session's files (same reason lastRun is quarantined above).
     wireCopy(body);
   } finally {
     lastRun = keepRun;
@@ -888,20 +1239,31 @@ async function renderSpawnDetail(id: string): Promise<void> {
 // children are stopped first (theirs to wind down), then files go.
 // No chat message — the row vanishing IS the feedback.
 async function deleteSpawn(id: string): Promise<void> {
-  const s = spawns.get(id);
-  if (s?.state === "running") {
-    try {
-      await pi.prompt(cwd, `/agent-stop ${id}`);
-    } catch { /* already gone */ }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
+  // View fence: the awaits below can span a session switch. Filesystem
+  // work is view-independent, but the tombstone and panel below belong
+  // to the origin view — never the new one.
+  const dk = viewKey;
+  const cf = curFile;
+  const stillHere = () => viewKey === dk;
+  // One atomic server-side command (stop + exit-wait + files + tombstone).
+  // The old stop prompt + blind sleep + direct remove raced the backend's
+  // own shutdown: files removed mid-shutdown could be recreated by the
+  // dying child after we deleted them.
   try {
-    await spawnTranscript.remove(id);
+    await pi.prompt(cwd, `/agent-delete ${id}`, undefined, dk || undefined);
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`delete failed: ${e.message ?? e}`)));
+    if (stillHere()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`delete failed: ${e.message ?? e}`)));
+    }
     return;
   }
-  burySpawn(id);
+  if (stillHere()) {
+    burySpawn(id);
+  } else {
+    buryUnder(dk, id);
+    if (cf && cf !== dk) buryUnder(cf, id);
+  }
+  if (!stillHere()) return;
   spawns.delete(id);
   if (selSpawn === id) {
     selSpawn = null;
@@ -917,13 +1279,21 @@ async function deleteSpawn(id: string): Promise<void> {
 // delayed rebuild covers a missed event. Never touches run UI.
 async function sendAgentCmd(text: string): Promise<void> {
   hideCmdList();
+  const sk = viewKey;
   try {
-    await pi.prompt(cwd, text);
+    await pi.prompt(cwd, text, undefined, sk || undefined);
   } catch (e: any) {
+    if (viewKey !== sk) return; // moved on: don't scribble on the new view
     $("msgs").appendChild(el("div", "msg sys", esc(`agent command failed: ${e.message ?? e}`)));
     return;
   }
-  if (!streaming) setTimeout(() => { if (!streaming) refreshMsgs(); }, 1200);
+  if (!streaming) {
+    setTimeout(() => {
+      // Fenced to the sending session: a mid-flight switch must not
+      // rebuild (and wipe the live stream of) the newly viewed session.
+      if (!streaming && viewKey === sk) refreshMsgs();
+    }, 1200);
+  }
 }
 
 function prefillSteer(id: string): void {
@@ -936,29 +1306,6 @@ function prefillSteer(id: string): void {
 }
 
 // ---- streaming ----
-
-const normText = (s: string): string => s.replace(/\s+/g, " ").trim();
-
-function flushStream(finalText?: string) {
-  if (!streamDiv) {
-    streamBuf = "";
-    return;
-  }
-  if (streamBuf && finalText && normText(streamBuf) === normText(finalText)) {
-    // Streamed preview matches the authoritative message: drop the preview,
-    // the full render below replaces it. Otherwise we'd show it twice.
-    streamDiv.remove();
-  } else if (streamBuf) {
-    const n = el("div", "msg assistant", renderMd(streamBuf));
-    streamDiv.replaceWith(n);
-    wireCopy(n);
-    pin();
-  } else {
-    streamDiv.remove();
-  }
-  streamDiv = null;
-  streamBuf = "";
-}
 
 // Thinking indicator lives in the message flow, where the answer will
 // stream — never parked in a separate row above the composer.
@@ -983,13 +1330,48 @@ function hideThinking() {
 
 function route(rec: any) {
   if (!rec) return;
+  // Turn boundaries gate the stream: deltas arriving after their
+  // message completed (provider stragglers, IPC bursts around switches)
+  // would otherwise birth a second ghost bubble of the same text.
+  // message_end closes; the next turn/message/run reopens.
+  if (rec.type === "turn_start" || rec.type === "agent_start") {
+    streamClosed = false;
+    queuedCount = 0; // held messages went live: count fallback consumed
+  }
+  if (rec.type === "message_start") {
+    streamClosed = false;
+  }
+  // A new turn starting (follow-ups, steering continuations, retries)
+  // locks the composer even though no send() ran: startRun's flag is
+  // per-send, but turns are per-agent. finishRun (settled / watchdog)
+  // is the matching unlock. Without this the UI idles mid-turn and
+  // action rows pop in prematurely.
+  if (rec.type === "turn_start" || rec.type === "agent_start") {
+    if (!refreshActive) {
+      streaming = true;
+      // A turn is work: mirror startRun's liveness marks (follow-up and
+      // steered turns never pass through startRun, so without this the
+      // composer locks while the sidebar dot stays dark).
+      if (viewKey) noteRunLive(viewKey, true);
+      if (viewPath) {
+        runLive.set(viewPath, true);
+        paintRunDots();
+      }
+      syncSendBtn();
+      // New work invalidates settled rows immediately: the previous
+      // turn's actions must not sit visible while the next turn streams.
+      // (They return via markTurnActions at the next real settle.)
+      document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
+    }
+  }
   // Streaming deltas (wire records are delta-only).
   if (rec.type === "message_update") {
     if (rec.usage && typeof rec.usage.totalTokens === "number") {
       runTok = Math.max(runTok, rec.usage.totalTokens);
     }
     const ev = rec.assistantMessageEvent ?? {};
-    if (ev.type === "text_delta" && typeof ev.delta === "string") {      // Dots stay until the final answer (agent_settled), even while text
+    if (ev.type === "text_delta" && typeof ev.delta === "string") {
+      if (streamClosed) return; // straggler from a completed message: drop      // Dots stay until the final answer (agent_settled), even while text
       // streams or tools run in gaps. No flicker clearing anywhere else.
       // First token takes the indicator's place in the flow.
       if (streamBuf === "") hideThinking();
@@ -1002,6 +1384,17 @@ function route(rec: any) {
         streamDiv = el("div", "msg assistant stream");
         $("msgs").appendChild(streamDiv);
       }
+      // Full re-parse + relayout per token is O(n^2) on long answers and
+      // janks WebKitGTK visibly. Paint at ~4Hz mid-stream; completion
+      // paths (message_end/flush) always render the full text, so nothing
+      // is ever lost to the throttle.
+      const nowRender = Date.now();
+      if (nowRender - lastStreamRender < 250 && ev.delta.length < 200) {
+        dotsToEnd();
+        pin();
+        return;
+      }
+      lastStreamRender = nowRender;
       streamDiv.innerHTML = renderMd(streamBuf);
       // Throttled mid-stream wiring: local images/cards resolve while the
       // answer is still coming. Resolve-once cache keeps this to one
@@ -1017,6 +1410,7 @@ function route(rec: any) {
     } else if (ev.type === "toolcall_start") {
       showThinking();
     } else if (typeof ev.type === "string" && ev.type.includes("think")) {
+      if (streamClosed) return; // same straggler guard as text
       if (refreshActive) return; // partial thinks; full blocks via history
       awaitingResponse = false;
       const d = (ev as any).delta ?? (ev as any).text ?? "";
@@ -1038,78 +1432,31 @@ function route(rec: any) {
     if (rec.message.role === "assistant" || rec.message.role === "toolResult" || rec.message.role === "bashExecution") {
       awaitingResponse = false;
     }
-    flushStream(rec.message.role === "assistant" ? textOf(rec.message.content) : undefined);
-    if (rec.message.role === "system") return;
-    // History rebuild owns the tree while active: keep bookkeeping maps
-    // warm (tool args, final-text dedup) but write no DOM — history covers
-    // it, and a second copy is exactly the back-to-back duplication.
+    // A history rebuild in flight can't be trusted to include this
+    // message (its snapshot may predate it) — buffer it and replay
+    // after the rebuild, instead of dropping it into the void.
     if (refreshActive) {
       if (rec.message.role === "assistant" && Array.isArray(rec.message.content)) {
         for (const b of rec.message.content) {
           if (b && b.type === "toolCall" && b.id) liveCalls.set(b.id, b);
         }
       }
+      if (!liveBuffer) liveBuffer = [];
+      if (liveBuffer.length < 100) liveBuffer.push({ key: getKey(), message: rec.message });
       return;
     }
-    // Remember ToolCall args so rows can show what ran.
-    if (rec.message.role === "assistant" && Array.isArray(rec.message.content)) {
-      for (const b of rec.message.content) {
-        if (b && b.type === "toolCall" && b.id) liveCalls.set(b.id, b);
-      }
-      // Full thinking blocks replace the live-streamed partial version.
-      liveThinkDiv?.remove();
-      liveThinkDiv = null;
-      liveThinkBuf = "";
+    // Dedupe against history just rendered: a message_end landing just
+    // after a rebuild would otherwise double with the snapshot. Keys are
+    // unique per message (response/toolCall ids, timestamps), so genuine
+    // repeats still render.
+    const rk = msgKey(rec.message);
+    if (!renderedKeys.has(rk)) {
+      renderedKeys.add(rk);
+      appendMessageEnd(rec.message);
     }
-    if (rec.message.role === "user") {
-      // Mirror: pi echoes user messages at delivery time, in true order.
-      // Always render the echo — no optimistic bubbles, no skip tokens,
-      // so the transcript can never disagree with pi's own history.
-      liveRun = null;
-    }
-    if (rec.message.role === "assistant" && Array.isArray(rec.message.content)) {
-      for (const b of rec.message.content) {
-        if (b && b.type === "thinking" && b.thinking) {
-          liveRun = runAppend($("msgs"), liveRun, thoughtDiv(b.thinking));
-          dotsToEnd();
-        }
-      }
-    }
-    if (rec.message.role === "toolResult" || rec.message.role === "bashExecution") {
-      liveRun = runAppend($("msgs"), liveRun, msgNode(rec.message, liveCalls));
-      dotsToEnd();
-      pin();
-      if (rec.message.role === "toolResult") {
-        const tn = (rec.message.toolName ?? "").toLowerCase();
-        // Pane tracks file changes only (edit/write). Reads, bash and
-        // friends expand inline and never touch it.
-        if (tn === "edit" || tn === "write") {
-          const a = liveCalls.get(rec.message.toolCallId);
-          noteDiff({ tool: rec.message.toolName, path: a?.arguments?.path ?? tn, args: a?.arguments ?? {}, out: textOf(rec.message.content) });
-        }
-      }
-      return;
-    }
-    if (rec.message.role === "assistant" && !textOf(rec.message.content)) return;
-    // Mirror: every assistant text renders, even exact repeats. pi shows
-    // them; suppressing was our invention (streaming made benign dupes,
-    // but the transcript must never disagree with pi's history).
-    const n = msgNode(rec.message, liveCalls);
-    $("msgs").appendChild(n);
-    wireCopy(n);
-    dotsToEnd();
-    pin();
-    // Live text splits the Activity stream like history does: later
-    // thoughts/tools start a new container below this bubble. Clear the
-    // partial-think pointer too, or new deltas bleed into the old box.
-    if (rec.message.role === "assistant") {
-      liveRun = null;
-      liveThinkDiv = null;
-      liveThinkBuf = "";
-    }
-    markTurnActions();
     return;
   }
+
   if (rec.type === "tool_execution_start") {
     showThinking();
     return;
@@ -1117,6 +1464,12 @@ function route(rec: any) {
   if (rec.type === "tool_execution_end") {
     if (rec && typeof rec.toolCallId === "string" && typeof rec.durationMs === "number") {
       toolElapsed.set(rec.toolCallId, rec.durationMs);
+      // toolCallIds are unique per call: cap the cache or it grows
+      // forever across sessions (Map iterates insertion-first).
+      if (toolElapsed.size > 500) {
+        const oldest = toolElapsed.keys().next().value;
+        if (oldest !== undefined) toolElapsed.delete(oldest);
+      }
     }
     return;
   }
@@ -1128,20 +1481,104 @@ function route(rec: any) {
   // Already key-filtered to the viewed session upstream. Renders the
   // queued bar (edit / promote-to-steer live here now, not on bubbles).
   if (rec.type === "queue_update") {
+    queuedCount = 0; // authoritative texts arrived: count superseded
     lastQueue = {
       steering: Array.isArray(rec.steering) ? rec.steering.filter((s: any) => typeof s === "string") : [],
       followUp: Array.isArray(rec.followUp) ? rec.followUp.filter((s: any) => typeof s === "string") : [],
     };
     renderQueued();
+    // Queued means not quiet: settled action rows (if any) must hide
+    // until the queue drains. Empty queue re-arms them via the same call.
+    markTurnActions();
     return;
   }
+}
+
+
+function appendMessageEnd(message: any): void {
+  const m = message;
+  // The stream preview can never become permanent content: drop it
+  // unconditionally at assistant completions and render the authoritative
+  // message below. No compare, no freeze, no second bubble ever.
+  if (m.role === "assistant" && streamDiv) {
+    streamDiv.remove();
+    streamDiv = null;
+    streamBuf = "";
+  }
+  if (m.role === "system") return;
+  // This message's stream is over: any later delta is a straggler.
+  if (m.role === "assistant") streamClosed = true;
+  // Remember ToolCall args so rows can show what ran.
+  if (m.role === "assistant" && Array.isArray(m.content)) {
+    for (const b of m.content) {
+      if (b && b.type === "toolCall" && b.id) liveCalls.set(b.id, b);
+    }
+    // Full thinking blocks replace the live-streamed partial version.
+    liveThinkDiv?.remove();
+    liveThinkDiv = null;
+    liveThinkBuf = "";
+  }
+  if (m.role === "user") {
+    // Mirror: pi echoes user messages at delivery time, in true order.
+    // Always render the echo — no optimistic bubbles, no skip tokens,
+    // so the transcript can never disagree with pi's own history.
+    liveRun = null;
+  }
+  if (m.role === "assistant" && Array.isArray(m.content)) {
+    for (const b of m.content) {
+      if (b && b.type === "thinking" && b.thinking) {
+        liveRun = runAppend($("msgs"), liveRun, thoughtDiv(b.thinking));
+        dotsToEnd();
+      }
+    }
+  }
+  if (m.role === "toolResult" || m.role === "bashExecution") {
+    liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls));
+    dotsToEnd();
+    pin();
+    if (m.role === "toolResult") {
+      const tn = (m.toolName ?? "").toLowerCase();
+      // Pane tracks file changes only (edit/write). Reads, bash and
+      // friends expand inline and never touch it.
+      if (tn === "edit" || tn === "write") {
+        const a = liveCalls.get(m.toolCallId);
+        noteDiff({ tool: m.toolName, path: a?.arguments?.path ?? tn, args: a?.arguments ?? {}, out: textOf(m.content).slice(0, 8000) });
+      }
+    }
+    return;
+  }
+  if (m.role === "assistant" && !textOf(m.content)) return;
+  // Mirror: every assistant text renders, even exact repeats. pi shows
+  // them; suppressing was our invention (streaming made benign dupes,
+  // but the transcript must never disagree with pi's history).
+  const n = msgNode(m, liveCalls);
+  $("msgs").appendChild(n);
+  wireCopy(n);
+  dotsToEnd();
+  pin();
+  // Live text splits the Activity stream like history does: later
+  // thoughts/tools start a new container below this bubble. Clear the
+  // partial-think pointer too, or new deltas bleed into the old box.
+  if (m.role === "assistant") {
+    liveRun = null;
+    liveThinkDiv = null;
+    liveThinkBuf = "";
+  }
+  markTurnActions();
 }
 
 const THINKING_DOTS = `<span class="thinking" aria-label="thinking"><i></i><i></i><i></i></span>`;
 
 function startRun() {
   streaming = true;
+  lastTransmit = Date.now();
+  if (viewKey) noteRunLive(viewKey, true);
+  if (viewPath) {
+    runLive.set(viewPath, true);
+    paintRunDots();
+  }
   streamBuf = "";
+  streamClosed = false; // new turn: reopen the stream gate
   markTurnActions();
   runT0 = Date.now();
   runTok = 0;
@@ -1167,31 +1604,50 @@ async function maybeAutoName() {
   } catch { /* best effort */ }
 }
 
-// Truth-based run watchdog: while the UI believes a run is live, poll the
-// agent's own isStreaming flag. Settles the UI when the agent is actually
-// done (normal path is still agent_settled; this covers lost events and
-// dead children). Never settles while the agent reports work in progress,
-// no matter how long the run takes. 30min cap so a wedged poller dies.
-function watchRun(watchCwd: string): void {
+// Truth-based run watchdog, scoped to one session key: while the UI
+// believes that session's run is live, poll the agent's own isStreaming
+// flag. Settles the UI when the agent is actually done (normal path is
+// still agent_settled; this covers lost events and dead children). Settles
+// UI only while viewing that key — a background run settles on revisit
+// (syncRunFlag + rebuild). Never settles while the agent reports work in
+// progress, no matter how long the run takes. 30min cap so a wedged
+// poller dies.
+function watchRun(watchCwd: string, watchKey?: string): void {
+  // The run belongs to wk; UI settles only while viewing it. State is
+  // queried with the explicit key so a background run is still observed.
+  const wk = watchKey ?? viewKey;
   let n = 0;
+  let fails = 0;
   const t = setInterval(async () => {
-    if (!streaming || watchCwd !== cwd) {
+    if (watchCwd !== cwd) {
+      clearInterval(t);
+      return;
+    }
+    const viewing = viewKey === wk && getKey() === wk;
+    if (!streaming && viewing) {
       clearInterval(t);
       return;
     }
     if (++n > 120) {
-      finishRun();
+      if (viewing) finishRun();
       clearInterval(t);
       return;
     }
     try {
-      const s: any = await pi.state(watchCwd);
+      const s: any = await pi.state(watchCwd, wk || undefined);
+      fails = 0; // proc answers (even mid-run): keep watching for idle
       if (s && s.isStreaming === false) {
-        finishRun();
+        if (viewing) finishRun();
         clearInterval(t);
       }
     } catch {
-      /* pi busy/starting: keep watching */
+      // State is backend-answered, so consecutive failures mean the proc
+      // is gone — not a busy agent. Stop polling a corpse long before
+      // the 30min cap (settle mirrors the cap path: viewing only).
+      if (++fails >= 5) {
+        if (viewing) finishRun();
+        clearInterval(t);
+      }
     }
   }, 15_000);
 }
@@ -1201,6 +1657,11 @@ function watchRun(watchCwd: string): void {
 // false and never auto-send: firing into a dead/busy backend loops errors.
 function finishRun() {
   streaming = false;
+  if (viewKey) noteRunLive(viewKey, false);
+  if (viewPath) {
+    runLive.set(viewPath, false);
+    paintRunDots();
+  }
   clearMediaCache(); // regenerated files must re-read next run
   streaming = false;
   clearMediaCache(); // regenerated files must re-read next run
@@ -1237,12 +1698,57 @@ function finishRun() {
   maybeAutoName().finally(() => refreshLight());
 }
 
-// ---- data loading ----
+// First message sent, file not yet on disk: optimistic sidebar row.
+// Set at send time (your action), cleared on view change or landing.
+let pendingSend: { title: string; at: number } | null = null;
+// Synchronous optimistic row: no API wait, no polling. Rebuilds wipe
+// and re-add it via refreshSessions until the real entry lands.
+function paintPendingRow(): void {
+  if (!pendingSend) return;
+  const list = $("sesslist");
+  if (list.querySelector(":scope > .sess.pending")) return;
+  const d = el("div", "sess pending",
+    `<div class="stitle">${esc(pendingSend.title)}</div><div class="ssub">sending…</div>`);
+  list.prepend(d);
+}
 
-// Optimistic entry for the session being written: pi only materializes
-// the file on first model activity, but the user hit send *now*, so show
-// it now (keyed by the real session file from live state).
-let pendingNew: { path: string; title: string } | null = null;
+// Cross-session run tracking (sidebar dots): path -> live. Fed by the
+// status channel (background agent_start/settled) plus a snapshot on
+// every sidebar refresh. The viewed session is driven by run events
+// directly; this map covers everything else.
+const runLive = new Map<string, boolean>();
+let lastBootId = "";
+// Session file -> live proc key. A run keeps the key it started with
+// (fresh id); switching by file path must reattach to THAT proc,
+// not spawn an idle duplicate that reports a dead-quiet session.
+const fileToKey = new Map<string, string>();
+// Reverse lookup: live proc key -> session file (procs keep the key
+// they started with, so fresh-id runs map back to their file row).
+function fileForProc(procKey: string): string | null {
+  for (const [f, k] of fileToKey) if (k === procKey) return f;
+  return null;
+}
+// Single choke point for event-driven liveness. runLive is keyed by
+// session FILE (rows match on file path), but backend events carry PROC
+// keys (fresh ids for app-started chats) — storing the raw proc key
+// alone never matches a row and the dot never lights. Mirror both.
+function noteRunLive(procKey: string, live: boolean): void {
+  runLive.set(procKey, live);
+  if (procKey.includes("/")) {
+    fileToKey.set(procKey, procKey);
+  } else {
+    const f = fileForProc(procKey);
+    if (f) runLive.set(f, live);
+  }
+  paintRunDots();
+}
+function paintRunDots(): void {
+  document.querySelectorAll("#sesslist .sess").forEach((d) => {
+    const p = (d as HTMLElement).title;
+    const live = !!p && runLive.get(p) === true;
+    d.classList.toggle("live", live);
+  });
+}
 
 async function refreshSessions() {
   try {
@@ -1251,31 +1757,84 @@ async function refreshSessions() {
     sessCache = [];
     return;
   }
-  if (pendingNew) {
-    if (sessCache.some((x) => x.path === pendingNew!.path)) {
-      pendingNew = null; // file landed: real entry takes over
-    } else {
-      try {
-        const s: any = await pi.state(cwd);
-        if (s?.sessionFile === pendingNew.path) {
-          sessCache.unshift({
-            path: pendingNew.path,
-            id: s.sessionId ?? "",
-            timestamp: new Date().toISOString(),
-            cwd,
-            name: pendingNew.title,
-            preview: null,
-          });
-        } else {
-          pendingNew = null; // switched away: drop the ghost
-        }
-      } catch { /* pi starting */ }
-    }
+  // Optimistic row for a just-sent first message: pi materializes the
+  // file on first model activity, but the chat exists from YOUR send.
+  // Display-only (no click, no delete — nothing exists on disk yet);
+  // replaced by the real entry once listed.
+  if (pendingSend) {
+    try {
+      const s: any = await pi.state(cwd);
+      const f: string | null = s?.sessionFile ?? null;
+      // Live file mapping: the proc key here may still be the fresh id,
+      // but rows match on file path. Keep both pointed at the truth.
+      if (f && streaming) runLive.set(f, true);
+      if (f) fileToKey.set(f, viewKey);
+      if (f && sessCache.some((x) => x.path === f)) {
+        pendingSend = null; // landed: real entry takes over
+      } else if (!f && !streaming) {
+        pendingSend = null; // settled with no file (aborted/handled): nothing coming
+      } else {
+        sessCache.unshift({
+          path: f ?? "",
+          id: s?.sessionId ?? "",
+          timestamp: new Date(pendingSend.at).toISOString(),
+          cwd,
+          name: pendingSend.title,
+          preview: null,
+        });
+      }
+    } catch { /* pi starting */ }
   }
+  // Merge cross-session run states (cheap map read, no pi traffic).
+  // Backend keys are proc keys: file paths for resumed sessions,
+  // fresh ids for new chats. Fresh ids resolve via one state call each
+  // (only for live ones — usually zero or one). Entries self-correct
+  // on the next event or snapshot. A backend reboot (bootId change)
+  // clears everything: supervised runs don't survive it.
+  // (Old backends return a bare array: accept it, skip the boot check.)
+  try {
+    const snapRaw: any = await runStates.snapshot();
+    const snap = Array.isArray(snapRaw) ? snapRaw : snapRaw?.runs ?? [];
+    if (!Array.isArray(snapRaw) && typeof snapRaw?.bootId === "string") {
+      if (snapRaw.bootId !== lastBootId) {
+        lastBootId = snapRaw.bootId;
+        runLive.clear();
+      }
+    }
+    const next = new Map<string, boolean>();
+    for (const s of snap) {
+      if (s.tag && s.tag !== "main") continue;
+      if (!s.key || !s.streaming) continue;
+      if (s.key.includes("/")) {
+        next.set(s.key, true);
+        fileToKey.set(s.key, s.key);
+      } else {
+        try {
+          const st: any = await pi.state(cwd, s.key);
+          if (st?.sessionFile) {
+            next.set(st.sessionFile, true);
+            fileToKey.set(st.sessionFile, s.key);
+          }
+        } catch { /* proc gone */ }
+      }
+    }
+    runLive.clear();
+    for (const [k, v] of next) runLive.set(k, v);
+    // Re-apply the viewed session's authoritative local state.
+    if (viewKey && viewKey.includes("/")) runLive.set(viewKey, streaming);
+  } catch { /* backend without pi_states: skip */ }
   const f = ($("sessfilter") as HTMLInputElement).value.toLowerCase();
   const list = $("sesslist");
+  // Rebuilds run after every finish/switch: preserve sidebar scroll or
+  // a long chat list snaps to top under the user each time.
+  const keepScroll = list.scrollTop;
   list.innerHTML = "";
   for (const s of sessCache) {
+    // Never spoken in, not live: fresh new_session or aborted-instantly
+    // leftovers with no name and no user text. Not chats yet — hide.
+    // Live sessions are exempt: pi buffers file writes, so a running
+    // chat's file can momentarily lack its user text.
+    if (!s.name && !s.preview && runLive.get(s.path) !== true) continue;
     const label = `${s.name ?? ""} ${s.id.slice(0, 8)} ${s.timestamp}`.toLowerCase();
     if (f && !label.includes(f)) continue;
     const d = el(
@@ -1285,24 +1844,51 @@ async function refreshSessions() {
         `<div class="ssub">${esc(subText(s))}</div>`
     );
     d.title = s.path;
-    d.addEventListener("click", () => switchSession(s.path));
+    if (!s.path) {
+      // Optimistic row: display-only. No click (nothing to open yet),
+      // no delete (nothing on disk yet). The real entry replaces it.
+      d.classList.add("pending");
+    } else {
+      d.addEventListener("click", () => switchSession(s.path));
+    }
     const del = el("button", "sdel", "×");
     del.title = "Delete session file";
     del.addEventListener("click", async (e) => {
       e.stopPropagation();
-      if (!confirm("Delete this session file?")) return;
+      // Arm-to-confirm: native confirm() throws under Tauri (dialog
+      // plugin not permitted). First click arms, second executes.
+      // Rebuilds reset the armed state, so it can't stick.
+      if (del.dataset.armed !== "1") {
+        del.dataset.armed = "1";
+        del.textContent = "?";
+        del.title = "Click again to confirm delete";
+        setTimeout(() => {
+          del.dataset.armed = "";
+          if (del.isConnected) {
+            del.textContent = "×";
+            del.title = "Delete session file";
+          }
+        }, 3000);
+        return;
+      }
       const wasActive = s.path === curFile;
       try {
         await sessions.del(s.path);
       } catch (e: any) {
-        alert(`delete failed: ${e.message ?? e}`);
+        toastErr(`delete failed: ${e.message ?? e}`);
         return;
       }
       // Deleting the viewed session: stop its child (it keeps running
-      // otherwise, orphaned) and open a fresh one.
+      // otherwise, orphaned) and open a fresh one. Procs keep the key
+      // they started with (fresh id), so stop by the mapped proc key —
+      // the file path alone matches no proc for app-started chats.
       try {
-        await stopChild(cwd, s.path).catch(() => {});
+        await stopChild(cwd, fileToKey.get(s.path) ?? s.path).catch(() => {});
       } catch { /* no child */ }
+      // Drop tracking for the deleted file: stale marks would otherwise
+      // linger (and a future file reusing the path would inherit them).
+      runLive.delete(s.path);
+      fileToKey.delete(s.path);
       if (wasActive) {
         try {
           resetRunState();
@@ -1313,9 +1899,12 @@ async function refreshSessions() {
       }
       refreshSessions();
     });
-    d.appendChild(del);
+    if (s.path) d.appendChild(del);
     list.appendChild(d);
   }
+  // Restore pre-rebuild scroll (clamped: rows may have come or gone).
+  list.scrollTop = Math.min(keepScroll, Math.max(0, list.scrollHeight - list.clientHeight));
+  paintRunDots();
 }
 
 // ChatGPT-style titles: explicit /name wins, else first words of first prompt.
@@ -1358,7 +1947,40 @@ const CHEV = `<svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d=
 // the load) and strand the thinking dots mid-flow — route() skips DOM
 // writes while set (bookkeeping maps still update).
 let refreshActive = false;
+// Messages that complete DURING a rebuild: the rebuild's snapshot may
+// predate them, so they're buffered here and replayed (deduped) after.
+// Without this, a reply landing mid-switch vanishes from the view.
+let liveBuffer: any[] | null = null;
+// Identity of messages already rendered (replay dedup). Response and
+// tool-call ids are stable; user/custom fall back to role+text+time.
+const renderedKeys = new Set<string>();
+function msgKey(m: any): string {
+  if (m?.role === "assistant" && typeof m.responseId === "string" && m.responseId) return `a:${m.responseId}`;
+  if (m?.role === "toolResult" && typeof m.toolCallId === "string") return `t:${m.toolCallId}`;
+  if (m?.role === "bashExecution") return `b:${m.command ?? ""}:${(m.output ?? "").length}`;
+  if (m?.role === "custom") return `c:${m.customType ?? ""}:${textOf(m.content).slice(0, 200)}`;
+  return `${m?.role ?? "?"}:${m?.timestamp ?? ""}:${textOf(m?.content).slice(0, 200)}`;
+}
+function replayLiveBuffer(): void {
+  const buf = liveBuffer;
+  liveBuffer = null;
+  if (!buf?.length) return;
+  let added = 0;
+  for (const e of buf) {
+    // Only this view's messages: another session's rebuild may have
+    // superseded us (its own replay covers those).
+    if (!e || e.key !== viewKey) continue;
+    const m = e.message;
+    const k = msgKey(m);
+    if (renderedKeys.has(k)) continue;
+    renderedKeys.add(k);
+    appendMessageEnd(m);
+    added++;
+  }
+  if (added) pin();
+}
 
+let rebuildGen = 0;
 async function refreshMsgs() {
   const box = $("msgs");
   box.innerHTML = "";
@@ -1373,9 +1995,33 @@ async function refreshMsgs() {
   liveThinkBuf = "";
   hideThinking();
   refreshActive = true;
+  liveBuffer = [];
+  renderedKeys.clear();
+  // Superseded rebuilds abort at the next await: two interleaved rebuilds
+  // would otherwise both write #msgs (scrambled order) and both replay
+  // the live buffer (duplicates). Only the latest finishes.
+  const myGen = ++rebuildGen;
+  const alive = () => myGen === rebuildGen;
   try {
-    const data = await pi.messages(cwd);
-    const arr = data.messages ?? [];
+    // History comes from the FILE, not the pi process: the file is the
+    // truth every writer shares, so a stale, dead, or busy child can
+    // never hide a reply from the view again. Fresh chats have no file
+    // yet — those (and only those) read via live RPC.
+    const fp = viewPath ?? curFile;
+    let arr: any[];
+    if (fp) {
+      try {
+        const data = await sessions.read(fp);
+        arr = data.messages ?? [];
+      } catch {
+        const data = await pi.messages(cwd);
+        arr = data.messages ?? [];
+      }
+    } else {
+      const data = await pi.messages(cwd);
+      arr = data.messages ?? [];
+    }
+    if (!alive()) return;
     // Entry ids so each sent message gets copy + revert (fork) actions.
     // Matched by text (order-independent): index mapping breaks if pi ever
     // returns entries in any other order.
@@ -1390,6 +2036,7 @@ async function refreshMsgs() {
         }
       }
     } catch { /* forks unavailable */ }
+    if (!alive()) return;
     const takeForkId = (text: string): string | undefined => {
       const q = forkByText.get(text);
       return q?.length ? (q.shift() as string) : undefined;
@@ -1418,20 +2065,23 @@ async function refreshMsgs() {
         }
       }
       if (isTool(m)) {
+        renderedKeys.add(msgKey(m));
         run = runAppend(box, run, msgNode(m, calls));
         shown++;
         continue;
       }
       // Textless assistant turns (tool-call-only) would flash as empty
       // boxes; their content already lives in the Activity container.
-      if (m.role === "assistant" && !textOf(m.content)) continue;
+      if (m.role === "assistant" && !textOf(m.content)) { renderedKeys.add(msgKey(m)); continue; }
       // Silent customs (display:false): track (tombstones) but never render.
       if (m.role === "custom" && (m as any).display === false) {
+        renderedKeys.add(msgKey(m));
         trackSpawn(m);
         continue;
       }
       // Mirror: repeats render. (Dedup was ours; pi shows them.)
       const fid = m.role === "user" ? takeForkId(textOf(m.content)) : undefined;
+      renderedKeys.add(msgKey(m));
       const n = msgNode(m, calls, fid);
       box.appendChild(n);
       // Rendered text splits the Activity stream: thoughts/tools after
@@ -1451,9 +2101,18 @@ async function refreshMsgs() {
     markTurnActions();
     const mp = $("scrollwrap");
     mp.scrollTop = mp.scrollHeight;
+    if (!alive()) return;
     refreshActive = false;
+    // Replay anything that completed during the rebuild window above.
+    // Deduped against what history just rendered: no drops, no doubles.
+    replayLiveBuffer();
+    // Spawns just rebuilt: probe recorded pids (throttled) so rows for
+    // crash/reboot orphans flip to lost instead of pulsing forever.
+    void reconcileSpawns();
   } catch (e: any) {
+    if (!alive()) return;
     refreshActive = false;
+    replayLiveBuffer();
     box.appendChild(el("div", "msg sys", esc(`could not load messages: ${e.message ?? e}`)));
   }
 }
@@ -1545,11 +2204,14 @@ function renderModelOpts() {
     const o = el("div", "dd-opt", esc(m.name ?? m.id));
     (o as HTMLElement).dataset.v = v;
     o.addEventListener("click", async () => {
+      // Capture the cwd: a mid-flight directory switch must not retarget
+      // the choice at the new session (pi.* resolves curKey lazily).
+      const mc = cwd;
       closeDrops();
       try {
-        await pi.setModel(cwd, m.provider, m.id);
+        await pi.setModel(mc, m.provider, m.id);
       } catch (err: any) {
-        alert(`model switch failed: ${err.message ?? err}`);
+        toastErr(`model switch failed: ${err.message ?? err}`);
       }
       refreshModels();
     });
@@ -1594,11 +2256,12 @@ function renderThinkOpts() {
     const o = el("div", "dd-opt", esc(l));
     (o as HTMLElement).dataset.v = l;
     o.addEventListener("click", async () => {
+      const mc = cwd; // see model picker: fence against dir switches
       closeDrops();
       try {
-        await pi.setThinking(cwd, l);
+        await pi.setThinking(mc, l);
       } catch (err: any) {
-        alert(`thinking switch failed: ${err.message ?? err}`);
+        toastErr(`thinking switch failed: ${err.message ?? err}`);
       }
       refreshModels();
     });
@@ -1717,12 +2380,14 @@ async function runLocalCmd(text: string): Promise<boolean> {
   if (!m) return false;
   const name = m[1].toLowerCase();
   if (name === "new") {
+    cwdGen++; // invalidate any in-flight setCwd (see switchSession)
     resetRunState();
     hideCmdList();
+    paintEmpty();
     try {
       await openFresh();
     } catch (e: any) {
-      alert(`new chat failed: ${e.message ?? e}`);
+      toastErr(`new chat failed: ${e.message ?? e}`);
     }
     ($("input") as HTMLTextAreaElement).value = "";
     syncSendBtn();
@@ -1788,7 +2453,14 @@ function refreshLight() {
 // different child and re-renders. Local partial UI is reset so a stale
 // stream doesn't linger in the new view.
 
+// In-flight revert guard: double-clicking forks twice into two branches
+// (single shared child, last-writer-wins view, one orphaned fork).
+let reverting = false;
 async function doRevert(entryId: string) {
+  if (reverting) return;
+  reverting = true;
+  // Same in-flight-setCwd invalidation as switchSession (see above).
+  cwdGen++;
   try {
     resetRunState();
     const before = curFile;
@@ -1799,10 +2471,17 @@ async function doRevert(entryId: string) {
     // The fork switched this child; retire it and open a dedicated child
     // so the key always means the file it names.
     await stopChild(cwd, oldKey).catch(() => {});
+    // The retired proc is dead: drop its marks, or the abandoned branch
+    // keeps a live dot and the mapping points at a corpse.
+    runLive.delete(oldKey);
+    for (const [f, k] of fileToKey) {
+      if (k === oldKey) fileToKey.delete(f);
+    }
     if (file) {
       await ensure(cwd, file, file);
       setKey(file);
       viewKey = file;
+      viewPath = file;
       curFile = file;
     }
     await refreshAll(false);
@@ -1814,7 +2493,9 @@ async function doRevert(entryId: string) {
       inp.focus();
     }
   } catch (err: any) {
-    alert(`revert failed: ${err.message ?? err}`);
+    toastErr(`revert failed: ${err.message ?? err}`);
+  } finally {
+    reverting = false;
   }
 }
 
@@ -1823,7 +2504,13 @@ async function doRevert(entryId: string) {
 // the old run into the new session's view.
 function resetRunState() {
   streaming = false;
+  // A queued follow-up's bridge flag belongs to its own view: without
+  // this, switching sessions mid-bridge hides the new (idle) session's
+  // action rows and a later finishRun shows thinking spuriously.
+  awaitingResponse = false;
   clearMediaCache();
+  pendingSend = null;
+  freshUnsent = false;
   spawns.clear();
   selSpawn = null;
   detailCount = -1;
@@ -1837,7 +2524,13 @@ function resetRunState() {
   liveThinkDiv = null;
   liveThinkBuf = "";
   lastQueue = null;
+  queuedCount = 0;
   $("qbar")?.replaceChildren();
+  selPinned = false;
+  try {
+    speechSynthesis.cancel();
+  } catch { /* no TTS */ }
+  speakingTurnId = null;
   hideCmdList();
   lastRun = null;
   diffFiles.clear();
@@ -1853,41 +2546,107 @@ function resetRunState() {
 let viewKey = "";
 let viewPath: string | null = null;
 
-// Fresh backend child for a brand-new session. The file only materializes
-// on first model activity; the poll pins the filename for the sidebar.
+// Fresh backend child for a brand-new session. The key/viewpoint switch
+// is synchronous (instant UI); the heavy parts (spawning pi, newSession)
+// run in the background. send() awaits initPromise for the viewed key,
+// so a fast Enter can never land in the fresh process's stale session.
+let initForKey = "";
+let initPromise: Promise<void> | null = null;
+// A fresh chat with nothing sent yet: the row appears on YOUR send,
+// not on file landing. Set by openFresh, cleared on first prompt success.
+let freshUnsent = false;
+// Virgin fresh procs (opened, never sent on): rapid New-chat clicks each
+// spawned a pi child and only the latest was ever viewed — the rest
+// leaked forever. Retired by the next openFresh (see below).
+const virginFresh = new Set<string>();
+// Condemned virgins: kill orders issued while their ensure was still in
+// flight (nothing registered yet, so the kill missed). The init checks
+// this after ensure and retires itself instead of leaking idle. Entries
+// are single-use keys — consumed on first observation, never reused.
+const condemnedFresh = new Set<string>();
 async function openFresh(): Promise<void> {
   const key = `fresh-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
-  await ensure(cwd, key, null);
+  // Retire superseded virgins first: keys with a sent message left the
+  // set on send success, so anything remaining here never served a view
+  // and holds no transcript — safe to stop, even mid-boot.
+  for (const k of [...virginFresh]) {
+    if (k !== key) {
+      virginFresh.delete(k);
+      // Condemn first: if its ensure hasn't registered yet the kill
+      // below misses, and the init's post-ensure check retires it.
+      condemnedFresh.add(k);
+      stopChild(cwd, k).catch(() => {});
+    }
+  }
+  virginFresh.add(key);
   setKey(key);
   viewKey = key;
   viewPath = null;
-  const before: string | null = await pi.state(cwd).then((s: any) => s?.sessionFile ?? null).catch(() => null);
-  await pi.newSession(cwd);
-  const file = await awaitSession(cwd, before);
-  curFile = file;
-  pendingNew = file ? { path: file, title: "New chat" } : null;
+  curFile = null;
+  initForKey = key;
+  initPromise = (async () => {
+    await ensure(cwd, key, null);
+    if (condemnedFresh.has(key)) {
+      // A newer New-chat retired us mid-boot (this check runs first:
+      // condemned keys are always moved-on ones). Stop the just-spawned
+      // proc instead of leaking it idle, then get out of the way.
+      condemnedFresh.delete(key);
+      virginFresh.delete(key);
+      await stopChild(cwd, key).catch(() => {});
+      return;
+    }
+    if (viewKey !== key) return; // user moved on: leave it alone
+    setKey(key);
+    await pi.newSession(cwd);
+  })();
+  freshUnsent = true;
+  await initPromise;
+}
+
+// Instant empty view for new chats: paint first, backend catches up.
+// No sidebar entry until the first prompt lands (no ghost rows).
+function paintEmpty(): void {
+  const box = $("msgs");
+  box.innerHTML = "";
+  box.appendChild(el("div", "greet", `<h2>Ready when you are.</h2>`));
+  $("sesstitle").textContent = "New chat";
+  listActive(undefined);
+  syncSendBtn();
 }
 
 async function switchSession(path: string) {
+  // Invalidate any in-flight setCwd: it would otherwise complete after us
+  // and steal the view back to its own session. Last click wins.
+  cwdGen++;
   // Relative embeds (./shots/…) resolve against the viewed session's own
   // cwd, which may differ from the window cwd after cross-dir navigation.
   const info = sessCache.find((x) => x.path === path);
   if (info?.cwd) setMediaBase(info.cwd);
+  // Reattach to the live proc when one already serves this file (fresh
+  // key from its first send). Otherwise a duplicate idle proc spawns
+  // and the view reports a dead-quiet session while the real run
+  // continues invisibly elsewhere.
+  const key = fileToKey.get(path) ?? path;
   try {
     resetRunState();
-    await ensure(cwd, path, path);
-    setKey(path);
-    viewKey = path;
+    await ensure(cwd, key, path);
+    setKey(key);
+    viewKey = key;
     viewPath = path;
     curFile = path;
   } catch (e: any) {
-    alert(`switch failed: ${e.message ?? e}`);
+    toastErr(`switch failed: ${e.message ?? e}`);
     return;
   }
-  refreshAll(false);
-  // AFTER the rebuild: refreshMsgs wipes #msgs (including any thinking
-  // row), so re-arming here is the only order that survives. Returning
-  // to a still-running session shows its thinking indicator again.
+  // AWAITED deliberately: refreshMsgs wipes #msgs, and syncRunFlag's
+  // dots + stream reseed must land AFTER the rebuild. Unawaited, the two
+  // race: dots get suppressed by refreshActive and never re-arm, the
+  // seeded stream lands mid-list, and the returned-to run looks dead.
+  // (That was the send+switch symptom: no thinking, no live response.)
+  await refreshAll(false);
+  // AFTER the rebuild: re-arming here is the only order that survives.
+  // Returning to a still-running session shows its thinking indicator
+  // again, with the live stream continuing underneath.
   await syncRunFlag();
 }
 
@@ -1896,15 +2655,36 @@ async function switchSession(path: string) {
 async function syncRunFlag() {
   try {
     const s: any = await pi.state(cwd);
-    if (s?.isStreaming) {
+    // Working = run lifecycle truth (runLive, fed by agent_start/settled
+    // for every session), not just the isStreaming sample — the sample
+    // can read false mid-run (between turns, long tools) while the run
+    // is obviously still alive. Sidebar dot and transcript dots must agree.
+    const live = !!s?.isStreaming || (viewKey !== "" && runLive.get(viewKey) === true);
+    if (viewKey) {
+      noteRunLive(viewKey, live);
+      // Rows match on file path, not proc key: a fresh-keyed view
+      // must mirror its file entry or the sidebar dot disagrees.
+      if (viewPath) {
+        fileToKey.set(viewPath, viewKey);
+        runLive.set(viewPath, live);
+      }
+      paintRunDots();
+    }
+    if (live) {
       streaming = true;
       syncSendBtn();
+      // The rebuild just ran assuming idle and left settled copy/speak
+      // rows under the last reply. A live run must never show them:
+      // strip first, then re-arm the thinking indicator.
+      document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
       showThinking();
     }
     // Count-only queue fallback: texts arrive via queue_update, but a
     // background queue predates our view of the session. Never invent
     // texts — show the count until an event refines it (or zero clears).
+    // The count also feeds markTurnActions so settled rows stay hidden.
     if (typeof s?.pendingMessageCount === "number") {
+      queuedCount = s.pendingMessageCount;
       if (s.pendingMessageCount > 0 && !lastQueue) {
         lastQueue = { steering: [], followUp: [] };
         const bar = $("qbar");
@@ -1915,6 +2695,10 @@ async function syncRunFlag() {
         $("qbar")?.replaceChildren();
       }
     }
+    // Reconcile settled rows with the now-known state: live strips the
+    // rebuild's premature rows (no-op if stripped above); idle re-arms
+    // them only when truly quiet (streaming/queue guards inside).
+    markTurnActions();
   } catch { /* ignore */ }
 }
 
@@ -1939,6 +2723,13 @@ async function send() {
   stick = true;
   hideCmdList();
   dropToBottom();
+  // The chat exists from YOUR send: paint the row synchronously, titled
+  // "New chat", before any API roundtrip. Replaced by the real entry
+  // once pi writes it (a later title generator will rename it).
+  if (freshUnsent && !pendingSend) {
+    pendingSend = { title: "New chat", at: Date.now() };
+    paintPendingRow();
+  }
   // Transmit-only: the bubble appears when pi echoes (milliseconds when
   // idle). startRun's dots are the send acknowledgment. On failure the
   // text goes back to the composer instead of being lost.
@@ -1951,47 +2742,120 @@ async function send() {
   liveThinkBuf = "";
   liveCalls = new Map<string, any>();
   startRun();
-  try {
-    await ensure(cwd, viewKey || undefined, viewPath);
-    if (viewKey) setKey(viewKey);
-  } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`pi failed to start: ${e.message ?? e}`)));
-    finishRun();
+  // Fence the whole send to the session it started in: viewKey/curKey
+  // are mutable and a mid-send switch must abandon (restore + note),
+  // never misdirect the prompt into the newly viewed session.
+  const sendKey = viewKey;
+  const sendPath = viewPath;
+  const movedOn = () => viewKey !== sendKey;
+  // Settle run UI only while still viewing this send's session (whether
+  // continuously or after switching away and back). After a mid-send
+  // switch the other view owns the UI; settling here would flush its
+  // partial stream, kill its dots, and unlock its composer mid-run.
+  // A backgrounded run settles its own view on revisit (rebuild + sync).
+  const settleIfViewing = () => {
+    if (!movedOn()) finishRun();
+  };
+  const abandon = (note: string) => {
+    // Never clobber what the user typed in the new view: restore only
+    // into an empty composer, and only then explain with a note.
+    const inpA = $("input") as HTMLTextAreaElement;
+    if (!inpA.value.trim()) {
+      inpA.value = text;
+      inpA.style.height = "auto";
+      $("msgs").appendChild(el("div", "msg sys", esc(note)));
+    }
+    syncSendBtn();
+    settleIfViewing();
+  };
+  // Fresh chat still initializing: wait for its backend first, or the
+  // text lands in the new process's stale (most-recent) session.
+  if (initPromise && sendKey === initForKey) {
+    try {
+      await initPromise;
+    } catch {
+      // A transient new_session failure would otherwise brick this tab:
+      // every later send re-awaits the same cached rejection. Retry once
+      // on the same key (same session, no routing change), then restore.
+      initPromise = null;
+      initForKey = "";
+      try {
+        await ensure(cwd, sendKey || undefined, sendPath);
+        await pi.newSession(cwd);
+      } catch {
+        const inp3 = $("input") as HTMLTextAreaElement;
+        if (!inp3.value.trim()) inp3.value = text;
+        syncSendBtn();
+        if (!movedOn()) {
+          $("msgs").appendChild(el("div", "msg sys", esc("new chat failed to start (kept in composer)")));
+        }
+        settleIfViewing();
+        return;
+      }
+    }
+  }
+  if (movedOn()) {
+    abandon("switched sessions before send completed (message kept in composer)");
     return;
   }
-  // Register the about-to-be-written session immediately.
-  pi.state(cwd).then((s: any) => {
-    if (s?.sessionFile) {
-      pendingNew = {
-        path: s.sessionFile,
-        title: s.sessionName ?? text.split(/\s+/).slice(0, 6).join(" ").slice(0, 48) ?? "New chat",
-      };
-      refreshSessions();
-    }
-  }).catch(() => {});
   try {
-    const res: any = await pi.prompt(cwd, text);
+    await ensure(cwd, sendKey || undefined, sendPath);
+    if (movedOn()) {
+      abandon("switched sessions before send completed (message kept in composer)");
+      return;
+    }
+    // NOTE: no setKey here — the key rides the payload (see below), so
+    // the viewed session's routing is never disturbed by a background send.
+  } catch (e: any) {
+    // Same fence as the prompt path below: a mid-ensure switch must not
+    // scribble on, or settle, the newly viewed session.
+    if (!movedOn()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`pi failed to start: ${e.message ?? e}`)));
+      finishRun();
+    }
+    return;
+  }
+  // Transmit-only: the bubble appears when pi echoes (milliseconds when
+  // idle). startRun's dots are the send acknowledgment. On failure the
+  // text goes back to the composer instead of being lost.
+  try {
+    // Key rides the payload: lands in sendKey's session even if the
+    // user has moved on. watchRun settles UI only if still viewing it.
+    const res: any = await pi.prompt(cwd, text, undefined, sendKey || undefined);
+    freshUnsent = false;
+    virginFresh.delete(sendKey); // sent-on: no longer a leak candidate
+    if (movedOn()) {
+      watchRun(cwd, sendKey);
+      return;
+    }
     if (res?.disposition === "handled") {
       // Extension command consumed the prompt: no run started, so no
       // agent_settled will ever arrive. Settle now and reload history —
       // the command's own output (if any) arrives as messages.
       // Note: handled commands add no user echo to history; what you
       // typed won't show as a bubble, only the command's output does.
-      finishRun();
-      await refreshMsgs();
+      settleIfViewing();
+      if (!movedOn()) await refreshMsgs();
     } else {
       // Completion arrives via agent_settled. Watchdog (not a fixed timer):
       // the old 180s safety net declared the run finished while long agents
       // were still working. Now we poll the agent's own isStreaming flag and
       // only settle the UI when it is actually done (or lost, or 30min cap).
-      watchRun(cwd);
+      watchRun(cwd, sendKey);
     }
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`send failed (kept in composer): ${e.message ?? e}`)));
-    const inp2 = $("input") as HTMLTextAreaElement;
-    inp2.value = text;
-    syncSendBtn();
-    finishRun();
+    // Same fence on failure: restore + note only if still viewing.
+    if (!movedOn()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`send failed (kept in composer): ${e.message ?? e}`)));
+      const inp2 = $("input") as HTMLTextAreaElement;
+      inp2.value = text;
+      syncSendBtn();
+    } else {
+      const inp2 = $("input") as HTMLTextAreaElement;
+      if (!inp2.value.trim()) inp2.value = text;
+      syncSendBtn();
+    }
+    settleIfViewing();
   }
   persistLastCwd();
 }
@@ -2003,26 +2867,41 @@ async function send() {
 async function sendFollowUp(text: string): Promise<void> {
   const inp = $("input") as HTMLTextAreaElement;
   inp.value = "";
+  lastTransmit = Date.now();
   syncSendBtn();
   inp.style.height = "auto";
   stick = true;
   dropToBottom();
-  try {
-    await ensure(cwd, viewKey || undefined, viewPath);
-    if (viewKey) setKey(viewKey);
-  } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`pi failed to start: ${e.message ?? e}`)));
-    inp.value = text;
+  // Follow-up continues the run: settled rows from the previous turn
+  // must go now, not when the next message completes.
+  document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
+  // Fenced like send(): a mid-flight switch must not requeue elsewhere.
+  // The composer is shared across views: restore into it only when still
+  // viewing (or when it is empty), never clobbering the new view's draft.
+  const fk = viewKey;
+  const fp = viewPath;
+  const stillHere = () => viewKey === fk;
+  const restoreFollowUp = (note: string) => {
+    if (stillHere()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(note)));
+      inp.value = text;
+    } else if (!inp.value.trim()) {
+      inp.value = text;
+    }
     syncSendBtn();
+  };
+  try {
+    await ensure(cwd, fk || undefined, fp);
+  } catch (e: any) {
+    restoreFollowUp(`pi failed to start: ${e.message ?? e}`);
     return;
   }
   try {
-    await pi.prompt(cwd, text, "followUp");
+    await pi.prompt(cwd, text, "followUp", fk || undefined);
     awaitingResponse = true;
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`follow-up failed, kept in composer (run continues): ${e.message ?? e}`)));
-    inp.value = text;
-    syncSendBtn();
+    // (restoreFollowUp already syncs the button.)
+    restoreFollowUp(`follow-up failed, kept in composer (run continues): ${e.message ?? e}`);
   }
   persistLastCwd();
 }
@@ -2035,13 +2914,20 @@ async function sendSlashMidRun(text: string): Promise<void> {
   hideCmdList();
   dropToBottom();
   inp.value = "";
+  lastTransmit = Date.now();
   syncSendBtn();
   inp.style.height = "auto";
+  const sk = viewKey;
   try {
-    await pi.prompt(cwd, text);
+    await pi.prompt(cwd, text, undefined, sk || undefined);
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`command failed: ${e.message ?? e}`)));
-    inp.value = text;
+    // Shared composer: never clobber the new view's draft on a switch.
+    if (viewKey === sk) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`command failed: ${e.message ?? e}`)));
+      inp.value = text;
+    } else if (!inp.value.trim()) {
+      inp.value = text;
+    }
     syncSendBtn();
   }
 }
@@ -2084,16 +2970,26 @@ function renderQueued(): void {
 
 // Edit a queued message, mirroring pi's own abort flow: clear the queue,
 // restore the target to the composer, re-queue everything else untouched.
+// View-fenced throughout: the composer, bar and queue state are shared
+// globals, so a mid-surgery switch must neither misroute texts nor
+// clobber the new view (all backend calls carry the captured key).
 async function editQueued(text: string, kind: "steer" | "followUp"): Promise<void> {
+  const qk = viewKey;
+  const stillHere = () => viewKey === qk;
   let q: { steering: string[]; followUp: string[] };
   try {
     q = await pi.clearQueue(cwd);
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`queue edit failed: ${e.message ?? e}`)));
+    if (stillHere()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`queue edit failed: ${e.message ?? e}`)));
+      pin();
+    }
     return;
   }
-  lastQueue = { steering: [], followUp: [] };
-  renderQueued();
+  if (stillHere()) {
+    lastQueue = { steering: [], followUp: [] };
+    renderQueued();
+  }
   const dropOnce = (arr: string[]): string[] => {
     const i = arr.indexOf(text);
     if (i < 0) return arr;
@@ -2101,21 +2997,50 @@ async function editQueued(text: string, kind: "steer" | "followUp"): Promise<voi
   };
   const reSteer = kind === "steer" ? dropOnce(q.steering) : q.steering;
   const reFollow = kind === "followUp" ? dropOnce(q.followUp) : q.followUp;
+  // Success buckets (identity, not text-match: duplicate queued texts are
+  // legal and must not over-filter on partial failure).
+  const okSteer: string[] = [];
+  const okFollow: string[] = [];
+  const put = async (k2: "steer" | "followUp", t: string, lost: string[]): Promise<void> => {
+    try {
+      if (k2 === "steer") await pi.steerMsg(cwd, t, qk || undefined);
+      else await pi.followUpMsg(cwd, t, qk || undefined);
+      (k2 === "steer" ? okSteer : okFollow).push(t);
+    } catch {
+      lost.push(t); // backend busy: surface instead of dropping silently
+    }
+  };
+  const lost: string[] = [];
   const inp = $("input") as HTMLTextAreaElement;
-  inp.value = text;
-  inp.style.height = "auto";
-  inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
-  syncSendBtn();
-  inp.focus();
-  for (const s of reSteer) {
-    try {
-      await pi.steerMsg(cwd, s);
-    } catch { /* backend busy: text stays only in composer then */ }
+  if (stillHere()) {
+    inp.value = text;
+    inp.style.height = "auto";
+    inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
+    syncSendBtn();
+    inp.focus();
+  } else if (!inp.value.trim()) {
+    inp.value = text;
+    inp.style.height = "auto";
+    inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
+    syncSendBtn();
+  } else {
+    // Switched with a draft in the composer: park the target back in
+    // its own queue rather than losing it or clobbering the draft.
+    await put(kind, text, lost);
   }
-  for (const f of reFollow) {
-    try {
-      await pi.followUpMsg(cwd, f);
-    } catch { /* ignore */ }
+  for (const s of reSteer) await put("steer", s, lost);
+  for (const f of reFollow) await put("followUp", f, lost);
+  if (stillHere()) {
+    // Exact state from known outcomes — no waiting on the next event.
+    // Composer-held target and failures excluded; parked target included.
+    lastQueue = { steering: [...okSteer], followUp: [...okFollow] };
+    queuedCount = okSteer.length + okFollow.length;
+    renderQueued();
+    markTurnActions();
+  }
+  if (lost.length && stillHere()) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`queue edit: ${lost.length} message(s) could not be re-queued and were lost: ${lost.join(" / ").slice(0, 300)}`)));
+    pin();
   }
 }
 
@@ -2124,28 +3049,71 @@ async function editQueued(text: string, kind: "steer" | "followUp"): Promise<voi
 // (pi has no in-place promote; clear + resubmit is its own documented
 // shape for queue surgery.)
 async function promoteQueued(text: string): Promise<void> {
+  const qk = viewKey;
+  const stillHere = () => viewKey === qk;
   let q: { steering: string[]; followUp: string[] };
   try {
     q = await pi.clearQueue(cwd);
   } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
+    if (stillHere()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
+      pin();
+    }
     return;
   }
-  lastQueue = { steering: [], followUp: [] };
-  renderQueued();
-  const rest = q.followUp.filter((f) => f !== text);
-  try {
-    await pi.steerMsg(cwd, text);
-  } catch (e: any) {
-    $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
-    const inp = $("input") as HTMLTextAreaElement;
-    inp.value = text;
-    syncSendBtn();
+  if (stillHere()) {
+    lastQueue = { steering: [], followUp: [] };
+    renderQueued();
   }
+  const rest = q.followUp.filter((f) => f !== text);
+  // Target outcomes: steered-live (not queued), composer-held (not
+  // queued), or parked follow-up (queued). Tracked explicitly below.
+  const parked: string[] = [];
+  try {
+    await pi.steerMsg(cwd, text, qk || undefined);
+  } catch (e: any) {
+    const inp = $("input") as HTMLTextAreaElement;
+    if (stillHere()) {
+      $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
+      inp.value = text;
+      syncSendBtn();
+    } else if (!inp.value.trim()) {
+      inp.value = text;
+      syncSendBtn();
+    } else {
+      // Switched with a draft: re-park as follow-up on its own session
+      // rather than losing it or clobbering the draft.
+      try {
+        await pi.followUpMsg(cwd, text, qk || undefined);
+        parked.push(text);
+      } catch {
+        if (!inp.value.trim()) {
+          inp.value = text;
+          syncSendBtn();
+        }
+      }
+    }
+  }
+  const lost: string[] = [];
+  const okRest: string[] = [];
   for (const f of rest) {
     try {
-      await pi.followUpMsg(cwd, f);
-    } catch { /* ignore */ }
+      await pi.followUpMsg(cwd, f, qk || undefined);
+      okRest.push(f);
+    } catch {
+      lost.push(f);
+    }
+  }
+  if (stillHere()) {
+    // Exact state from known outcomes (see editQueued).
+    lastQueue = { steering: [], followUp: [...okRest, ...parked] };
+    queuedCount = okRest.length + parked.length;
+    renderQueued();
+    markTurnActions();
+  }
+  if (lost.length && stillHere()) {
+    $("msgs").appendChild(el("div", "msg sys", esc(`promote: ${lost.length} queued message(s) could not be re-queued and were lost: ${lost.join(" / ").slice(0, 300)}`)));
+    pin();
   }
 }
 async function persistLastCwd() {
@@ -2170,17 +3138,18 @@ async function setCwd(next: string, save = true) {
   $("dirlabel").textContent = baseName(cwd) || cwd;
   ($("dirbtn") as HTMLButtonElement).title = cwd;
   syncDirMenu();
-  unsub?.();
   try {
     const files = await sessions.list(cwd).catch(() => []);
     if (gen !== cwdGen) return;
     if (files.length) {
-      // Continue the most recent session in its own child.
+      // Continue the most recent session in its own child — reattaching
+      // to a live proc when one already serves it (see switchSession).
       const f = files[0].path;
-      await ensure(cwd, f, f);
+      const key = fileToKey.get(f) ?? f;
+      await ensure(cwd, key, f);
       if (gen !== cwdGen) return;
-      setKey(f);
-      viewKey = f;
+      setKey(key);
+      viewKey = key;
       viewPath = f;
       curFile = f;
     } else {
@@ -2193,6 +3162,10 @@ async function setCwd(next: string, save = true) {
     return;
   }
   if (gen !== cwdGen) return; // superseded by a newer switch
+  // Subscribe here (not at the top): every early return above must leave
+  // the previous subscription intact, or live updates die silently with
+  // no error. Same fn reference, so the Set dedupes — no double delivery.
+  unsub?.();
   unsub = onRecord(cwd, route);
   if (save) {
     try {
@@ -2314,7 +3287,27 @@ async function openSettings() {
   });
 
 window.addEventListener("DOMContentLoaded", async () => {
+  trapErrors();
   setTag("main");
+  // Background run lifecycle -> sidebar dots (viewed session is driven
+  // by run events directly; this covers everything else).
+  onRunStatus((st) => {
+    if (st.tag && st.tag !== "main") return;
+    if (!st.key) return;
+    noteRunLive(st.key, st.streaming);
+    // Fresh-id proc keys carry no file path: resolve once so the row
+    // dot lights without waiting for the next sidebar snapshot.
+    if (st.streaming && !st.key.includes("/") && !fileForProc(st.key)) {
+      pi.state(cwd, st.key).then((s: any) => {
+        const f = (s as any)?.sessionFile;
+        if (typeof f === "string" && f) {
+          fileToKey.set(f, st.key);
+          runLive.set(f, true);
+          paintRunDots();
+        }
+      }).catch(() => {});
+    }
+  });
   ($("send") as HTMLButtonElement).addEventListener("click", () => {
     if (streaming) stopOnly();
     else send();
@@ -2373,11 +3366,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("newsess") as HTMLButtonElement).addEventListener("click", async () => {
+    cwdGen++; // invalidate any in-flight setCwd (see switchSession)
     resetRunState();
+    paintEmpty();
+    refreshSessions();
     try {
       await openFresh();
     } catch (e: any) {
-      alert(`new chat failed: ${e.message ?? e}`);
+      toastErr(`new chat failed: ${e.message ?? e}`);
       return;
     }
     refreshAll(false);
@@ -2415,6 +3411,94 @@ window.addEventListener("DOMContentLoaded", async () => {
   ($("tabagents") as HTMLButtonElement).addEventListener("click", () => {
     setSidePane("agents");
   });
+  // Covers any stuck state (missed settled event, lost subscription,
+  // wedged flag): if the agent runs but we show idle, re-arm dots and
+  // lock the composer. Read-only — never settles, never rebuilds.
+  // (One exception: a corroborated backend reboot settles the viewed
+  // run — no proc answers AND the boot changed, so it is dead, not busy.)
+  setInterval(async () => {
+    // Backend reboot ends every supervised run and orphans (then reaps)
+    // spawn grandchildren: without this tripwire both the composer and
+    // the Agents panel stick "live" forever. One snapshot, no per-proc
+    // traffic; persisted so restarts across app launches trip it too.
+    let bootChanged = false;
+    try {
+      const snap: any = await runStates.snapshot();
+      const boot = Array.isArray(snap) ? null : snap?.bootId ?? null;
+      if (typeof boot === "string") {
+        let prev: string | null = null;
+        try {
+          prev = localStorage.getItem("pi-boot-id");
+        } catch { /* private mode */ }
+        if (prev && prev !== boot) bootChanged = true;
+        if (prev !== boot) {
+          try {
+            localStorage.setItem("pi-boot-id", boot);
+          } catch { /* ignore */ }
+          lastBootId = boot;
+          runLive.clear();
+        }
+      }
+    } catch { /* snapshot unavailable: skip */ }
+    if (bootChanged) markAllSpawnsStale();
+    try {
+      if (!cwd || !viewKey) return;
+      if (document.hidden) return;
+      let s: any = null;
+      let stateFailed = false;
+      try {
+        s = await pi.state(cwd, viewKey || undefined);
+      } catch {
+        stateFailed = true;
+      }
+      if (stateFailed) {
+        if (bootChanged && streaming) finishRun();
+        return;
+      }
+      const live = !!s?.isStreaming || runLive.get(viewKey) === true;
+      if (viewKey) {
+        noteRunLive(viewKey, live);
+        if (viewPath) {
+          fileToKey.set(viewPath, viewKey);
+          runLive.set(viewPath, live);
+        }
+        paintRunDots();
+      }
+      if (live && !streaming) {
+        streaming = true;
+        syncSendBtn();
+        showThinking();
+        // Missed the turn start entirely: its settled rows (if any)
+        // are showing mid-run. Strip; they return at the next settle.
+        document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
+      }
+      // Reconcile background marks: a run cannot survive its process.
+      // Invoke failure (no proc) clears the dot; success says nothing
+      // (never second-guess liveness from a sample — events own that).
+      // Probe the REAL proc key: file rows of fresh-keyed sessions map
+      // via fileToKey, and probing the file path itself would always
+      // miss (no such proc) and wrongly wipe live dots. Unknown mappings
+      // are left alone — the next snapshot rebuild owns that truth.
+      for (const [k, v] of runLive) {
+        if (!v || k === viewKey) continue;
+        const procKey = k.includes("/") ? fileToKey.get(k) : k;
+        if (procKey == null) continue;
+        try {
+          await pi.state(cwd, procKey);
+        } catch {
+          if (runLive.get(k) === true) {
+            runLive.delete(k);
+            // A dead fresh-id proc takes its file row's dot with it.
+            if (!k.includes("/")) {
+              const f = fileForProc(k);
+              if (f) runLive.delete(f);
+            }
+            paintRunDots();
+          }
+        }
+      }
+    } catch { /* backend busy: next beat retries */ }
+  }, 20_000);
   // Elapsed ticking for running subagents: badge + open panel + inline
   // cards. Static elapsed on a live card reads broken within seconds.
   setInterval(() => {
@@ -2457,12 +3541,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.addEventListener("toggle", (e) => {
     const d = e.target as HTMLElement;
     if (d?.tagName === "DETAILS" && d.classList.contains("toolrow") && (d as HTMLDetailsElement).open) {
+      // Spawn detail transcripts borrow the chat renderer: their rows
+      // expand inline only and never feed this session's Changes pane.
+      if (d.closest("#agenttranscript")) return;
       const ref = (d as any)._diff as DiffRef | undefined;
       const tn = (ref?.tool || "").toLowerCase();
       if (!ref || (tn !== "edit" && tn !== "write")) return;
       noteDiff(ref);
       selKey = diffKey(ref.tool, ref.path);
       viewRef = diffFiles.get(selKey) ?? ref;
+      // Expanding a row is explicit focus on that file: pin it there.
+      selPinned = true;
       if (changesVisible()) renderDiffPane();
     }
   }, true);

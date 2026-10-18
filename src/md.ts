@@ -2,6 +2,10 @@
 // inline code, links, images/video embeds, lists, quotes, paragraphs,
 // tables. Pi decides content, this only displays it.
 import { invoke } from "./tauri-shim";
+
+// Browser dev mode has no system player to hand files to (the opener
+// plugin is Tauri-only): video cards there play inline only.
+const inTauri = typeof window !== "undefined" && "__TAURI__" in window;
 //
 // Media contract (desktop app concern): the agent figures out *how* to get
 // pixels (ffmpeg screenshots, web search, local files) — this module only
@@ -58,8 +62,15 @@ const VIDEO_EXTS = new Set(["mp4", "webm", "mov", "ogv", "m4v"]);
 // every token re-render. Positive hits are ALSO inlined synchronously at
 // render time (see mediaTag), so resolved images survive per-token
 // innerHTML wipes without flicker. Cleared on run end / view switch — a
-// regenerated file must re-read, never serve stale bytes.
-const mediaResolved = new Map<string, string>();
+// regenerated file must re-read, never serve stale bytes. Entries carry
+// the stat they were read at: same-path rewrites (agents iterating on a
+// screenshot) revalidate via media_stat instead of trusting bytes forever.
+interface MediaEntry {
+  uri: string;
+  mtimeMs: number;
+  size: number;
+}
+const mediaResolved = new Map<string, MediaEntry>();
 const mediaKey = (abs: string): string => `${mediaBase}\n${abs}`;
 export function clearMediaCache(): void {
   mediaResolved.clear();
@@ -84,7 +95,10 @@ function extOf(src: string): string {
 // with whitespace/control chars or quote/bracket breakouts.
 function safeMediaSrc(raw: string): string | null {
   const s = raw.trim();
-  if (!s || /[\s<>"\u0000-\u001f]/.test(s)) return null;
+  // Plain spaces are legitimate (local "my shot.png", <>-delimited
+  // markdown): every emission site attribute-escapes, so they cannot
+  // break out. Controls, quotes and angle brackets stay rejected.
+  if (!s || /[<>"\t\n\r\f\v\u0000-\u001f\u007f]/.test(s)) return null;
   const lower = s.toLowerCase();
   if (
     lower.startsWith("javascript:") ||
@@ -160,10 +174,12 @@ function mediaTag(alt: string, src: string): string {
   if (isLocalSrc(safe)) {
     // Sync fast-path: an already-resolved file inlines its bytes, so the
     // image survives per-token stream re-renders with zero flicker.
+    // data-fast lets wireMedia revalidate the stat behind the bytes:
+    // a same-path rewrite lands on the next pass instead of never.
     const fast = mediaResolved.get(mediaKey(resolveLocal(src)));
     if (fast) {
       const cap = a ? `<figcaption>${a}</figcaption>` : "";
-      return `<figure class="media"><img loading="lazy" alt="${a}" src="${fast}">${cap}</figure>`;
+      return `<figure class="media"><img loading="lazy" alt="${a}" src="${fast.uri}" data-fast="${esc(src)}">${cap}</figure>`;
     }
     // Unresolved: shimmer placeholder (CSS) until bytes land — never a
     // premature failure verdict. wireMedia clears `loading` on settle.
@@ -270,7 +286,7 @@ function linkedMedia(alt: string, posterInner: string, targetInner: string): str
   const img = (() => {
     if (!isLocalSrc(safePoster)) return `<img loading="lazy" referrerpolicy="no-referrer" src="${p}" alt="${a}">`;
     const fast = mediaResolved.get(mediaKey(resolveLocal(safePoster)));
-    if (fast) return `<img loading="lazy" src="${fast}" alt="${a}">`;
+    if (fast) return `<img loading="lazy" src="${fast.uri}" alt="${a}" data-fast="${esc(firstToken(posterInner))}">`;
     return `<img loading="lazy" alt="${a}" data-local="${p}">`;
   })();
   return `<a href="${t}" target="_blank" rel="noreferrer"><figure class="${fcls}">${img}${a ? `<figcaption>${a}</figcaption>` : ""}</figure></a>`;
@@ -337,7 +353,7 @@ function sanitizeImg(tag: string): string | null {
   const srcAttr = (() => {
     if (!isLocalSrc(safe)) return { cls: "media", attr: ` src="${u}"` };
     const fast = mediaResolved.get(mediaKey(resolveLocal(safe)));
-    if (fast) return { cls: "media", attr: ` src="${fast}"` };
+    if (fast) return { cls: "media", attr: ` src="${fast.uri}" data-fast="${u}"` };
     return { cls: "media loading", attr: ` data-local="${u}"` };
   })();
   return `<figure class="${srcAttr.cls}"><img loading="lazy" referrerpolicy="no-referrer"${srcAttr.attr} alt="${alt}"${dim("width")}${dim("height")}>${alt ? `<figcaption>${alt}</figcaption>` : ""}</figure>`;
@@ -408,7 +424,9 @@ function inline(s: string): string {
   // so `**a *b* c**` (italic-close + bold-close `***`) resolves correctly.
   h = h.replace(/\*\*([\s\S]+?)\*\*(?!\*)/g, "<strong>$1</strong>");
   h = h.replace(/(^|[^*\w])\*([^\s*][^*\n]*?)\*(?![*\w])/g, "$1<em>$2</em>");
-  h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  // Link URLs may contain balanced parens (Wikipedia…): match one level
+  // instead of stopping at the first `)`.
+  h = h.replace(/\[([^\]]+)\]\((https?:[^()\s]*(?:\([^)]*\)[^()\s]*)*)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   // Bare URLs → links, but never inside code spans, existing anchors, or
   // already-built media figures (their src="..." must not be linkified).
   h = h.split(/(\u0001[\s\S]*?\u0002|\u0005\d+\u0006|<a\b.*?<\/a>|<figure\b.*?<\/figure>)/g).map((part) => {
@@ -474,7 +492,9 @@ function renderMdInner(src: string): string {
   };
   while (i < lines.length) {
     const line = lines[i];
-    const fence = line.match(/^```(\w*)\s*$/);
+    // Language ids are not all \w (c++, c#, f# …): accept anything up
+    // to whitespace, unknown ids still fall back to plaintext below.
+    const fence = line.match(/^```([^\s`]*)\s*$/);
     if (fence) {
       closeList();
       closeOl();
@@ -494,9 +514,10 @@ function renderMdInner(src: string): string {
       );
       continue;
     }
-    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
     if (h) {
       closeList();
+      closeOl();
       out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`);
       i++;
       continue;
@@ -505,8 +526,25 @@ function renderMdInner(src: string): string {
     if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes("-")) {
       closeList();
       closeOl();
-      const splitRow = (r: string) =>
-        r.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()));
+      // Split on pipes, but respect code spans: `a | b` is one cell.
+      const splitRow = (r: string): string[] => {
+        const cells: string[] = [];
+        let cur = "";
+        let inCode = false;
+        const body = r.trim().replace(/^\||\|$/g, "");
+        for (let i = 0; i < body.length; i++) {
+          const ch = body[i];
+          if (ch === "`") inCode = !inCode;
+          if (ch === "|" && !inCode) {
+            cells.push(inline(cur.trim()));
+            cur = "";
+          } else {
+            cur += ch;
+          }
+        }
+        cells.push(inline(cur.trim()));
+        return cells;
+      };
       const head = splitRow(line);
       i += 2;
       const rows: string[][] = [];
@@ -740,25 +778,52 @@ async function openLocalPath(abs: string, fallbackUrl: string): Promise<void> {
   if (/^https?:\/\//i.test(fallbackUrl)) return openExternal(fallbackUrl);
 }
 
-async function toAssetUrl(localPath: string): Promise<string | null> {
+async function mediaStat(localPath: string): Promise<{ mtimeMs: number; size: number } | null> {
+  try {
+    const r = await invoke<{ mtimeMs: number; size: number } | null>("media_stat", {
+      path: localPath,
+      base: mediaBase || null,
+    });
+    if (r && typeof r.mtimeMs === "number" && typeof r.size === "number") return r;
+    return null;
+  } catch {
+    return null; // old backend without media_stat: callers treat as unknown
+  }
+}
+
+async function toAssetUrl(localPath: string, revalidate = false): Promise<string | null> {
   // Local files ride over plain invoke as data: URIs (see read_media).
-  // Resolve-once: every token re-render shares one backend read.
+  // Resolve-once per stat: every token re-render shares one backend read
+  // while the file is unchanged; a same-path rewrite re-reads instead of
+  // serving stale bytes forever (see the data-fast loop in wireMedia).
   const key = mediaKey(localPath);
   const hit = mediaResolved.get(key);
-  if (hit) return hit;
+  if (hit && !revalidate) return hit.uri;
+  const same = async (): Promise<boolean> => {
+    if (!hit) return false;
+    const st = await mediaStat(localPath);
+    if (!st) return true; // unknown: keep showing rather than flashing
+    return st.mtimeMs === hit.mtimeMs && st.size === hit.size;
+  };
   try {
-    const r = await invoke<{ mime: string; base64: string }>("read_media", {
+    if (revalidate && (await same())) return (mediaResolved.get(key) as MediaEntry).uri;
+    const r = await invoke<{ mime: string; base64: string; mtimeMs?: number; size?: number }>("read_media", {
       path: localPath,
       base: mediaBase || null,
     });
     if (r?.mime && r?.base64) {
       const uri = `data:${r.mime};base64,${r.base64}`;
-      mediaResolved.set(key, uri);
+      const st = await mediaStat(localPath);
+      mediaResolved.set(key, {
+        uri,
+        mtimeMs: r.mtimeMs ?? st?.mtimeMs ?? 0,
+        size: r.size ?? st?.size ?? 0,
+      });
       return uri;
     }
-    return null;
+    return hit?.uri ?? null; // read failed: keep stale bytes over a break
   } catch {
-    return null;
+    return hit?.uri ?? null;
   }
 }
 
@@ -828,17 +893,47 @@ function wireMedia(container: HTMLElement): void {
       };
       attempt();
     });
-  // Remote images: error fallback + click-to-open-full.
+  // Fast-pathed images (bytes inlined at render): revalidate the stat
+  // behind them once per wiring. A same-path rewrite swaps the src in
+  // place — no shimmer, and no flicker when unchanged (toAssetUrl
+  // returns the identical URI and the write is skipped).
+  container
+    .querySelectorAll<HTMLImageElement>("img[data-fast]")
+    .forEach((img) => {
+      if ((img as any)._fastCk) return;
+      (img as any)._fastCk = true;
+      const raw = img.getAttribute("data-fast") ?? "";
+      if (!raw) return;
+      const abs = resolveLocal(raw);
+      void toAssetUrl(abs, true).then((url) => {
+        if (!url || !img.isConnected) return;
+        if (img.getAttribute("src") !== url) {
+          img.setAttribute("src", url);
+          mediaSettled();
+        }
+      });
+    });
+  // Remote images: error fallback + click-to-open-full. Local files
+  // still carrying data-local are owned by the resolver above: an img
+  // with no src is *always* complete+naturalWidth-0, so the check below
+  // would instantly condemn every pending local image. Skip those.
   container.querySelectorAll<HTMLImageElement>("figure.media > img").forEach((img) => {
     if ((img as any)._wired) return;
     (img as any)._wired = true;
+    if (img.hasAttribute("data-local")) return;
     const fig = img.closest("figure") as HTMLElement | null;
     img.addEventListener("error", () => {
       if (fig) mediaFallback(fig, img.getAttribute("src") ?? "image");
     });
     // Remote images load natively (no read step): follow their completion
     // too, otherwise late bytes strand the viewport mid-answer.
-    if (!img.currentSrc && img.getAttribute("src")) {
+    // Cached images may already be complete before we attach: check
+    // synchronously, or the settle (and autoscroll pin) never fires.
+    // Complete-but-broken (error fired pre-listener) falls back directly.
+    if (img.complete) {
+      if (img.naturalWidth > 0) mediaSettled();
+      else if (fig) mediaFallback(fig, img.getAttribute("src") ?? "image");
+    } else if (!img.currentSrc && img.getAttribute("src")) {
       img.addEventListener("load", mediaSettled, { once: true });
     }
     img.addEventListener("click", () => {
@@ -903,7 +998,9 @@ function playVideoCard(b: HTMLButtonElement): void {
       fig.appendChild(c);
     }
     row.appendChild(fig);
-    if (extPath || extUrl) {
+    // Local files open in the system player only under Tauri; in browser
+    // dev the button would silently do nothing, so omit it there.
+    if (extUrl || (extPath && inTauri)) {
       const x = document.createElement("button");
       x.className = "media-ext";
       x.textContent = "open in player \u2197";

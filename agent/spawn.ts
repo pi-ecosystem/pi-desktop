@@ -261,6 +261,13 @@ async function startChild(
   } catch (e: any) {
     children.delete(id);
     try { proc.kill(); } catch { /* ignore */ }
+    // Don't litter an empty run dir (continuations reuse their thread's
+    // dir, so only remove directories this start created).
+    if (!continuedFrom) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch { /* best effort */ }
+    }
     throw new Error(`spawn ${id}: prompt rejected: ${e.message ?? e}`);
   }
 
@@ -270,7 +277,10 @@ async function startChild(
         customType: "spawn-started",
         content: continuedFrom ? `Continued **${label}**` : `Spawned **${label}** (${id})`,
         display: true,
-        details: { id, thread, label, startedAt: Date.now() },
+        // pid lets the desktop UI probe process liveness later: rows for
+        // children orphaned by a crash/reboot would otherwise read
+        // "running" forever, since no completion can ever arrive.
+        details: { id, thread, label, startedAt: Date.now(), pid: proc.pid ?? undefined },
       },
     );
   } catch { /* host without message channel; status still works */ }
@@ -323,46 +333,104 @@ async function finishChild(pi: ExtensionAPI, c: Child, state: ChildState, error?
 }
 
 // Resolve a run id, id prefix, or thread id to a live record.
-// Threads retarget: prefer the running run, else the latest.
+// Exact ids and threads first; id prefixes only when unambiguous — a
+// shared prefix across runs must never silently pick one (steer/stop
+// the wrong child). Throws on ambiguity so callers report it instead.
 function resolveChild(key: string): Child | undefined {
+  if (!key) return undefined;
   const direct = children.get(key);
   if (direct) return direct;
+  // Threads retarget: prefer the running run, else the latest started.
   let latest: Child | undefined;
-  for (const [k, c] of children) {
-    if (k === key || k.startsWith(key) || c.thread === key) {
+  for (const c of children.values()) {
+    if (c.thread === key) {
       if (c.state === "running") return c;
-      latest = c;
+      if (!latest || c.startedAt > latest.startedAt) latest = c;
     }
   }
-  return latest;
+  if (latest) return latest;
+  const hits = [...children.values()].filter((c) => c.id.startsWith(key));
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) {
+    throw new Error(`'${key}' matches ${hits.length} children (${hits.map((c) => c.id).join(", ")}); use a longer id`);
+  }
+  return undefined;
 }
+
 
 function noChild(id: string): string {
   return `no live child '${id}' in this process (a restart ends live runs; reopen a finished one with start + continueFrom)`;
 }
 
+// Resolves when the child process actually exits (cap: never hang delete).
+function waitExit(c: Child, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (c.proc.exitCode !== null || c.proc.signalCode !== null) return resolve();
+    const cleanup = () => {
+      clearTimeout(t);
+      c.proc.off("exit", onExit);
+    };
+    const onExit = () => {
+      cleanup();
+      resolve();
+    };
+    const t = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    c.proc.on("exit", onExit);
+  });
+}
+
 async function deleteChild(pi: ExtensionAPI, id: string): Promise<{ id: string; label: string }> {
   if (!validRunId(id)) throw new Error(`invalid run id '${id}'`);
-  const c = children.get(id);
+  // Stop the live run, not just the named record: threads retarget to
+  // the running continuation, which lives under a NEWER run id after a
+  // continue. Stopping only the requested id orphaned the live child
+  // (record miss) while deleting its transcript dir from under it.
+  let c: Child | undefined;
+  try {
+    c = resolveChild(id);
+  } catch {
+    c = undefined; // ambiguous prefix: fall through to id-not-found below
+  }
+  if (!c) c = children.get(id);
   if (c && c.state === "running") {
     await stopChild(pi, c.id, "deleted by parent");
   }
+  // The child gets a SIGKILL grace in finishChild and may still be
+  // flushing its transcript: removing the dir underneath it races that
+  // shutdown (torn writes, resurrect-on-flush). Wait for the exit first.
+  if (c) await waitExit(c, 6000);
   const label = c?.label ?? id;
   // Scoped delete: resolve and confirm containment, never above root.
   const root = path.resolve(spawnRoot());
   const dir = path.resolve(root, id);
   if (dir !== path.join(root, id) || path.basename(dir) !== id) throw new Error(`invalid run id '${id}'`);
+  let dirExists = false;
+  try {
+    dirExists = fs.statSync(dir).isDirectory();
+  } catch { /* already gone */ }
+  // Neither a live record nor transcript files: refuse a feel-good
+  // success for a typo'd or ambiguous id.
+  if (!c && !dirExists) throw new Error(`'${noChild(id)}'`);
   fs.rmSync(dir, { recursive: true, force: true });
   children.delete(id);
+  // A continuation's record lives under its newer run id: drop that too
+  // or list/status keeps showing a stopped child for a deleted thread.
+  if (c && c.id !== id) children.delete(c.id);
   // Silent by design (display:false): the row vanishing IS the feedback.
   // The entry persists in history purely as the tombstone, so rebuilds
-  // re-bury it without ever rendering anything in chat.
-  pi.sendMessage({
-    customType: "spawn-note",
-    content: `Deleted ${id}.`,
-    display: false,
-    details: { id, deleted: true },
-  });
+  // re-bury it without ever rendering anything in chat. Fire-and-forget:
+  // a dead parent channel must not turn a completed delete into an error.
+  try {
+    pi.sendMessage({
+      customType: "spawn-note",
+      content: `Deleted ${id}.`,
+      display: false,
+      details: { id, deleted: true },
+    });
+  } catch { /* parent gone; deletion itself succeeded */ }
   return { id, label };
 }
 
@@ -502,7 +570,13 @@ export default function (pi: ExtensionAPI) {
   async function cmdStatus(id: string | undefined) {
     const all = [...children.values()];
     if (id) {
-      const c = resolveChild(id);
+      let c: Child | undefined;
+      try {
+        c = resolveChild(id);
+      } catch (e: any) {
+        note(e.message ?? String(e)); // ambiguous prefix, not a crash
+        return;
+      }
       if (!c) {
         note(`'${noChild(id)}'`);
         return;
@@ -556,8 +630,13 @@ export default function (pi: ExtensionAPI) {
         note("Usage: /agent-steer <id> <message>");
         return;
       }
-      const key = resolveChild(m[1])?.id ?? m[1];
-      const c = children.get(key);
+      let c: Child | undefined;
+      try {
+        c = children.get(resolveChild(m[1])?.id ?? m[1]);
+      } catch (e: any) {
+        note(e.message ?? String(e)); // ambiguous prefix, not a crash
+        return;
+      }
       if (!c) {
         note(`'${noChild(m[1])}'`);
         return;

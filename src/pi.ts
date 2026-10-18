@@ -40,6 +40,19 @@ export async function ensureListening(): Promise<void> {
     const p = e.payload ?? {};
     const { cwd, tag, key, record } = p;
     if (tag !== NS) return;
+    // Run-lifecycle events for NON-viewed sessions bypass the transcript
+    // filter into the status channel: that's how the sidebar tracks
+    // background runs (key carries the session path for saved sessions).
+    if (
+      key !== undefined &&
+      key !== curKey &&
+      record &&
+      (record.type === "agent_start" || record.type === "agent_settled")
+    ) {
+      const set = statusSubs;
+      if (set.size) set.forEach((fn) => fn({ tag, key, streaming: record.type === "agent_start" }));
+      return;
+    }
     // Render only the currently viewed session. Other sessions keep
     // running; their UI refreshes when viewed (full reload from messages).
     if (key !== undefined && key !== curKey && !(record && record.type === "response")) return;
@@ -60,6 +73,15 @@ export async function ensureListening(): Promise<void> {
   });
 }
 
+export function onRunStatus(fn: (s: { tag: string; key: string; streaming: boolean }) => void): () => void {
+  statusSubs.add(fn);
+  return () => {
+    statusSubs.delete(fn);
+  };
+}
+
+const statusSubs = new Set<(s: { tag: string; key: string; streaming: boolean }) => void>();
+
 export function onRecord(cwd: string, fn: (rec: any) => void): () => void {
   const k = subKey(cwd);
   let set = subs.get(k);
@@ -71,22 +93,36 @@ export function onRecord(cwd: string, fn: (rec: any) => void): () => void {
   return () => set!.delete(fn);
 }
 
-async function call(cwd: string, obj: any, timeoutMs = 120_000): Promise<any> {
+async function call(cwd: string, obj: any, timeoutMs = 120_000, key?: string): Promise<any> {
   await ensureListening();
   const id = `q${++seq}`;
   obj.id = id;
   return new Promise((res, rej) => {
-    pending.set(id, { res, rej });
-    invoke("pi_send", { cwd, payload: obj, tag: NS, key: curKey }).catch((err) => {
-      pending.delete(id);
-      rej(err);
-    });
-    setTimeout(() => {
+    // Clear the deadline on settle: otherwise every RPC (including
+    // high-frequency state polls) leaves a dead 120s timer behind.
+    const timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
         rej(new Error("pi timeout"));
       }
     }, timeoutMs);
+    pending.set(id, {
+      res: (v: any) => {
+        clearTimeout(timer);
+        res(v);
+      },
+      rej: (e: any) => {
+        clearTimeout(timer);
+        rej(e);
+      },
+    });
+    // Explicit key when given (background send to a non-viewed session);
+    // otherwise the viewed session. Never mutate curKey for a send.
+    invoke("pi_send", { cwd, payload: obj, tag: NS, key: key ?? curKey }).catch((err) => {
+      pending.delete(id);
+      clearTimeout(timer);
+      rej(err);
+    });
   });
 }
 
@@ -105,17 +141,17 @@ export async function stopChild(cwd: string, key: string): Promise<void> {
 }
 
 export const pi = {
-  prompt: (cwd: string, message: string, streamingBehavior?: "steer" | "followUp") =>
+  prompt: (cwd: string, message: string, streamingBehavior?: "steer" | "followUp", key?: string) =>
     call(cwd, {
       type: "prompt",
       message,
       ...(streamingBehavior ? { streamingBehavior } : {}),
-    }),
+    }, 120_000, key),
   abort: (cwd: string) => call(cwd, { type: "abort" }),
   newSession: (cwd: string) => call(cwd, { type: "new_session" }),
   switchSession: (cwd: string, sessionPath: string) =>
     call(cwd, { type: "switch_session", sessionPath }),
-  state: (cwd: string) => call(cwd, { type: "get_state" }),
+  state: (cwd: string, key?: string) => call(cwd, { type: "get_state" }, 120_000, key),
   messages: (cwd: string) => call(cwd, { type: "get_messages" }),
   models: (cwd: string) => call(cwd, { type: "get_available_models" }),
   setModel: (cwd: string, provider: string, modelId: string) =>
@@ -138,10 +174,10 @@ export const pi = {
   // Mid-run queue primitives (mirror of pi's own API; backend forwards).
   // steer()/followUp() enqueue server-side; clearQueue() returns the held
   // {steering[], followUp[]} so the UI can restore them to the editor.
-  steerMsg: (cwd: string, message: string) =>
-    call(cwd, { type: "steer", message }),
-  followUpMsg: (cwd: string, message: string) =>
-    call(cwd, { type: "follow_up", message }),
+  steerMsg: (cwd: string, message: string, key?: string) =>
+    call(cwd, { type: "steer", message }, 120_000, key),
+  followUpMsg: (cwd: string, message: string, key?: string) =>
+    call(cwd, { type: "follow_up", message }, 120_000, key),
   clearQueue: (cwd: string): Promise<{ steering: string[]; followUp: string[] }> =>
     call(cwd, { type: "clear_queue" }),
 };
@@ -182,6 +218,27 @@ export const sessions = {
   list: (cwd?: string): Promise<SessionInfo[]> =>
     invoke("list_sessions", { cwdFilter: cwd ?? null, sessionRoot: null }),
   del: (path: string): Promise<void> => invoke("delete_session", { path, sessionRoot: null }),
+  // Full transcript parsed straight from the session file (same shape as
+  // get_messages). The file is the truth every writer shares: immune to
+  // stale/dead/busy pi processes. Falls back to live RPC when needed.
+  read: (path: string): Promise<{ messages: any[] }> =>
+    invoke("read_session_messages", { path, sessionRoot: null }),
+};
+
+// Run-lifecycle snapshot across sessions (sidebar status dots).
+// Event-maintained backend-side; unknown sessions absent (= idle).
+// bootId changes across backend reboots: pre-reboot liveness dies with it.
+export const runStates = {
+  snapshot: (): Promise<{ bootId: string; runs: { tag: string; key: string; streaming: boolean }[] }> =>
+    invoke("pi_states"),
+};
+
+// Process liveness probe for subagent rows orphaned by a crash/reboot
+// (agent/SPAWN.md). Same command name as the Tauri backend. Only ever
+// marks rows dead (high confidence); a live answer changes nothing, so
+// pid reuse can at worst leave a row "running", never kill a live one.
+export const procAlive = {
+  check: (pids: number[]): Promise<boolean[]> => invoke("pids_alive", { pids }),
 };
 
 // Transcript of one spawned subagent (agent/SPAWN.md). Scoped server-side
