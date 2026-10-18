@@ -157,7 +157,7 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 .sesshead { margin-top: 2px; }
 #sessfilter { margin: 0 6px 8px; width: calc(100% - 12px); background: transparent; }
 #sesslist { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding-bottom: 8px; }
-.sess { position: relative; padding: 7px 36px 7px 10px; border-radius: 8px; cursor: pointer; }
+.sess { position: relative; padding: 5px 36px 5px 10px; border-radius: 8px; cursor: pointer; }
 .sess:hover { background: var(--surface); }
 .sess.active { background: var(--surface); }
 .stitle { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
@@ -183,10 +183,10 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 #msgs { flex: none; overflow: visible; padding: 24px 16px 40px; display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 1024px; margin: 0 auto; }
 
 /* messages: user right bubble, assistant full-width plain */
-.msg { font-size: 16px; }
+.msg { font-size: 16px; line-height: 1.375; }
 .msg.user { align-self: flex-end; max-width: min(75%, 640px); background: var(--bubble); border-radius: 24px; padding: 6px 16px; }
-.msg.user .ubody { line-height: 1.6; }
-.msg.assistant { align-self: stretch; position: relative; padding: 0; border: none; background: none; line-height: 24px; }
+.msg.user .ubody { line-height: 1.375; }
+.msg.assistant { align-self: stretch; position: relative; padding: 0; border: none; background: none; line-height: 1.375; }
 .msg.sys { align-self: stretch; color: var(--dim); font-size: 13px; border: 1px dashed var(--border); border-radius: 8px; padding: 6px 12px; background: none; }
 .msg.stream { opacity: 0.95; }
 .msg .meta { font-size: 12px; color: var(--dim); margin-top: 4px; }
@@ -199,7 +199,6 @@ details.msg.toolres summary { cursor: pointer; list-style: none; }
 details.msg.toolres summary::-webkit-details-marker { display: none; }
 .tool { color: var(--dim); padding: 2px 0; }
 .msg ol { margin: 6px 0; padding-left: 22px; }
-.msg ol li { margin: 2px 0; }
 .greet { text-align: center; margin: auto 0; padding: 40px 0; }
 .greet h2 { font-weight: 400; font-size: 30px; line-height: 36px; margin: 0; color: var(--text); }
 .umsgwrap { display: flex; flex-direction: column; position: relative; }
@@ -288,13 +287,13 @@ details.toolrow > summary:hover { color: var(--text); }
 .msg.assistant > .actions.overlay { left: 0; right: auto; }
 
 /* markdown */
-.msg p, #qbanswer p { margin: 12px 0; }
-.msg li, #qbanswer li { margin: 3px 0; }
+.msg p, #qbanswer p { margin: 10px 0; }
+.msg li, #qbanswer li { margin: 0; }
 .msg h1, #qbanswer h1 { margin: 10px 0 4px; font-size: 24px; font-weight: 600; line-height: 31px; }
 .msg h2, #qbanswer h2 { margin: 10px 0 4px; font-size: 20px; font-weight: 600; line-height: 28px; }
 .msg h3, #qbanswer h3 { margin: 8px 0 4px; font-size: 18px; font-weight: 600; line-height: 28px; letter-spacing: -0.72px; }
 .msg h4, .msg h5, .msg h6, #qbanswer h4, #qbanswer h5, #qbanswer h6 { margin: 8px 0 4px; font-size: 16px; font-weight: 600; line-height: 22px; }
-.msg ul, #qbanswer ul { margin: 4px 0; padding-left: 22px; }
+.msg ul, #qbanswer ul { margin: 6px 0; padding-left: 22px; }
 .msg code, #qbanswer code { background: #3a3a3a; padding: 0 4px; border-radius: 4px; font-family: var(--mono); font-size: 0.875em; }
 .msg pre, #qbanswer pre { background: var(--code); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
 .msg pre code, #qbanswer pre code { background: none; padding: 0; }
@@ -396,7 +395,7 @@ figure.media.broken { border: 1px dashed var(--border); border-radius: 12px; pad
 body.qb { background: var(--surface); }
 #qbwrap { background: var(--surface); border: none; border-radius: 16px; padding: 12px; overflow: hidden; }
 #qbinput { width: 100%; font-size: 16px; padding: 8px 4px; background: transparent; border: none; }
-#qbanswer { font-size: 16px; }
+#qbanswer { font-size: 16px; line-height: 1.375; }
 #qbinput:focus { border: none; }
 #qbanswer { max-height: 420px; overflow-y: auto; margin-top: 8px; padding: 4px 2px; border-top: 1px solid var(--border); }
 .qbrow { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--dim); }
@@ -453,7 +452,7 @@ body.qb { background: var(--surface); }
 #agenttranscript { flex: 1; overflow-y: auto; min-height: 0; padding: 12px 16px 28px; display: flex; flex-direction: column; gap: 10px; }
 #agenttranscript:not(:empty) { border-top: 1px solid var(--sideborder); }
 #agenttranscript:empty { display: none; }
-#agenttranscript .msg { line-height: 1.65; }
+#agenttranscript .msg { line-height: 1.375; }
 #agenttranscript .msg.user { max-width: 95%; padding: 8px 14px; }
 #agenttranscript .spbody { line-height: 1.65; }
 #agenttranscript pre { white-space: pre-wrap; word-break: break-word; }
