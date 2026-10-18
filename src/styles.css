@@ -250,6 +250,7 @@ details.toolrow > summary:hover { color: var(--text); }
 .tstat { font-weight: 700; }
 .tstat.ok { color: #4ade80; }
 .tstat.err { color: #f87171; }
+.tstat.run { color: #7aa2f7; animation: pulse 1.2s ease-in-out infinite; }
 .telapsed { color: var(--dim); font-size: 12px; }
 .diffblock { margin: 6px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .diffhead { padding: 5px 10px; font-size: 12px; color: var(--dim); border-bottom: 1px solid var(--border); }

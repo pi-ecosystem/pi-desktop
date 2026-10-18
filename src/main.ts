@@ -14,6 +14,11 @@ let liveRun: HTMLElement | null = null;
 let liveThinkDiv: HTMLElement | null = null;
 let liveThinkBuf = "";
 let liveCalls = new Map<string, any>();
+// Live tool rows by toolCallId: created at tool_execution_start (running),
+// morphed at toolResult completion. Long tools show WHAT is running
+// instead of bare dots. Cleared on view change; history rebuilds render
+// completed rows from the file and never consult this.
+const liveToolRows = new Map<string, HTMLElement>();
 let streaming = false;
 // True from a follow-up transmit until the agent's next output. Bridges
 // the dead air between turn A settling and turn B's first token: without
@@ -613,6 +618,26 @@ function textOf(c: any): string {
       .map((b) => b.text ?? "")
       .join("");
   return "";
+}
+
+// Running tool row: the same expandable shape as a completed row, but
+// alive — pulsing dot, "running…" body fed by tool_execution_update,
+// morphed into the final form at toolResult. Collapsed like history
+// rows: one visible line per running tool, detail behind the click.
+function liveToolRow(toolName: string, args: any): HTMLElement {
+  const params = args && typeof args === "object" ? args : {};
+  const path = typeof (params as any).path === "string" ? (params as any).path : toolName;
+  const d = el("details", "toolrow liverow");
+  d.appendChild(el("summary", "tgsum",
+    `<span class="tstat run">◌</span> ` + esc(toolSummary(toolName, params)) +
+    ` <span class="telapsed">· running…</span>`));
+  const ran = esc(JSON.stringify(params)).slice(0, 500);
+  if (ran && ran !== "{}") d.appendChild(el("div", "tgrun", `<code>${ran}</code>`));
+  // No body until completion: the summary line already says running, and
+  // the morph installs the real output. Nothing repeats while expanded.
+  (d as any)._diff = { tool: toolName, path, args: params, out: "" };
+  wireCopy(d);
+  return d;
 }
 
 function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement {
@@ -1408,7 +1433,17 @@ function route(rec: any) {
       dotsToEnd();
       pin();
     } else if (ev.type === "toolcall_start") {
+      // Early args capture (may be partial — deltas/end refine it) so
+      // rows can show what ran even for joins that missed the start.
+      const tc = (ev as any).toolCall;
+      if (tc && typeof tc.id === "string") liveCalls.set(tc.id, tc);
       showThinking();
+    } else if (ev.type === "toolcall_end") {
+      // Full name + arguments (see ToolCall shape): completes the capture.
+      const tc = ev as any;
+      if (tc && typeof tc.id === "string") {
+        liveCalls.set(tc.id, { type: "toolCall", id: tc.id, name: tc.name, arguments: tc.arguments ?? {} });
+      }
     } else if (typeof ev.type === "string" && ev.type.includes("think")) {
       if (streamClosed) return; // same straggler guard as text
       if (refreshActive) return; // partial thinks; full blocks via history
@@ -1459,8 +1494,28 @@ function route(rec: any) {
 
   if (rec.type === "tool_execution_start") {
     showThinking();
+    // Live row: WHAT is running, visible for the whole execution — not
+    // just dots. Morphed into the final form at toolResult completion.
+    if (!refreshActive && rec && typeof rec.toolCallId === "string") {
+      liveCalls.set(rec.toolCallId, { type: "toolCall", id: rec.toolCallId, name: rec.toolName, arguments: rec.args ?? {} });
+      if (!liveToolRows.has(rec.toolCallId)) {
+        const row = liveToolRow(rec.toolName ?? "tool", rec.args ?? {});
+        // Auto-open a FRESH Activity container so the running tool is
+        // actually visible (the whole point). An existing container is
+        // left alone — the user may have collapsed it deliberately.
+        const wasNew = !liveRun;
+        liveRun = runAppend($("msgs"), liveRun, row);
+        if (wasNew) (liveRun as HTMLDetailsElement).open = true;
+        liveToolRows.set(rec.toolCallId, row);
+        dotsToEnd();
+        pin();
+      }
+    }
     return;
   }
+  // tool_execution_update intentionally has no branch: with no live body
+  // there is nothing to stream into, and the completion morph renders
+  // the authoritative full output. (Summary line stays the indicator.)
   if (rec.type === "tool_execution_end") {
     if (rec && typeof rec.toolCallId === "string" && typeof rec.durationMs === "number") {
       toolElapsed.set(rec.toolCallId, rec.durationMs);
@@ -1470,6 +1525,11 @@ function route(rec: any) {
         const oldest = toolElapsed.keys().next().value;
         if (oldest !== undefined) toolElapsed.delete(oldest);
       }
+      // Stamp the live row too: the completion morph below may already
+      // have run (event order is end-then-result, but never assume it).
+      const row = liveToolRows.get(rec.toolCallId) as HTMLElement | undefined;
+      const t = row?.querySelector(":scope > summary .telapsed");
+      if (t && row?.isConnected) t.textContent = `· ${fmtMs(rec.durationMs)}`;
     }
     return;
   }
@@ -1533,7 +1593,24 @@ function appendMessageEnd(message: any): void {
     }
   }
   if (m.role === "toolResult" || m.role === "bashExecution") {
-    liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls));
+    // A running row exists: morph it into the final form in place — no
+    // second row, no scroll jump. Otherwise append fresh, as before.
+    // (bashExecution has no toolCallId to match on: always appended.)
+    const liveRow = m.role === "toolResult" && typeof m.toolCallId === "string"
+      ? liveToolRows.get(m.toolCallId)
+      : undefined;
+    if (liveRow && liveRow.isConnected) {
+      liveToolRows.delete(m.toolCallId);
+      const fresh = msgNode(m, liveCalls);
+      liveRow.innerHTML = "";
+      for (const kid of Array.from(fresh.childNodes)) liveRow.appendChild(kid);
+      liveRow.classList.remove("liverow");
+      (liveRow as any)._diff = (fresh as any)._diff;
+      wireCopy(liveRow);
+    } else {
+      if (m.role === "toolResult" && typeof m.toolCallId === "string") liveToolRows.delete(m.toolCallId);
+      liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls));
+    }
     dotsToEnd();
     pin();
     if (m.role === "toolResult") {
@@ -1675,6 +1752,20 @@ function finishRun() {
   streamBuf = "";
   syncSendBtn();
   hideThinking();
+  // Retire running tool rows a crashed/aborted run left behind: no
+  // permanent spinners. Rebuilt from history on revisit (completed form).
+  for (const [, row] of liveToolRows) {
+    if (!row.isConnected) continue;
+    const sum = row.querySelector(":scope > summary");
+    const diff = (row as any)._diff as { tool?: string; args?: any } | undefined;
+    if (sum) {
+      sum.innerHTML = `<span class="tstat">■</span> ` +
+        esc(toolSummary(diff?.tool ?? "tool", diff?.args ?? {})) +
+        ` <span class="telapsed">· ended</span>`;
+    }
+    row.classList.remove("liverow");
+  }
+  liveToolRows.clear();
   // Follow-up bridge: turn A settled with our message accepted but turn
   // B silent so far — stay visibly working instead of dead idle. Any
   // agent output, abort, or 90s clears it; first token hides dots anyway.
@@ -2523,6 +2614,10 @@ function resetRunState() {
   liveRun = null;
   liveThinkDiv = null;
   liveThinkBuf = "";
+  // Fresh view, fresh run maps: stale tool args/rows belong to the old
+  // session (ids are unique, so this is a leak cap as much as hygiene).
+  liveCalls = new Map<string, any>();
+  liveToolRows.clear();
   lastQueue = null;
   queuedCount = 0;
   $("qbar")?.replaceChildren();
@@ -2741,6 +2836,7 @@ async function send() {
   liveThinkDiv = null;
   liveThinkBuf = "";
   liveCalls = new Map<string, any>();
+  liveToolRows.clear(); // previous run settled (rows morphed); belt up
   startRun();
   // Fence the whole send to the session it started in: viewKey/curKey
   // are mutable and a mid-send switch must abandon (restore + note),
@@ -3066,11 +3162,14 @@ async function promoteQueued(text: string): Promise<void> {
     renderQueued();
   }
   const rest = q.followUp.filter((f) => f !== text);
-  // Target outcomes: steered-live (not queued), composer-held (not
-  // queued), or parked follow-up (queued). Tracked explicitly below.
+  // Target outcomes: steered-live (still queued server-side until the
+  // next turn drains it), composer-held (not queued), or parked
+  // follow-up (queued). Tracked explicitly below.
   const parked: string[] = [];
+  let steeredLive = false;
   try {
     await pi.steerMsg(cwd, text, qk || undefined);
+    steeredLive = true;
   } catch (e: any) {
     const inp = $("input") as HTMLTextAreaElement;
     if (stillHere()) {
@@ -3105,9 +3204,15 @@ async function promoteQueued(text: string): Promise<void> {
     }
   }
   if (stillHere()) {
-    // Exact state from known outcomes (see editQueued).
-    lastQueue = { steering: [], followUp: [...okRest, ...parked] };
-    queuedCount = okRest.length + parked.length;
+    // Exact state from known outcomes (see editQueued). The steered
+    // target IS still queued server-side (steering lane, drained next
+    // turn), so it stays in the pill until an event or the turn echo
+    // supersedes it — never in neither place.
+    lastQueue = {
+      steering: steeredLive ? [text] : [],
+      followUp: [...okRest, ...parked],
+    };
+    queuedCount = (steeredLive ? 1 : 0) + okRest.length + parked.length;
     renderQueued();
     markTurnActions();
   }
