@@ -2109,17 +2109,34 @@ let lastForkMap = new Map<string, string[]>();
 // Older-page fetch: prepends the next HIST_PAGE messages and re-renders
 // the accumulated window in one pass (fork ids + spawn tracking keep
 // full-load order). Scroll position survives via delta math in renderHist.
+// Repaint the in-DOM Show-earlier button from the live paging state.
+// renderHist builds the button from these same flags, but a flag flip
+// with no render after it (success painted while still loading, a lost
+// refresh race, a failed fetch) would otherwise strand it disabled at
+// "Loading…" forever — with no later render coming to fix it. The
+// finally below calls this on every path, so the button always reflects
+// reality. Null-safe: no button, nothing to do.
+function paintShowEarlierBtn(): void {
+  const b = document.querySelector("#msgs .showearlier") as HTMLButtonElement | null;
+  if (!b || !histMore) return;
+  const more = Math.max(histTotal - histArr.length, 0);
+  b.disabled = histLoading;
+  b.textContent = histLoading
+    ? "Loading earlier messages…"
+    : more > 0 ? `Show earlier messages (${more} more)` : "Show earlier messages";
+  b.onclick = histLoading ? null : () => void showEarlier();
+}
+
 async function showEarlier() {
   if (histLoading || !histMore || !histPath) return;
   histLoading = true;
   refreshActive = true;
-  const b = document.querySelector("#msgs .showearlier") as HTMLButtonElement | null;
-  if (b) { b.disabled = true; b.textContent = "Loading earlier messages…"; }
+  paintShowEarlierBtn();
   const myGen = ++rebuildGen;
   const alive = () => myGen === rebuildGen;
   try {
     const data = await sessions.read(histPath, HIST_PAGE_BYTES, histArr.length);
-    if (!alive()) return;
+    if (!alive()) return; // stale page: dropped, button restored below
     // Overlap guard: the file can grow between pages (live run); offset
     // counts from newest so growth shifts indices. msgKey-dedupe (same
     // keys as the live replay path) keeps the prepend exact.
@@ -2133,11 +2150,20 @@ async function showEarlier() {
     // (keep streamBuf) so the next delta rebuilds it in the new tree.
     // Completion still renders authoritatively via replayLiveBuffer.
     streamDiv = null;
+    // Flag down BEFORE paint: renderHist builds the button from this flag,
+    // so painting while still loading bricks it disabled (the stuck state).
+    histLoading = false;
     await renderHist($("msgs"), true, alive, lastForkMap);
-  } catch { /* button stays for retry */ }
-  finally {
+  } catch (e: any) {
+    // Silent failure + disabled button was the brick: surface it, the
+    // button stays for retry via the finally repaint below.
+    try {
+      toastErr(`Couldn't load earlier messages: ${e?.message ?? e}`);
+    } catch { /* last resort: stay silent */ }
+  } finally {
     histLoading = false;
     if (alive()) refreshActive = false;
+    paintShowEarlierBtn();
   }
 }
 async function refreshMsgs() {
