@@ -38,11 +38,20 @@ fn spawn_ext_path(app: &AppHandle) -> Option<PathBuf> {
             return Some(pb);
         }
     }
-    // Installed bundle: Tauri `bundle.resources` places it here.
+    // Installed bundle: Tauri `bundle.resources` places it here. The
+    // `..` segments survive as `_up_` dirs (verified in the deb:
+    // `resource_dir/_up_/_up_/pi-spawn/index.ts` for a `../../` entry),
+    // so try the plausible layouts; existence-checked, first hit wins.
     if let Ok(rd) = app.path().resource_dir() {
-        let bundled = rd.join("pi-spawn").join("index.ts");
-        if bundled.is_file() {
-            return Some(bundled);
+        for rel in [
+            "pi-spawn/index.ts",
+            "_up_/_up_/pi-spawn/index.ts",
+            "_up_/pi-spawn/index.ts",
+        ] {
+            let bundled = rd.join(rel);
+            if bundled.is_file() {
+                return Some(bundled);
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {

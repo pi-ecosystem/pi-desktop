@@ -15,6 +15,9 @@ on PATH and Node.js 22+.
 
 ```bash
 git clone git@github.com:pi-ecosystem/pi-desktop.git ~/Projects/pi-desktop
+# Sibling checkout: build resources + the vendored subagent extension come
+# from here until pi-spawn is on npm (then this step goes away).
+git clone git@github.com:pi-ecosystem/pi-spawn.git ~/Projects/pi-spawn
 cd ~/Projects/pi-desktop
 npm install
 ```
@@ -75,6 +78,13 @@ Develop / build / install:
 npx tauri dev                       # use WEBKIT_DISABLE_DMABUF_RENDERER=1 below on NVIDIA+Wayland
 npm run build && npx tauri build --bundles deb   # (or --bundles appimage)
 cp -f src-tauri/target/release/pi-desktop ~/.local/bin/pi-desktop-bin
+# Subagents ride along via --extension: place the vendored copy next to the
+# binary (binary-copy installs carry no Tauri resource bundle). Source is
+# the sibling pi-spawn checkout (also used at build time via
+# `bundle.resources`); after `npm publish pi-spawn` this becomes
+# `node_modules/pi-spawn/index.ts` instead.
+mkdir -p ~/.local/bin/pi-spawn
+cp -f ../pi-spawn/index.ts ~/.local/bin/pi-spawn/index.ts
 printf '#!/bin/sh\nexec env WEBKIT_DISABLE_DMABUF_RENDERER=1 "$HOME/.local/bin/pi-desktop-bin" "$@"\n' > ~/.local/bin/pi-desktop
 chmod +x ~/.local/bin/pi-desktop
 ```
