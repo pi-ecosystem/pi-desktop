@@ -3,6 +3,7 @@
 
 import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
+import { getCurrentWindow } from "./tauri-window-shim";
 import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
@@ -49,6 +50,17 @@ function pin() {
   if (!stick) return;
   const m = $("scrollwrap");
   m.scrollTop = m.scrollHeight;
+}
+// Latch-heal: trackpad jitter or a layout kick unlatches `stick` while the
+// user is still effectively at the bottom, and every later pin() no-ops.
+// New agent output re-arms the pin when the viewport is NEAR the bottom
+// (300px grace); readers parked deep in history keep control.
+function healStick(): void {
+  try {
+    const m = $("scrollwrap");
+    if (!m) return;
+    if (m.scrollHeight - m.scrollTop - m.clientHeight < 300) stick = true;
+  } catch { /* ignore */ }
 }
 // Unconditional drop-to-bottom on send: the user asked for it, output or
 // not. Unlike pin() this ignores `stick` — pressing Enter means "take me
@@ -1528,9 +1540,11 @@ function route(rec: any) {
   if (rec.type === "turn_start" || rec.type === "agent_start") {
     streamClosed = false;
     queuedCount = 0; // held messages went live: count fallback consumed
+    healStick(); // agent responded: forgive a jitter-unlatched pin
   }
   if (rec.type === "message_start") {
     streamClosed = false;
+    healStick();
   }
   // A new turn starting (follow-ups, steering continuations, retries)
   // locks the composer even though no send() ran: startRun's flag is
@@ -3850,6 +3864,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     ($("scrollbtn") as HTMLButtonElement).classList.toggle("hidden", away < 200);
   };
   scrollerEl.addEventListener("scroll", scroller);
+  // Refocus the composer when the window regains focus (Tauri tab
+  // switch, Alt-Tab): without this the user must click the box to type.
+  // Guarded: never yank focus out of another field, the settings modal,
+  // or the lightbox — only fill the vacuum when nothing is focused.
+  const focusComposer = () => {
+    try {
+      if (!$("settingsmodal").classList.contains("hidden")) return;
+      if (document.querySelector(".lightbox")) return;
+      const a = document.activeElement as HTMLElement | null;
+      if (a && a !== document.body) return;
+      ($("input") as HTMLTextAreaElement).focus();
+    } catch { /* ignore */ }
+  };
+  try {
+    const win = getCurrentWindow();
+    void win.onFocusChanged(({ payload: focused }: any) => {
+      if (focused) focusComposer();
+    });
+  } catch { /* browser fallback below covers it */ }
+  window.addEventListener("focus", focusComposer);
   ($("panebtn") as HTMLButtonElement).addEventListener("click", () => {
     setSidePane(sideIsOpen() ? null : sideTabLast);
   });

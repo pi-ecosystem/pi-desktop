@@ -622,11 +622,36 @@ function renderMdInner(src: string): string {
     closeList();
     closeOl();
     // paragraph: gather until blank. A lone media URL becomes an embed.
+    // A lone `Label:` line (plain or **bold**, e.g. `You'll like it if you
+    // like:`) is a section header, not body — peel it into <p class="sect">
+    // so it gets header styling even when the model skips bold. Applies to
+    // a solo label para AND a label leading a multi-line para.
     const buf = [line];
     i++;
     while (i < lines.length && lines[i].trim() !== "" && !lines[i].startsWith("```")) {
       buf.push(lines[i]);
       i++;
+    }
+    const isLabelLine = (s: string): boolean => {
+      // Accept plain `Label:` and **bold** `**Label:**` / `**Label**:`.
+      let t = s.trim();
+      const bm = t.match(/^\*\*([\s\S]+?)\*\*:?$/);
+      if (bm) t = `${bm[1].trim().replace(/:+$/, "")}:`;
+      if (!/^.{2,80}:$/.test(t)) return false;
+      if (t.includes("://") || t.includes("::")) return false; // URLs, times
+      return !/[.!?]/.test(t.slice(0, -1)); // no sentence inside
+    };
+    if (buf.length === 1 && isLabelLine(buf[0])) {
+      const bare = bareMediaLine(buf[0]);
+      out.push(bare ?? `<p class="sect">${inline(buf[0].trim())}</p>`);
+      continue;
+    }
+    if (buf.length > 1 && isLabelLine(buf[0])) {
+      out.push(`<p class="sect">${inline(buf[0].trim())}</p>`);
+      const rest = buf.slice(1).join("\n");
+      const bare = bareMediaLine(rest);
+      out.push(bare ?? `<p>${inline(rest)}</p>`);
+      continue;
     }
     const bare = bareMediaLine(buf.join("\n"));
     out.push(bare ?? `<p>${inline(buf.join("\n"))}</p>`);

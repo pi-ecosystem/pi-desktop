@@ -297,20 +297,21 @@ details.toolrow > summary:hover { color: var(--text); }
 .msg p, #qbanswer p { margin: 12px 0; text-wrap: pretty; }
 .msg p:first-child, #qbanswer p:first-child { margin-top: 0; }
 .msg p:last-child, #qbanswer p:last-child { margin-bottom: 0; }
-/* Lone-bold paragraphs are really section labels (BUDGET PICKS /
-   MID-RANGE / PREMIUM). Set them as small caps headers with air above
-   instead of another white sentence in the blob. */
-.msg p > strong:only-child, #qbanswer p > strong:only-child { display: block; margin: 20px 0 2px; font-size: 12.5px; font-weight: 500; letter-spacing: 0.08em; color: var(--text); text-wrap: balance; }
-.msg p:first-child > strong:only-child, #qbanswer p:first-child > strong:only-child { margin-top: 0; }
+/* Lone-bold paras and `Label:` lines stay bold body text — just on their
+   own line with air above. No smaller size, no letterspacing: a header
+   costume that shrinks text reads as a different font. */
+.msg p > strong:only-child, #qbanswer p > strong:only-child, .msg p.sect, #qbanswer p.sect { display: block; margin: 20px 0 2px; font-size: inherit; font-weight: 600; letter-spacing: normal; color: #fff; text-wrap: balance; }
+.msg p:first-child > strong:only-child, #qbanswer p:first-child > strong:only-child, .msg p.sect:first-child, #qbanswer p.sect:first-child { margin-top: 0; }
 .msg li, #qbanswer li { margin: 8px 0; line-height: 1.65; text-wrap: pretty; }
 .msg li::marker, #qbanswer li::marker { color: var(--dim); font-weight: 500; }
 .msg h1, #qbanswer h1 { margin: 10px 0 4px; font-size: 21px; font-weight: 600; line-height: 28px; text-wrap: balance; }
 .msg h2, #qbanswer h2 { margin: 10px 0 4px; font-size: 18px; font-weight: 600; line-height: 26px; text-wrap: balance; }
 .msg h3, #qbanswer h3 { margin: 8px 0 4px; font-size: 16px; font-weight: 500; line-height: 24px; letter-spacing: -0.2px; text-wrap: balance; }
 .msg h4, .msg h5, .msg h6, #qbanswer h4, #qbanswer h5, #qbanswer h6 { margin: 8px 0 4px; font-size: 14px; font-weight: 500; line-height: 20px; text-wrap: balance; }
-/* inline bold: weight alone blooms on dark bg. 400 + pure-white reads as
-   emphasis via brightness, not stroke — quiet but still scannable. */
-.msg strong, .msg b, #qbanswer strong, #qbanswer b { font-weight: 400; color: #fff; }
+/* inline bold: 400/400 bloomed invisibly against body (#ececec vs #fff).
+   600 + pure-white reads as emphasis via stroke AND brightness. */
+.msg strong, .msg b, #qbanswer strong, #qbanswer b { font-weight: 600; color: #fff; }
+.msg em, .msg i, #qbanswer em, #qbanswer i { color: #fff; }
 .msg ul, #qbanswer ul { margin: 12px 0 16px; padding-left: 24px; }
 .msg code, #qbanswer code { background: rgba(255, 255, 255, 0.07); padding: 1px 6px; border-radius: 6px; font-family: var(--mono); font-size: 0.85em; font-weight: 400; }
 .msg pre, #qbanswer pre { background: var(--code); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
