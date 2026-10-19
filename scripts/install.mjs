@@ -85,11 +85,11 @@ if (!args.has("--skip-build")) {
       if (out.status === 0) env.WEBKIT_DISABLE_DMABUF_RENDERER = "1";
     } catch { /* no nvidia-smi: plain build */ }
   }
-  // No bundles on Linux: raw binary install. Everywhere else the
-  // bundler runs (dmq/nsis/deb per platform above).
+  // No bundles on Linux: raw binary install. --no-bundle still runs
+  // the full build (and embeds the frontend — plain cargo does not).
   if (bundles.length === 0) {
-    console.log("→ cargo build --release (no bundle — takes minutes)");
-    run("cargo", ["build", "--release", "--manifest-path", "src-tauri/Cargo.toml"], { env });
+    console.log("→ tauri build --no-bundle (release — takes minutes)");
+    run("npx", ["tauri", "build", "--no-bundle"], { env });
   } else {
     console.log(`→ tauri build --bundles ${bundles.join(",")} (release — takes minutes)`);
     run("npx", ["tauri", "build", "--bundles", ...bundles], { env });
