@@ -16,6 +16,9 @@ use calamine::Reader as _;
 use tokio::sync::broadcast;
 
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+// Desktop-only: global shortcuts don't exist on Android/iOS (and the
+// plugin isn't even a dependency there — see Cargo.toml target cfg).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri_plugin_global_shortcut::ShortcutState;
 
 mod server;
@@ -1238,6 +1241,24 @@ fn get_config(state: State<Arc<AppState>>) -> AppConfig {
     state.get_config_core()
 }
 
+/// Hotkey validation: desktop parses via the real Shortcut type;
+/// mobile just checks non-empty (no global shortcuts there, and the
+/// plugin isn't a dependency on android/ios). Server --server path
+/// shares this, so validation must compile everywhere.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn validate_hotkey(s: &str) -> Result<(), String> {
+    let _: tauri_plugin_global_shortcut::Shortcut =
+        s.parse().map_err(|_| format!("bad hotkey: {s}"))?;
+    Ok(())
+}
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn validate_hotkey(s: &str) -> Result<(), String> {
+    if s.trim().is_empty() {
+        return Err("bad hotkey: empty".into());
+    }
+    Ok(())
+}
+
 impl AppState {
     /// Apply a config patch: validate, mutate, persist. Returns the
     /// snapshot plus which window-side effects the host must apply
@@ -1258,10 +1279,8 @@ impl AppState {
             .to_string();
         drop(cfg);
         // Validate BEFORE unregister_all: a typo must not wipe working keys.
-        let _: tauri_plugin_global_shortcut::Shortcut =
-            q.parse().map_err(|_| format!("bad hotkey: {q}"))?;
-        let _: tauri_plugin_global_shortcut::Shortcut =
-            m.parse().map_err(|_| format!("bad hotkey: {m}"))?;
+        validate_hotkey(&q)?;
+        validate_hotkey(&m)?;
     }
     let mut cfg = self.config.lock().map_err(|e| e.to_string())?;
     if let Some(v) = patch.get("default_dir").and_then(|v| v.as_str()) {
@@ -1307,6 +1326,7 @@ fn set_config(patch: serde_json::Value, app: AppHandle, state: State<Arc<AppStat
     Ok(snapshot)
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn apply_hotkeys(app: &AppHandle, _state: &State<Arc<AppState>>, cfg: &AppConfig) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let _ = app.global_shortcut().unregister_all();
@@ -1323,6 +1343,12 @@ fn apply_hotkeys(app: &AppHandle, _state: &State<Arc<AppState>>, cfg: &AppConfig
             .map_err(|e| e.to_string())?;
         app.global_shortcut().register(shortcut).map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+/// Mobile stub: no global shortcuts on Android/iOS (--server has no
+/// windows to toggle; the phone UI never calls this).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn apply_hotkeys(_app: &AppHandle, _state: &State<Arc<AppState>>, _cfg: &AppConfig) -> Result<(), String> {
     Ok(())
 }
 
@@ -1342,11 +1368,14 @@ fn quit_app(app: &AppHandle) {
     app.exit(0);
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn tray_icon_image() -> Option<tauri::image::Image<'static>> {
     tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png")).ok()
 }
 
 /// Create the tray icon if missing; set visibility per background mode.
+/// Desktop only: no tray/menu APIs on Android/iOS.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn apply_tray(app: &AppHandle, enabled: bool) {
     use tauri::tray::TrayIconBuilder;
     if app.tray_by_id("main-tray").is_none() {
@@ -1381,6 +1410,9 @@ fn apply_tray(app: &AppHandle, enabled: bool) {
         let _ = tray.set_visible(enabled);
     }
 }
+/// Mobile stub: no tray on Android/iOS.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn apply_tray(_app: &AppHandle, _enabled: bool) {}
 
 fn bg_enabled(app: &AppHandle) -> bool {
     app.try_state::<AppState>()
@@ -1422,6 +1454,8 @@ fn toggle_window(app: &AppHandle, label: &str) {
             let _ = w.show();
             let _ = w.set_focus();
             if label == "quickbar" {
+                // center() is desktop-only (no windowing on mobile).
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let _ = w.center();
                 let _ = app.emit("quickbar-shown", ());
             }
@@ -1481,6 +1515,8 @@ fn open_in_main(app: AppHandle, cwd: String, session_path: Option<String>, state
 
 /// Native file picker (desktop only): real paths, no copying. Browser
 /// mode keeps the file-input + save_upload flow (see attachbtn).
+/// Mobile stub below: blocking_pick_* doesn't exist on Android/iOS.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -1493,7 +1529,13 @@ fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
         .map(|v| v.into_iter().map(|p| p.to_string()).collect())
         .unwrap_or_default())
 }
-
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
+    let _ = app;
+    Err("file picker unavailable on mobile (use upload instead)".into())
+}
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 async fn pick_dir(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -1503,6 +1545,12 @@ async fn pick_dir(app: AppHandle) -> Result<Option<String>, String> {
         .set_title("Choose working directory")
         .blocking_pick_folder();
     Ok(picked.map(|p| p.to_string()))
+}
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+async fn pick_dir(app: AppHandle) -> Result<Option<String>, String> {
+    let _ = app;
+    Err("dir picker unavailable on mobile".into())
 }
 
 // ---------------------------------------------------------------- run
@@ -1563,8 +1611,12 @@ pub fn run() {
     // Shared core (config, procs, broadcast) also used by `--server`.
     let backend = AppState::new_shared();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+    // Desktop-only plugins (not dependencies on android/ios — see
+    // Cargo.toml target cfg). Rebind pattern: #[cfg] can't gate a link
+    // inside a builder chain, so gate the rebinding instead.
+    let builder = tauri::Builder::default();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // KDE-fallback shortcut path: `pi-quickbar --toggle-quickbar`.
             if argv.iter().any(|a| a == "--toggle-quickbar") {
                 toggle_window(&app, "quickbar");
@@ -1574,8 +1626,10 @@ pub fn run() {
                 let _ = w.show();
                 let _ = w.set_focus();
             }
-        }))
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        }));
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(backend)
@@ -1601,6 +1655,7 @@ pub fn run() {
                 if let Some(w) = app.get_webview_window("quickbar") {
                     let _ = w.show();
                     let _ = w.set_focus();
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     let _ = w.center();
                 }
             }
