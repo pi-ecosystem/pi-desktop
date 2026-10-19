@@ -4453,6 +4453,21 @@ window.addEventListener("DOMContentLoaded", async () => {
     syncSendBtn();
     renderCmdList();
   });
+  // Mobile keyboard: the manifest uses adjustNothing, so the keyboard
+  // overlays the WebView instead of resizing it. Lift only the composer
+  // above the keyboard via the visual viewport — header and transcript
+  // stay exactly put. No-op wherever there is no keyboard (kb height 0).
+  try {
+    const vv = window.visualViewport;
+    if (vv) {
+      const liftComposer = () => {
+        const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        ($("composer") as HTMLElement).style.transform = kb > 0 ? `translateY(${-kb}px)` : "";
+      };
+      vv.addEventListener("resize", liftComposer);
+      vv.addEventListener("scroll", liftComposer);
+    }
+  } catch { /* old webviews: no-op */ }
   inp.addEventListener("paste", (e) => {
     const files = e.clipboardData?.files;
     if (files?.length) addFiles(files);
