@@ -536,7 +536,7 @@ html:has(> body.qb) { background: var(--surface); }
 /* Mobile: sidebar + sidepane become overlays, composer tightens, no iOS zoom. */
 @media (max-width: 768px) {
   #newchatbtn { display: inline-flex; }
-  #side { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; width: min(84vw, 320px); min-width: 0; box-shadow: 8px 0 32px rgba(0,0,0,0.5); }
+  #side { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; width: min(84vw, 320px); min-width: 0; box-shadow: 8px 0 32px rgba(0,0,0,0.5); padding-top: env(safe-area-inset-top, 0px); }
   #sidepane { position: fixed; left: 0; right: 0; bottom: 0; top: 12%; z-index: 60; flex: none; min-width: 0; border-left: none; border-top: 1px solid var(--sideborder); border-radius: 16px 16px 0 0; box-shadow: 0 -8px 32px rgba(0,0,0,0.5); }
   #sideresize, #sidelresize { display: none; }
   #msgs { padding: 16px 12px 32px; width: calc(100% - 16px); gap: 20px; }

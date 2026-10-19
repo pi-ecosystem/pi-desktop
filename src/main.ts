@@ -3556,6 +3556,12 @@ function paintEmpty(): void {
 }
 
 async function switchSession(path: string) {
+  // Mobile: the sidebar is an overlay drawer — picking a session
+  // dismisses it so the transcript is actually visible.
+  if (window.matchMedia("(max-width: 768px)").matches) {
+    document.body.classList.add("side-collapsed");
+    ($("expandbtn") as HTMLButtonElement).classList.remove("hidden");
+  }
   // Invalidate any in-flight setCwd: it would otherwise complete after us
   // and steal the view back to its own session. Last click wins.
   cwdGen++;
@@ -4492,6 +4498,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("newsess") as HTMLButtonElement).addEventListener("click", async () => {
+    // Mobile drawer: a fresh chat is a navigation — dismiss the sidebar.
+    if (window.matchMedia("(max-width: 768px)").matches) {
+      document.body.classList.add("side-collapsed");
+      ($("expandbtn") as HTMLButtonElement).classList.remove("hidden");
+    }
     cwdGen++; // invalidate any in-flight setCwd (see switchSession)
     resetRunState();
     paintEmpty();
@@ -4525,6 +4536,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.body.classList.add("side-collapsed");
     ($("expandbtn") as HTMLButtonElement).classList.remove("hidden");
   }
+  // Mobile drawer: tapping outside the open sidebar dismisses it.
+  // Narrow-only so desktop clicks are untouched; the expand button
+  // itself is exempt (it opens, this would instantly re-close).
+  document.addEventListener("click", (e) => {
+    if (!window.matchMedia("(max-width: 768px)").matches) return;
+    if (document.body.classList.contains("side-collapsed")) return;
+    const t = e.target as HTMLElement | null;
+    if (!t) return;
+    if (t.closest("#side") || t.closest("#expandbtn")) return;
+    document.body.classList.add("side-collapsed");
+    ($("expandbtn") as HTMLButtonElement).classList.remove("hidden");
+  });
   const scrollerEl = $("scrollwrap");
   const scroller = () => {
     const away = scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight;
