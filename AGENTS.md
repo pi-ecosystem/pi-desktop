@@ -63,6 +63,10 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
   always reports Termux missing on Android 11+).
 - Debug on-device: `adb logcat`, screenshots via
   `adb exec-out screencap -p` (readable as images here).
+- After any fresh `tauri android init`, also re-apply in
+  `gen/android/app/build.gradle.kts`: release `usesCleartextTraffic`
+  must be `"true"` (app talks to Termux backend over localhost HTTP;
+  Tauri's release default `false` blocks even loopback).
 
 ## Contributions
 
