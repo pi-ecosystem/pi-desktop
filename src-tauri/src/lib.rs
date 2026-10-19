@@ -288,8 +288,18 @@ impl AppState {
         procs.remove(&pkey);
     }
 
+    // Empty cwd (a fresh frontend with no config yet) means the backend
+    // default, not an error — the phone UI hits this on first launch.
+    let cwd = if cwd.trim().is_empty() {
+        self.config.lock().map(|c| c.default_dir.clone()).unwrap_or_default()
+    } else {
+        cwd
+    };
+    if cwd.trim().is_empty() {
+        return Err("no working dir and no backend default (config broken?)".into());
+    }
     // Make sure the dir exists (default Q&A dir may not yet).
-    let _ = fs::create_dir_all(&cwd);
+    fs::create_dir_all(&cwd).map_err(|e| format!("cannot use working dir '{cwd}': {e}"))?;
 
     let bin = pi_bin();
     let mut cmd = Command::new(&bin);
@@ -335,7 +345,7 @@ impl AppState {
             cmd.arg("--session").arg(sp);
         }
     }
-    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn pi: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn pi binary '{bin}': {e}"))?;
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
 
