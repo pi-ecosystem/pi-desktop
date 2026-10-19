@@ -858,6 +858,59 @@ fn delete_session(path: String, session_root: Option<String>) -> Result<(), Stri
     fs::remove_file(&canonical).map_err(|e| e.to_string())
 }
 
+/// Rename a session: append a `session_info` name entry (last one wins
+/// for the sidebar — same shape pi itself writes via set_session_name).
+/// Chained onto the file's last entry id so history stays linked.
+/// Works on any session, live or not: no proc needed.
+#[tauri::command]
+fn rename_session(path: String, name: String, session_root: Option<String>) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("empty name".into());
+    }
+    if name.chars().count() > 120 {
+        return Err("name too long (max 120 chars)".into());
+    }
+    let root = session_root.unwrap_or_else(session_root_default);
+    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable session root: {e}"))?;
+    let p = PathBuf::from(&path);
+    let canonical = fs::canonicalize(&p).map_err(|e| format!("unreadable session file: {e}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("refusing to rename outside session dir".into());
+    }
+    let text = fs::read_to_string(&canonical).map_err(|e| e.to_string())?;
+    let mut parent_id = String::new();
+    for line in text.lines().rev() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                parent_id = id.to_string();
+                break;
+            }
+        }
+    }
+    static RENAME_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RENAME_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let id = format!("{:08x}", (nanos ^ (std::process::id() as u128) ^ (n as u128)) & 0xffff_ffff);
+    let entry = serde_json::json!({
+        "type": "session_info",
+        "id": id,
+        "parentId": parent_id,
+        "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        "name": name,
+    });
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&canonical)
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "{entry}").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Windowed transcript of ANY session file, parsed straight from disk.
 /// Same message shape as get_messages. This is what history rebuilds read:
 /// the file is the truth every writer shares, so a stale, dead, or busy
@@ -1691,6 +1744,7 @@ pub fn run() {
             pids_alive,
             list_sessions,
             delete_session,
+            rename_session,
             read_media,
             media_stat,
             read_session_messages,

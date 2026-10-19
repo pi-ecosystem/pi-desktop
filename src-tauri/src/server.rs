@@ -22,7 +22,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 
 use super::{
-    delete_session, delete_spawn_run, list_sessions, media_stat, pids_alive,
+    delete_session, delete_spawn_run, list_sessions, media_stat, pids_alive, rename_session,
     read_media, read_office_text, read_session_messages, read_sheet, read_spawn_log, read_spawn_transcript, AppState,
 };
 
@@ -114,6 +114,12 @@ fn dispatch(
             let path = req_s(p, "path", "path", "path")?;
             let session_root = s(p, "session_root", "sessionRoot");
             delete_session(path, session_root).map(|_| serde_json::Value::Null)
+        }
+        "rename_session" => {
+            let path = req_s(p, "path", "path", "path")?;
+            let name = req_s(p, "name", "name", "name")?;
+            let session_root = s(p, "session_root", "sessionRoot");
+            rename_session(path, name, session_root).map(|_| serde_json::Value::Null)
         }
         "read_media" => {
             let path = req_s(p, "path", "path", "path")?;

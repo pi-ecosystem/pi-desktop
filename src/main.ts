@@ -2341,6 +2341,7 @@ function paintRunDots(): void {
 }
 
 async function refreshSessions() {
+  hideSessMenu(); // rows rebuild: any open menu points at stale nodes
   try {
     sessCache = await sessions.list(cwd);
   } catch {
@@ -2441,60 +2442,148 @@ async function refreshSessions() {
     } else {
       d.addEventListener("click", () => switchSession(s.path));
     }
-    const del = el("button", "sdel", "×");
-    del.title = "Delete session file";
-    del.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      // Arm-to-confirm: native confirm() throws under Tauri (dialog
-      // plugin not permitted). First click arms, second executes.
-      // Rebuilds reset the armed state, so it can't stick.
-      if (del.dataset.armed !== "1") {
-        del.dataset.armed = "1";
-        del.textContent = "?";
-        del.title = "Click again to confirm delete";
-        setTimeout(() => {
-          del.dataset.armed = "";
-          if (del.isConnected) {
-            del.textContent = "×";
-            del.title = "Delete session file";
-          }
-        }, 3000);
-        return;
-      }
-      const wasActive = s.path === curFile;
-      try {
-        await sessions.del(s.path);
-      } catch (e: any) {
-        toastErr(`delete failed: ${e.message ?? e}`);
-        return;
-      }
-      // Deleting the viewed session: stop its child (it keeps running
-      // otherwise, orphaned) and open a fresh one. Procs keep the key
-      // they started with (fresh id), so stop by the mapped proc key —
-      // the file path alone matches no proc for app-started chats.
-      try {
-        await stopChild(cwd, fileToKey.get(s.path) ?? s.path).catch(() => {});
-      } catch { /* no child */ }
-      // Drop tracking for the deleted file: stale marks would otherwise
-      // linger (and a future file reusing the path would inherit them).
-      runLive.delete(s.path);
-      fileToKey.delete(s.path);
-      if (wasActive) {
-        try {
-          resetRunState();
-          await openFresh();
-        } catch { /* fall through to refresh */ }
-        refreshAll(false);
-        return;
-      }
-      refreshSessions();
-    });
-    if (s.path) d.appendChild(del);
+    // Claude-style row menu: hover "…" button or right-click opens a
+    // floating menu (Delete lives there, red, with its own confirm
+    // step). Native confirm() throws under Tauri, so the menu itself
+    // hosts the confirmation — no popups, no timeouts, no overlap.
+    if (s.path) {
+      const more = el("button", "sdel smore", "…");
+      more.title = "Session options";
+      more.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+        openSessMenu(s, r.left, r.bottom + 4);
+      });
+      d.appendChild(more);
+      d.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openSessMenu(s, e.clientX, e.clientY);
+      });
+    }
     list.appendChild(d);
   }
   // Restore pre-rebuild scroll (clamped: rows may have come or gone).
   list.scrollTop = Math.min(keepScroll, Math.max(0, list.scrollHeight - list.clientHeight));
   paintRunDots();
+}
+
+// Floating per-session menu (Claude-style): hover "…" or right-click a
+// sidebar row. One shared element, positioned at the anchor, clamped
+// into the viewport. Same .dd-list chrome as the other menus.
+let sessMenuEl: HTMLElement | null = null;
+function sessMenuEsc(e: KeyboardEvent) {
+  if (e.key === "Escape") {
+    e.stopPropagation();
+    hideSessMenu();
+  }
+}
+function hideSessMenu() {
+  sessMenuEl?.remove();
+  sessMenuEl = null;
+  document.removeEventListener("keydown", sessMenuEsc, true);
+}
+function openSessMenu(s: SessionInfo, x: number, y: number) {
+  closeDrops();
+  hideSessMenu();
+  const label = titleText(s);
+  const m = document.createElement("div");
+  m.id = "sessmenu";
+  m.className = "dd-list";
+  m.addEventListener("click", (e) => e.stopPropagation());
+  const ren = el("div", "dd-opt", "Rename");
+  ren.addEventListener("click", () => {
+    m.innerHTML = "";
+    m.appendChild(el("div", "sessmenu-head", "Rename session"));
+    const inp = document.createElement("input");
+    inp.className = "sessmenu-input";
+    inp.value = s.name ?? "";
+    inp.placeholder = "Name this session";
+    inp.setAttribute("spellcheck", "false");
+    m.appendChild(inp);
+    const row = el("div", "sessmenu-row");
+    const cancel = el("button", "sessmenu-btn", "Cancel");
+    cancel.addEventListener("click", () => hideSessMenu());
+    const save = el("button", "sessmenu-btn primary", "Save");
+    const doRename = async () => {
+      const name = inp.value.trim();
+      hideSessMenu();
+      if (!name) return;
+      try {
+        await sessions.rename(s.path, name);
+      } catch (e: any) {
+        toastErr(`rename failed: ${e.message ?? e}`);
+        return;
+      }
+      if (s.path === curFile) $("sesstitle").textContent = name;
+      refreshSessions();
+    };
+    save.addEventListener("click", doRename);
+    inp.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") doRename();
+    });
+    row.appendChild(cancel);
+    row.appendChild(save);
+    m.appendChild(row);
+    inp.focus();
+    inp.select();
+  });
+  m.appendChild(ren);
+  const del = el("div", "dd-opt danger", "Delete");
+  del.addEventListener("click", () => {
+    // Confirm step, inline: native confirm() throws under Tauri.
+    m.innerHTML = "";
+    m.appendChild(el("div", "sessmenu-head", "Delete this session?"));
+    m.appendChild(el("div", "sessmenu-sub", esc(label)));
+    const row = el("div", "sessmenu-row");
+    const cancel = el("button", "sessmenu-btn", "Cancel");
+    cancel.addEventListener("click", () => hideSessMenu());
+    const yes = el("button", "sessmenu-btn danger", "Delete");
+    yes.addEventListener("click", async () => {
+      hideSessMenu();
+      await deleteSessionFile(s);
+    });
+    row.appendChild(cancel);
+    row.appendChild(yes);
+    m.appendChild(row);
+  });
+  m.appendChild(del);
+  document.body.appendChild(m);
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + "px";
+  m.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+  sessMenuEl = m;
+  document.addEventListener("keydown", sessMenuEsc, true);
+}
+async function deleteSessionFile(s: SessionInfo) {
+  const wasActive = s.path === curFile;
+  try {
+    await sessions.del(s.path);
+  } catch (e: any) {
+    toastErr(`delete failed: ${e.message ?? e}`);
+    return;
+  }
+  // Deleting the viewed session: stop its child (it keeps running
+  // otherwise, orphaned) and open a fresh one. Procs keep the key
+  // they started with (fresh id), so stop by the mapped proc key —
+  // the file path alone matches no proc for app-started chats.
+  try {
+    await stopChild(cwd, fileToKey.get(s.path) ?? s.path).catch(() => {});
+  } catch { /* no child */ }
+  // Drop tracking for the deleted file: stale marks would otherwise
+  // linger (and a future file reusing the path would inherit them).
+  runLive.delete(s.path);
+  fileToKey.delete(s.path);
+  if (wasActive) {
+    try {
+      resetRunState();
+      await openFresh();
+    } catch { /* fall through to refresh */ }
+    refreshAll(false);
+    return;
+  }
+  refreshSessions();
 }
 
 // ChatGPT-style titles: explicit /name wins, else first words of first prompt.
@@ -3012,6 +3101,7 @@ function menuPick(list: HTMLElement): void {
 }
 
 function closeDrops() {
+  hideSessMenu();
   $("modellist").classList.add("hidden");
   $("thinklist").classList.add("hidden");
   $("dirlist").classList.add("hidden");
@@ -4564,6 +4654,26 @@ window.addEventListener("DOMContentLoaded", async () => {
       }
     } catch { /* backend busy: next beat retries */ }
   }, 20_000);
+  // Chat sidebar resize: same drag pattern as the right panel, mirrored.
+  // Width persists across reloads.
+  const side = $("side");
+  const savedSideW = Number(localStorage.getItem("side-w") || 0);
+  if (savedSideW >= 220 && savedSideW <= 560) side.style.flex = `0 0 ${savedSideW}px`;
+  ($("sidelresize") as HTMLElement).addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = side.getBoundingClientRect().width;
+    const move = (ev: MouseEvent) => {
+      side.style.flex = `0 0 ${Math.min(560, Math.max(220, startW + (ev.clientX - startX)))}px`;
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      localStorage.setItem("side-w", String(Math.round(side.getBoundingClientRect().width)));
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  });
   // Elapsed ticking for running subagents: badge + open panel + inline
   // cards. Static elapsed on a live card reads broken within seconds.
   setInterval(() => {

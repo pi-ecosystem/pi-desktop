@@ -220,6 +220,8 @@ export const sessions = {
   list: (cwd?: string): Promise<SessionInfo[]> =>
     invoke("list_sessions", { cwdFilter: cwd ?? null, sessionRoot: null }),
   del: (path: string): Promise<void> => invoke("delete_session", { path, sessionRoot: null }),
+  rename: (path: string, name: string): Promise<void> =>
+    invoke("rename_session", { path, name, sessionRoot: null }),
   // Windowed transcript parsed straight from the session file (same shape as
   // get_messages, plus total/has_more/bytes). The file is the truth every
   // writer shares: immune to stale/dead/busy pi processes. Falls back to
