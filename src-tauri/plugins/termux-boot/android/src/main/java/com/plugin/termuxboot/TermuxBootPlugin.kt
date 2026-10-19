@@ -51,15 +51,16 @@ class TermuxBootPlugin(private val activity: Activity) : Plugin(activity) {
         return
       }
       // Fire-and-forget: Termux runs pi-desktop-server in the background.
-      // The frontend polls the HTTP backend until it answers.
-      val intent = Intent("com.termux.app.RUN_COMMAND").apply {
+      // Spec: https://github.com/termux/termux-app/wiki/RUN_COMMAND-Intent
+      // (action + extras verified against RunCommandService bytecode).
+      val intent = Intent("com.termux.RUN_COMMAND").apply {
         setClassName("com.termux", "com.termux.app.RunCommandService")
-        putExtra("com.termux.execute.background", true)
+        putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
         putExtra(
-          "com.termux.execute.command_path",
+          "com.termux.RUN_COMMAND_PATH",
           "/data/data/com.termux/files/usr/bin/pi-desktop-server"
         )
-        putExtra("com.termux.execute.arguments", arrayOf("--server", args.port.toString()))
+        putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("--server", args.port.toString()))
       }
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         activity.startForegroundService(intent)
