@@ -351,15 +351,10 @@ function setSidePane(tab: "changes" | "agents" | "procs" | null) {
 function syncPaneBtns() {
   ($("panebtn") as HTMLButtonElement).classList.toggle("open", sideIsOpen());
 }
-const toolElapsed = new Map<string, number>(); // toolCallId -> durationMs (server-reported)
 let runT0 = 0;
-let runTok = 0;
 let lastRun: HTMLElement | null = null;
 function fmtMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
-}
-function fmtTok(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
 }
 // Claude-style one-line tool summary from name + args.
 function toolSummary(name: string, p: any): string {
@@ -716,7 +711,9 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
     const args = calls?.get(m.toolCallId);
     const params = args?.arguments ?? {};
     const ok = !m.isError;
-    const elapsed = toolElapsed.get(m.toolCallId ?? "");
+    // Duration comes from the message itself (the file's durationMs) —
+    // no memory cache; rebuilds and reloads show the same number.
+    const elapsed = typeof m.durationMs === "number" ? m.durationMs : undefined;
     const d = el("details", "toolrow");
     d.appendChild(el("summary", "tgsum",
       `<span class="tstat ${ok ? "ok" : "err"}">${ok ? "✓" : "✗"}</span> ` +
@@ -740,6 +737,7 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
     d.appendChild(el("summary", "tgsum", `<span class="tstat ok">✓</span> $ ${esc((m.command ?? "bash").slice(0, 80))}`));
     d.appendChild(el("div", "tgrun", `<code>$ ${esc(m.command ?? "")}</code>`));
     if (m.output) d.appendChild(el("div", "tgout", `<pre><code>${esc(m.output.slice(0, 2000))}</code></pre>`));
+    (d as any)._diff = { tool: "bash", path: "bash", args: {}, out: (m.output ?? "").slice(0, 8000) };
     return d;
   }
   if (role === "compactionSummary" || role === "branchSummary") {
@@ -1224,13 +1222,13 @@ function appendMsgList(
     if (m.role === "assistant" && Array.isArray(m.content)) {
       for (const b of m.content) {
         if (b && b.type === "thinking" && b.thinking) {
-          run = runAppend(box, run, thoughtDiv(b.thinking));
+          run = runAppend(box, run, thoughtDiv(b.thinking), msgTs(m));
         }
       }
     }
     if (isTool(m)) {
       opts.onRendered?.(m);
-      run = runAppend(box, run, msgNode(m, calls));
+      run = runAppend(box, run, msgNode(m, calls), msgTs(m));
       shown++;
       continue;
     }
@@ -1258,6 +1256,8 @@ function appendMsgList(
   }
   // Thought-only containers never earn a dropdown: unwrap them into flow.
   box.querySelectorAll("details.runact").forEach((r) => maybeUnwrapRun(r as HTMLElement));
+  // History groups stamp time from the file's own timestamps.
+  box.querySelectorAll("details.runact").forEach((r) => stampRunTime(r as HTMLElement));
   return shown;
 }
 
@@ -1571,9 +1571,6 @@ function route(rec: any) {
   }
   // Streaming deltas (wire records are delta-only).
   if (rec.type === "message_update") {
-    if (rec.usage && typeof rec.usage.totalTokens === "number") {
-      runTok = Math.max(runTok, rec.usage.totalTokens);
-    }
     const ev = rec.assistantMessageEvent ?? {};
     if (ev.type === "text_delta" && typeof ev.delta === "string") {
       if (streamClosed) return; // straggler from a completed message: drop      // Dots stay until the final answer (agent_settled), even while text
@@ -1631,7 +1628,9 @@ function route(rec: any) {
       const d = (ev as any).delta ?? (ev as any).text ?? "";
       if (typeof d === "string" && d) {
         if (!liveThinkDiv) {
+          const wasNewThink = !liveRun;
           liveRun = runAppend($("msgs"), liveRun, thoughtDiv(""));
+          if (wasNewThink) openFreshRun($("msgs"), liveRun as HTMLElement);
           liveThinkDiv = (liveRun as HTMLElement).querySelector(".tgbody > .runthought:last-child");
           liveThinkBuf = "";
         }
@@ -1681,11 +1680,12 @@ function route(rec: any) {
       if (!liveToolRows.has(rec.toolCallId)) {
         const row = liveToolRow(rec.toolName ?? "tool", rec.args ?? {});
         // Auto-open a FRESH Activity container so the running tool is
-        // actually visible (the whole point). An existing container is
-        // left alone — the user may have collapsed it deliberately.
+        // actually visible (the whole point), collapsing older ones.
+        // An existing container is left alone — the user may have
+        // collapsed it deliberately.
         const wasNew = !liveRun;
         liveRun = runAppend($("msgs"), liveRun, row);
-        if (wasNew) (liveRun as HTMLDetailsElement).open = true;
+        if (wasNew) openFreshRun($("msgs"), liveRun as HTMLElement);
         liveToolRows.set(rec.toolCallId, row);
         dotsToEnd();
         pin();
@@ -1698,13 +1698,6 @@ function route(rec: any) {
   // the authoritative full output. (Summary line stays the indicator.)
   if (rec.type === "tool_execution_end") {
     if (rec && typeof rec.toolCallId === "string" && typeof rec.durationMs === "number") {
-      toolElapsed.set(rec.toolCallId, rec.durationMs);
-      // toolCallIds are unique per call: cap the cache or it grows
-      // forever across sessions (Map iterates insertion-first).
-      if (toolElapsed.size > 500) {
-        const oldest = toolElapsed.keys().next().value;
-        if (oldest !== undefined) toolElapsed.delete(oldest);
-      }
       // Stamp the live row too: the completion morph below may already
       // have run (event order is end-then-result, but never assume it).
       const row = liveToolRows.get(rec.toolCallId) as HTMLElement | undefined;
@@ -1767,7 +1760,9 @@ function appendMessageEnd(message: any): void {
   if (m.role === "assistant" && Array.isArray(m.content)) {
     for (const b of m.content) {
       if (b && b.type === "thinking" && b.thinking) {
-        liveRun = runAppend($("msgs"), liveRun, thoughtDiv(b.thinking));
+        const wasNewThink = !liveRun;
+        liveRun = runAppend($("msgs"), liveRun, thoughtDiv(b.thinking), msgTs(m));
+        if (wasNewThink) openFreshRun($("msgs"), liveRun as HTMLElement);
         dotsToEnd();
       }
     }
@@ -1789,7 +1784,9 @@ function appendMessageEnd(message: any): void {
       wireCopy(liveRow);
     } else {
       if (m.role === "toolResult" && typeof m.toolCallId === "string") liveToolRows.delete(m.toolCallId);
-      liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls));
+      const wasNewTool = !liveRun;
+      liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls), msgTs(m));
+      if (wasNewTool) openFreshRun($("msgs"), liveRun as HTMLElement);
     }
     dotsToEnd();
     pin();
@@ -1825,12 +1822,16 @@ function appendMessageEnd(message: any): void {
   // Live text splits the Activity stream like history does: later
   // thoughts/tools start a new container below this bubble. Clear the
   // partial-think pointer too, or new deltas bleed into the old box.
+  // An agent message after a group collapses it (pinned ones stay) —
+  // one rule for every group, last one included.
   if (m.role === "assistant") {
+    collapseAllRuns($("msgs"));
     liveRun = null;
     liveThinkDiv = null;
     liveThinkBuf = "";
   }
   markTurnActions();
+  pin(); // actions row + collapse changed heights after the earlier pin
 }
 
 const THINKING_DOTS = `<span class="thinking" aria-label="thinking"><i></i><i></i><i></i></span>`;
@@ -1847,7 +1848,6 @@ function startRun() {
   streamClosed = false; // new turn: reopen the stream gate
   markTurnActions();
   runT0 = Date.now();
-  runTok = 0;
   syncSendBtn();
   showThinking();
 }
@@ -1968,25 +1968,32 @@ function finishRun() {
   }
   pin();
   markTurnActions();
+  // No settle-collapse here: the last group follows the same rule as
+  // every other — it collapses when the next agent message lands.
   if (lastRun && runT0 > 0) {
     // Thought-only tail: unwrap into flow instead of labeling a box.
     maybeUnwrapRun(lastRun);
     const sum = lastRun.isConnected ? lastRun.querySelector(":scope > summary") : null;
     if (sum) {
-      const secs = ((Date.now() - runT0) / 1000).toFixed(1);
+      // Group span from the file's timestamps; omitted when unknown
+      // (still running) — never the memory wall clock.
+      const rs = runSecs(lastRun);
+      const secs = rs == null ? "" : ` · ${rs.toFixed(1)}s`;
       const label = (((lastRun as any)._label as string) || "Activity");
-      // "Ran N commands" already counts the tools — don't append a
-      // redundant "· N tools" after it.
-      const isRan = label.startsWith("Ran ");
-      const nTools = isRan ? 0 : lastRun.querySelectorAll(":scope .tgbody > details.toolrow").length;
+      // The label already breaks down what ran — only time and failures
+      // are appended here.
       const nFail = lastRun.querySelectorAll(":scope .tgbody .tstat.err").length;
       sum.innerHTML = `<span class="tgsum-txt">${esc(label)}` +
-        `${nTools ? ` · ${nTools} tool${nTools === 1 ? "" : "s"}` : ""}` +
-        ` · ${secs}s${runTok ? ` · ${fmtTok(runTok)} tokens` : ""}</span>` +
+        `${secs}</span>` +
         `${nFail ? ` <span class="tstat err">· ${nFail} failed</span>` : ""} ${CHEV}`;
     }
     lastRun = null;
   }
+  pin(); // label/actions/collapse changed heights after the earlier pin
+  // Definitive scroll AFTER paint: fonts, images and late layout all
+  // land before this fires, so one pin catches everything trailing.
+  // (pin is a no-op if you scrolled up to read.)
+  requestAnimationFrame(() => requestAnimationFrame(() => pin()));
   maybeAutoName().finally(() => refreshLight());
 }
 
@@ -2213,15 +2220,91 @@ function stamp(s: SessionInfo): string {
   return s.timestamp.replace("T", " ").slice(0, 19);
 }
 
+// Activity auto-collapse: only the newest container stays open. A manual
+// expand pins that container (dataset.userOpen) so later collapses skip
+// it; a manual close unpins. Programmatic opens go through setRunOpen
+// so the toggle listener can tell them apart.
+// Elements flipped programmatically: their (async) toggle events are
+// ours, not the user's. A counter/microtask can't work here — toggle
+// dispatches after microtasks — so track per-element until seen.
+const progRunToggle = new Set<HTMLDetailsElement>();
+function setRunOpen(d: HTMLDetailsElement, open: boolean): void {
+  if (d.open === open) return;
+  progRunToggle.add(d);
+  d.open = open;
+}
+function collapseRuns(box: HTMLElement, except: HTMLElement | null): void {
+  box.querySelectorAll(":scope > details.runact").forEach((r) => {
+    if (r === except) return;
+    if ((r as HTMLElement).dataset.userOpen === "1") return;
+    stampRunTime(r as HTMLElement);
+    setRunOpen(r as HTMLDetailsElement, false);
+  });
+}
+// Group span from the file's own message timestamps. No wall clock,
+// no memory: still-running groups show no time until they close.
+function runSecs(run: HTMLElement): number | null {
+  const r = run as any;
+  if (typeof r._ts0 === "number" && typeof r._ts1 === "number" && r._ts1 > r._ts0)
+    return (r._ts1 - r._ts0) / 1000;
+  return null;
+}
+function stampRunTime(run: HTMLElement): void {
+  try {
+    if (run.dataset.tstamped) return;
+    const secs = runSecs(run);
+    if (secs == null) return;
+    const tag = secs.toFixed(1);
+    const sum = run.querySelector(":scope > summary");
+    if (!sum) return;
+    const txt = sum.querySelector(":scope > .tgsum-txt");
+    if (txt) txt.innerHTML += ` <span class="dim">· ${tag}s</span>`;
+    else sum.innerHTML += ` <span class="dim">· ${tag}s</span>`;
+    run.dataset.tstamped = "1";
+  } catch { /* keep previous label */ }
+}
+// Fresh live container: open it. Older groups are NOT touched here —
+// they collapse when the next agent message lands (see
+// appendMessageEnd), so every group follows the same rule, including
+// the last one.
+function openFreshRun(_box: HTMLElement, run: HTMLElement): void {
+  setRunOpen(run as HTMLDetailsElement, true);
+}
+// Final answer / settle: collapse every Activity except user-pinned ones.
+function collapseAllRuns(box: HTMLElement): void {
+  collapseRuns(box, null);
+}
+document.addEventListener("toggle", (e) => {
+  const t = e.target as HTMLElement | null;
+  if (!t?.matches?.("details.runact")) return;
+  if (progRunToggle.has(t as HTMLDetailsElement)) {
+    progRunToggle.delete(t as HTMLDetailsElement);
+    return;
+  }
+  if ((t as HTMLDetailsElement).open) t.dataset.userOpen = "1";
+  else delete t.dataset.userOpen;
+}, true);
+
 // One collapsed "Activity" container per user request: thoughts and tool
 // rows interleaved in chronological order. No counts, no copy buttons.
-function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement): HTMLElement {
+function msgTs(m: any): number | undefined {
+  return typeof m?.timestamp === "number" ? m.timestamp : undefined;
+}
+function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement, ts?: number): HTMLElement {
   if (!run) {
     run = el("details", "runact");
     run.appendChild(el("summary", "tgsum", `Activity ${CHEV}`));
     lastRun = run;
+    if (ts != null) (run as any)._ts0 = (run as any)._ts1 = ts;
     run.appendChild(el("div", "tgbody"));
     box.appendChild(run);
+  } else if (ts != null) {
+    const r = run as any;
+    if (typeof r._ts0 !== "number") r._ts0 = r._ts1 = ts;
+    else {
+      r._ts0 = Math.min(r._ts0, ts);
+      r._ts1 = Math.max(r._ts1, ts);
+    }
   }
   run.querySelector(".tgbody")!.appendChild(item);
   // Claude-style: the collapsed container says what happened instead of
@@ -2233,26 +2316,54 @@ function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement)
 }
 
 // Recompute a runact container's collapsed label from its whole body.
-// Pure tool bursts aggregate ("Ran 4 commands"); anything with thinking
+// Pure tool bursts name what ran (reads / edits / tool calls / commands);
+// anything with thinking
 // leads with the latest thought's first sentence.
 function refreshRunLabel(run: HTMLElement): void {
   try {
     const body = run.querySelector(":scope > .tgbody");
     if (!body) return;
-    const tools = body.querySelectorAll(":scope > details.toolrow").length;
+    const rows = body.querySelectorAll(":scope > details.toolrow");
     const thoughts: string[] = [];
     body.querySelectorAll(":scope > div.runthought").forEach((d) => {
       const t = (d.textContent ?? "").replace(/\s+/g, " ").trim();
       if (t && t !== "Thought") thoughts.push(t.split(/[.?!]\s/)[0].slice(0, 110));
     });
     let base = "";
-    if (tools > 0 && thoughts.length === 0) base = `Ran ${tools} command${tools === 1 ? "" : "s"}`;
+    if (rows.length > 0 && thoughts.length === 0) base = toolMixLabel(rows);
     else if (thoughts.length) base = thoughts[thoughts.length - 1];
     else return;
+    if (!base) return;
     (run as any)._label = base;
     const sum = run.querySelector(":scope > summary");
     if (sum) sum.innerHTML = `<span class="tgsum-txt">${esc(base)}</span> ${CHEV}`;
   } catch { /* keep previous label */ }
+}
+
+// Explicit per-kind summary, counts only — never file names or tool
+// details. Only nonzero buckets appear: read 3 files, edited 1 file,
+// used 2 tools, ran 1 command.
+function toolMixLabel(rows: NodeListOf<Element>): string {
+  let reads = 0, edits = 0, writes = 0, tools = 0, cmds = 0;
+  rows.forEach((r) => {
+    const d = (r as any)._diff as { tool?: string } | undefined;
+    const tn = (d?.tool ?? "").toLowerCase();
+    if (tn === "read") reads++;
+    else if (tn === "edit") edits++;
+    else if (tn === "write") writes++;
+    else if (tn === "bash" || tn === "") cmds++;
+    else tools++;
+  });
+  const n = (c: number, one: string, many: string) =>
+    c === 1 ? `1 ${one}` : `${c} ${many}`;
+  const parts: string[] = [];
+  if (reads) parts.push(`read ${n(reads, "file", "files")}`);
+  if (edits) parts.push(`edited ${n(edits, "file", "files")}`);
+  if (writes) parts.push(`wrote ${n(writes, "file", "files")}`);
+  if (tools) parts.push(`used ${n(tools, "tool", "tools")}`);
+  if (cmds) parts.push(`ran ${n(cmds, "command", "commands")}`);
+  const s = parts.join(", ").slice(0, 140);
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
 // A dropdown with no tool rows behind it is chrome around plain musing —
