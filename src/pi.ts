@@ -180,6 +180,8 @@ export const pi = {
     call(cwd, { type: "follow_up", message }, 120_000, key),
   clearQueue: (cwd: string): Promise<{ steering: string[]; followUp: string[] }> =>
     call(cwd, { type: "clear_queue" }),
+  upload: (cwd: string, name: string, data: string): Promise<string> =>
+    invoke("save_upload", { cwd, name, data }).then((r: any) => r.path as string),
 };
 
 // new_session / switch_session / fork ACK immediately but switch

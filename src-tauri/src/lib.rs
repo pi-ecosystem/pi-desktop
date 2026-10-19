@@ -1033,6 +1033,60 @@ fn delete_spawn_run(run_id: String) -> Result<(), String> {
     Ok(())
 }
 
+impl AppState {
+    /// Store an uploaded file inside the session cwd so the agent can
+    /// read it: `<cwd>/.pi-desktop-uploads/<name>`. Returns `{path}`.
+    /// Browser File objects have no path; this bridges them to one.
+    /// Cap 12MB (matches read_media), names sanitized, collisions
+    /// suffixed. The frontend appends the path to the message text.
+    fn save_upload_core(cwd: String, name: String, data: String) -> Result<serde_json::Value, String> {
+        let clean: String = std::path::Path::new(&name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("upload")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let clean = clean.trim_matches('.').to_string();
+        let clean = if clean.is_empty() || clean.len() > 128 { "upload".to_string() } else { clean };
+        let dir = PathBuf::from(&cwd).join(".pi-desktop-uploads");
+        fs::create_dir_all(&dir).map_err(|e| format!("unreadable working dir: {e}"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.trim())
+            .map_err(|_| "invalid base64".to_string())?;
+        if bytes.len() > 12 * 1024 * 1024 {
+            return Err("file too large (>12MB)".into());
+        }
+        let (stem, ext) = match clean.rfind('.') {
+            Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
+            _ => (clean.clone(), String::new()),
+        };
+        let mut i = 0;
+        let path = loop {
+            let candidate = if i == 0 {
+                dir.join(format!("{stem}{ext}"))
+            } else {
+                dir.join(format!("{stem}-{i}{ext}"))
+            };
+            if !candidate.exists() {
+                break candidate;
+            }
+            i += 1;
+            if i > 1000 {
+                return Err("too many uploads with this name".into());
+            }
+        };
+        fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+        Ok(serde_json::json!({ "path": path.to_string_lossy() }))
+    }
+}
+
+#[tauri::command]
+fn save_upload(cwd: String, name: String, data: String, state: State<Arc<AppState>>) -> Result<serde_json::Value, String> {
+    let _ = state;
+    AppState::save_upload_core(cwd, name, data)
+}
+
 // ---------------------------------------------------------------- config
 
 impl AppState {
@@ -1431,6 +1485,7 @@ pub fn run() {
             read_spawn_transcript,
             read_spawn_log,
             delete_spawn_run,
+            save_upload,
             get_config,
             set_config,
             toggle_quickbar,

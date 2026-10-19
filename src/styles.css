@@ -254,6 +254,24 @@ details.toolrow > summary:hover { color: var(--text); }
 #cmdlist .cmdopt { display: flex; gap: 10px; align-items: baseline; }
 #cmdlist .cmdname { flex: none; font-family: var(--mono); font-size: 13px; color: var(--text); }
 #cmdlist .cmddesc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--dim); }
+/* Pending upload chips: thumbnail + name + remove, above the textarea. */
+#attachbar { display: flex; gap: 8px; flex-wrap: wrap; padding: 2px 4px 8px; }
+#attachbar.hidden { display: none; }
+.achip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 12px; padding: 4px 6px 4px 4px; font-size: 12px; }
+.athumb { width: 32px; height: 32px; object-fit: cover; border-radius: 8px; flex: none; }
+.aname { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.ax { border: none; background: none; color: var(--dim); font-size: 14px; padding: 0 4px; }
+.ax:hover { color: var(--text); }
+/* Sent-attachment previews: own wrapping row above the user bubble.
+   Thumbnails stay small so many files scale; full image on click. */
+.umsgwrap > .uatt { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-bottom: 6px; }
+.umsgwrap > .uatt:empty { display: none; }
+.umsgwrap > .uatt figure.media { margin: 0; max-width: 220px; }
+.umsgwrap > .uatt figure.media img { max-height: 220px; }
+.umsgwrap > .uatt.solo figure.media { max-width: 380px; }
+.umsgwrap > .uatt.solo figure.media img { max-height: 420px; }
+.umsgwrap > .uatt figure.media figcaption { font-size: 11px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.umsgwrap > .uatt .media-card { max-width: 280px; }
 #input { width: 100%; resize: none; background: transparent; border: none; border-radius: 0; padding: 4px; font-size: 14.5px; line-height: 22px; }
 #input::placeholder { color: #afafaf; }
 #input:focus { border: none; }

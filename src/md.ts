@@ -316,10 +316,22 @@ function linkedMedia(alt: string, posterInner: string, targetInner: string): str
   return `<a href="${t}" target="_blank" rel="noreferrer"><figure class="${fcls}">${img}${a ? `<figcaption>${a}</figcaption>` : ""}</figure></a>`;
 }
 
+// Inline parsing runs on ALREADY-escaped HTML (esc() first), so the
+// documented `<>` / `"..."` URL forms arrive entity-encoded. Decode
+// before tokenizing, or paths with spaces can never resolve.
+function unescEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 // First whitespace-separated token of a `![alt](...)` inner, unbracketed
 // (`<a b.png>`, `"a b.png"`, or bare). Shared with parseImageToken.
 function firstToken(inner: string): string {
-  let rest = inner.trim();
+  let rest = unescEntities(inner.trim());
   if (rest.startsWith("<")) {
     const end = rest.indexOf(">");
     return end < 0 ? "" : rest.slice(1, end);
@@ -333,7 +345,7 @@ function firstToken(inner: string): string {
   return src;
 }
 function parseImageToken(alt: string, inner: string): string {
-  let rest = inner.trim();
+  let rest = unescEntities(inner.trim());
   let src = "";
   if (rest.startsWith("<")) {
     const end = rest.indexOf(">");

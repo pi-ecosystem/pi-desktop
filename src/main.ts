@@ -88,7 +88,7 @@ function syncSendBtn() {
     btn.dataset.mode = "send";
     btn.innerHTML = ICO_SEND;
     btn.title = "Send";
-    btn.disabled = !inp.value.trim();
+    btn.disabled = !inp.value.trim() && !pendingAttachments.length;
   }
 }
 // Mirror of pi's own queue, data-driven (see renderQueued). queue_update
@@ -656,6 +656,32 @@ function liveToolRow(toolName: string, args: any): HTMLElement {
   return d;
 }
 
+// Sent attachments arrive as `[attached file: PATH]` lines (see send()).
+// Image/video ones render as real previews through the markdown media
+// pipeline (figure.media + wireMedia resolution); anything else stays
+// a plain path line. Angle brackets survive spaces in paths.
+const PREVIEW_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "mp4", "m4v", "webm", "mov", "ogv"]);
+function splitUserAttachments(raw: string): { text: string; media: string } {
+  const texts: string[] = [];
+  const media: string[] = [];
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^\[attached file: (.+)\]$/);
+    const p = (m?.[1] ?? "").trim();
+    const ext = p.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
+    if (m && p) {
+      const name = (p.split("/").pop() ?? p).replace(/[\[\]]/g, "_") || p;
+      if (PREVIEW_EXTS.has(ext)) {
+        media.push(`![${name}](<${p}>)`);
+      } else {
+        texts.push(`\`${name}\``);
+      }
+    } else {
+      texts.push(line);
+    }
+  }
+  return { text: texts.join("\n").trim(), media: media.join("\n") };
+}
+
 function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement {
   const role = m.role ?? "unknown";
   // Subagents via pi-spawn (see SPAWN.md there): one collapsed card per
@@ -666,10 +692,22 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
     return spawnCard(m);
   }
   if (role === "user") {
-    const box = el("div", "msg user");
-    box.appendChild(el("div", "ubody", renderMd(textOf(m.content) || "(empty)")));
     const wrap = el("div", "umsgwrap");
-    wrap.appendChild(box);
+    // Attached previews render ABOVE the bubble as their own wrapping
+    // row (scales to many files); the bubble holds text only.
+    let { text: utext, media: umedia } = splitUserAttachments(textOf(m.content) || "");
+    if (!utext && !umedia) utext = "(empty)";
+    if (umedia) {
+      const prev = el("div", "uatt");
+      if (umedia.split("\n").length === 1) prev.classList.add("solo");
+      prev.innerHTML = renderMd(umedia);
+      wrap.appendChild(prev);
+    }
+    if (utext) {
+      const box = el("div", "msg user");
+      box.appendChild(el("div", "ubody", renderMd(utext)));
+      wrap.appendChild(box);
+    }
     // Hover toolbar, icon-only and hidden at rest (Claude-style): copy +
     // revert. Overlay takes no layout space so the bubble hugs the text.
     const acts = el(
@@ -3280,13 +3318,66 @@ async function syncRunFlag() {
   } catch { /* ignore */ }
 }
 
+// Pending uploads: files picked/pasted/dropped but not yet sent. Stored
+// as data URLs client-side; uploaded at send time into the session cwd
+// with paths appended to the message text. 12MB cap matches save_upload.
+interface PendingAttachment { name: string; dataUrl: string; size: number; kind: string; }
+const pendingAttachments: PendingAttachment[] = [];
+function addFiles(files: FileList | File[]) {
+  for (const f of Array.from(files)) {
+    if (f.size > 12 * 1024 * 1024) { toastErr(`${f.name}: over 12MB, skipped`); continue; }
+    const rd = new FileReader();
+    rd.onload = () => {
+      pendingAttachments.push({ name: f.name, dataUrl: String(rd.result ?? ""), size: f.size, kind: f.type });
+      renderAttachbar();
+    };
+    rd.readAsDataURL(f);
+  }
+}
+function clearAttachments() { pendingAttachments.length = 0; renderAttachbar(); }
+function renderAttachbar() {
+  const bar = $("attachbar");
+  bar.innerHTML = "";
+  bar.classList.toggle("hidden", !pendingAttachments.length);
+  syncSendBtn();
+  pendingAttachments.forEach((a, i) => {
+    const chip = el("span", "achip");
+    if (a.kind.startsWith("image/")) {
+      const img = document.createElement("img");
+      img.src = a.dataUrl; img.className = "athumb"; img.alt = "";
+      chip.appendChild(img);
+    }
+    chip.appendChild(el("span", "aname", esc(a.name)));
+    const x = el("button", "ax", "×") as HTMLButtonElement;
+    x.title = "Remove";
+    x.onclick = () => { pendingAttachments.splice(i, 1); renderAttachbar(); };
+    chip.appendChild(x);
+    bar.appendChild(chip);
+  });
+}
+
 async function send() {
   const inp = $("input") as HTMLTextAreaElement;
-  const text = inp.value.trim();
-  if (!text) {
+  let text = inp.value.trim();
+  if (!text && !pendingAttachments.length) {
     // Empty fire while streaming still means stop (the button's job).
     if (streaming) stopOnly();
     return;
+  }
+  // Uploads first: dropped/pasted files become paths the agent can read.
+  if (pendingAttachments.length) {
+    try {
+      const paths: string[] = [];
+      for (const a of pendingAttachments) {
+        const b64 = a.dataUrl.slice(a.dataUrl.indexOf(",") + 1);
+        paths.push(await pi.upload(cwd, a.name, b64));
+      }
+      clearAttachments();
+      text = (text ? text + "\n" : "") + paths.map((p) => `[attached file: ${p}]`).join("\n");
+    } catch (e: any) {
+      toastErr(`upload failed: ${e.message ?? e}`);
+      return;
+    }
   }
   const isSlash = text.startsWith("/");
   // Local commands (/new, /model, …) never reach the agent.
@@ -3938,6 +4029,20 @@ window.addEventListener("DOMContentLoaded", async () => {
   ($("abortbtn") as HTMLButtonElement).addEventListener("click", () => {
     stopOnly();
   });
+  ($("attachbtn") as HTMLButtonElement).addEventListener("click", () => {
+    ($("attachfile") as HTMLInputElement).click();
+  });
+  ($("attachfile") as HTMLInputElement).addEventListener("change", (e) => {
+    const fi = e.target as HTMLInputElement;
+    if (fi.files?.length) addFiles(fi.files);
+    fi.value = "";
+  });
+  const comp = $("composer");
+  comp.addEventListener("dragover", (e) => e.preventDefault());
+  comp.addEventListener("drop", (e) => {
+    e.preventDefault();
+    if (e.dataTransfer?.files.length) addFiles(e.dataTransfer.files);
+  });
   const inp = $("input") as HTMLTextAreaElement;
   const autogrow = () => {
     inp.style.height = "auto";
@@ -3947,6 +4052,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     autogrow();
     syncSendBtn();
     renderCmdList();
+  });
+  inp.addEventListener("paste", (e) => {
+    const files = e.clipboardData?.files;
+    if (files?.length) addFiles(files);
   });
   inp.addEventListener("keydown", (e) => {
     const cmdOpen = !$("cmdlist")?.classList.contains("hidden");

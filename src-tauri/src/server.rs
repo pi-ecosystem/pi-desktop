@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{
@@ -144,6 +144,12 @@ fn dispatch(
             let run_id = req_s(p, "run_id", "runId", "run_id")?;
             delete_spawn_run(run_id).map(|_| serde_json::Value::Null)
         }
+        "save_upload" => {
+            let cwd = req_s(p, "cwd", "cwd", "cwd")?;
+            let name = s(p, "name", "name").unwrap_or_default();
+            let data = s(p, "data", "data").unwrap_or_default();
+            AppState::save_upload_core(cwd, name, data)
+        }
         "get_config" => Ok(serde_json::json!(be.get_config_core())),
         "set_config" => {
             let patch = p.get("patch").cloned().unwrap_or(serde_json::Value::Null);
@@ -236,6 +242,9 @@ pub fn run_server(port: u16) {
                     "pi-desktop backend. POST /api/invoke, GET /api/events",
                 )
             })
+            // save_upload caps payloads at 12MB itself; axum's 2MB
+            // default would 413 every real attachment first.
+            .layer(DefaultBodyLimit::disable())
             .layer(middleware::from_fn(cors))
             .with_state(backend);
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
