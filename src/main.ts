@@ -1222,13 +1222,13 @@ function appendMsgList(
     if (m.role === "assistant" && Array.isArray(m.content)) {
       for (const b of m.content) {
         if (b && b.type === "thinking" && b.thinking) {
-          run = runAppend(box, run, thoughtDiv(b.thinking), msgTs(m));
+          run = runAppend(box, run, thoughtDiv(b.thinking), msgSpan(m));
         }
       }
     }
     if (isTool(m)) {
       opts.onRendered?.(m);
-      run = runAppend(box, run, msgNode(m, calls), msgTs(m));
+      run = runAppend(box, run, msgNode(m, calls), msgSpan(m));
       shown++;
       continue;
     }
@@ -1761,7 +1761,7 @@ function appendMessageEnd(message: any): void {
     for (const b of m.content) {
       if (b && b.type === "thinking" && b.thinking) {
         const wasNewThink = !liveRun;
-        liveRun = runAppend($("msgs"), liveRun, thoughtDiv(b.thinking), msgTs(m));
+        liveRun = runAppend($("msgs"), liveRun, thoughtDiv(b.thinking), msgSpan(m));
         if (wasNewThink) openFreshRun($("msgs"), liveRun as HTMLElement);
         dotsToEnd();
       }
@@ -1785,7 +1785,7 @@ function appendMessageEnd(message: any): void {
     } else {
       if (m.role === "toolResult" && typeof m.toolCallId === "string") liveToolRows.delete(m.toolCallId);
       const wasNewTool = !liveRun;
-      liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls), msgTs(m));
+      liveRun = runAppend($("msgs"), liveRun, msgNode(m, liveCalls), msgSpan(m));
       if (wasNewTool) openFreshRun($("msgs"), liveRun as HTMLElement);
     }
     dotsToEnd();
@@ -2287,24 +2287,33 @@ document.addEventListener("toggle", (e) => {
 
 // One collapsed "Activity" container per user request: thoughts and tool
 // rows interleaved in chronological order. No counts, no copy buttons.
-function msgTs(m: any): number | undefined {
-  return typeof m?.timestamp === "number" ? m.timestamp : undefined;
+// A message's wall span from file fields: completion timestamp minus
+// its own duration (tools) — a point for anything else. Parallel batches
+// share one timestamp, so the span alone would read zero; durations
+// recover the true burst width.
+function msgSpan(m: any): [number, number] | undefined {
+  if (typeof m?.timestamp !== "number") return undefined;
+  const dur = typeof m?.durationMs === "number" ? m.durationMs : 0;
+  return [m.timestamp - dur, m.timestamp];
 }
-function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement, ts?: number): HTMLElement {
+function runAppend(box: HTMLElement, run: HTMLElement | null, item: HTMLElement, span?: [number, number]): HTMLElement {
+  const merge = (r: HTMLElement, s: [number, number]) => {
+    const o = r as any;
+    if (typeof o._ts0 !== "number") { o._ts0 = s[0]; o._ts1 = s[1]; }
+    else {
+      o._ts0 = Math.min(o._ts0, s[0]);
+      o._ts1 = Math.max(o._ts1, s[1]);
+    }
+  };
   if (!run) {
     run = el("details", "runact");
     run.appendChild(el("summary", "tgsum", `Activity ${CHEV}`));
     lastRun = run;
-    if (ts != null) (run as any)._ts0 = (run as any)._ts1 = ts;
+    if (span) merge(run, span);
     run.appendChild(el("div", "tgbody"));
     box.appendChild(run);
-  } else if (ts != null) {
-    const r = run as any;
-    if (typeof r._ts0 !== "number") r._ts0 = r._ts1 = ts;
-    else {
-      r._ts0 = Math.min(r._ts0, ts);
-      r._ts1 = Math.max(r._ts1, ts);
-    }
+  } else if (span) {
+    merge(run, span);
   }
   run.querySelector(".tgbody")!.appendChild(item);
   // Claude-style: the collapsed container says what happened instead of

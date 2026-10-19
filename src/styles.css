@@ -180,7 +180,7 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 #sesstitle { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--dim); font-size: 13px; }
 
 #stats { color: var(--dim); font-size: 12px; white-space: nowrap; }
-#msgs { flex: none; overflow: visible; padding: 32px 24px 48px; display: flex; flex-direction: column; gap: 28px; width: 100%; max-width: 1024px; margin: 0 auto; }
+#msgs { flex: none; overflow: visible; padding: 32px 24px 48px; display: flex; flex-direction: column; gap: 28px; width: calc(100% - 48px); max-width: 1024px; margin: 0 auto; min-height: 100%; }
 
 /* messages: user right bubble, assistant full-width plain.
    15.5px / 1.7 is the Claude/ChatGPT long-read zone: same size feel as
@@ -202,8 +202,8 @@ details.msg.toolres summary { cursor: pointer; list-style: none; }
 details.msg.toolres summary::-webkit-details-marker { display: none; }
 .tool { color: var(--dim); padding: 2px 0; }
 .msg ol, #qbanswer ol { margin: 12px 0 16px; padding-left: 24px; }
-.greet { text-align: center; margin: auto 0; padding: 40px 0; }
-.greet h2 { font-weight: 400; font-size: 30px; line-height: 36px; margin: 0; color: var(--text); }
+.greet { flex: 1; display: flex; align-items: center; justify-content: center; text-align: center; margin: 0; padding: 40px 0; }
+.greet h2 { font-weight: 400; font-size: 30px; line-height: 36px; margin: 0; color: var(--text); transform: translateX(3px); }
 .umsgwrap { display: flex; flex-direction: column; position: relative; }
 details.runact { font-size: 12.5px; color: var(--dim); opacity: 0.85; }
 details.runact > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; max-width: 100%; }
