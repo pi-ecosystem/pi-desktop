@@ -66,9 +66,10 @@ if (args.has("--extensions-only")) {
 }
 
 // Linux installs the raw binary (no .deb — nothing consumes it), so skip
-// bundling there. macOS needs the .app (dmg), Windows the nsis installer.
-const BUNDLES = { linux: ["none"], darwin: ["dmg"], win32: ["nsis"] };
-const bundle = (BUNDLES[platform()] ?? ["deb"])[0];
+// bundling there (plain cargo build). macOS needs the .app (dmg),
+// Windows the nsis installer.
+const BUNDLES = { linux: [], darwin: ["dmg"], win32: ["nsis"] };
+const bundles = BUNDLES[platform()] ?? ["deb"];
 
 if (!args.has("--skip-build")) {
   need("npm");
@@ -77,7 +78,6 @@ if (!args.has("--skip-build")) {
   run("npm", ["install"]);
   console.log("→ npm run build");
   run("npm", ["run", "build"]);
-  console.log(`→ tauri build --bundles ${bundle} (release — takes minutes)`);
   const env = { ...process.env };
   if (platform() === "linux" && process.env.WAYLAND_DISPLAY) {
     try {
@@ -85,7 +85,15 @@ if (!args.has("--skip-build")) {
       if (out.status === 0) env.WEBKIT_DISABLE_DMABUF_RENDERER = "1";
     } catch { /* no nvidia-smi: plain build */ }
   }
-  run("npx", ["tauri", "build", "--bundles", bundle], { env });
+  // No bundles on Linux: raw binary install. Everywhere else the
+  // bundler runs (dmq/nsis/deb per platform above).
+  if (bundles.length === 0) {
+    console.log("→ cargo build --release (no bundle — takes minutes)");
+    run("cargo", ["build", "--release", "--manifest-path", "src-tauri/Cargo.toml"], { env });
+  } else {
+    console.log(`→ tauri build --bundles ${bundles.join(",")} (release — takes minutes)`);
+    run("npx", ["tauri", "build", "--bundles", ...bundles], { env });
+  }
 }
 
 if (platform() === "win32") {
