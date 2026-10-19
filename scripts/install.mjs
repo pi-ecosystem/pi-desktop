@@ -65,7 +65,9 @@ if (args.has("--extensions-only")) {
   process.exit(0);
 }
 
-const BUNDLES = { linux: ["deb"], darwin: ["dmg"], win32: ["nsis"] };
+// Linux installs the raw binary (no .deb — nothing consumes it), so skip
+// bundling there. macOS needs the .app (dmg), Windows the nsis installer.
+const BUNDLES = { linux: ["none"], darwin: ["dmg"], win32: ["nsis"] };
 const bundle = (BUNDLES[platform()] ?? ["deb"])[0];
 
 if (!args.has("--skip-build")) {
@@ -116,6 +118,20 @@ if (platform() === "win32") {
     '#!/bin/sh\nexec env WEBKIT_DISABLE_DMABUF_RENDERER=1 "$HOME/.local/bin/pi-desktop-bin" "$@"\n',
   );
   chmodSync(join(binDir, "pi-desktop"), 0o755);
+  // Launcher entry (Linux only: macOS gets it from the .app, Windows
+  // from the nsis installer). Puts Pi in the app grid; hotkeys are
+  // still the way in (KDE custom shortcut, see README).
+  const appsDir = join(homedir(), ".local", "share", "applications");
+  const iconsDir = join(homedir(), ".local", "share", "icons");
+  mkdirSync(appsDir, { recursive: true });
+  mkdirSync(iconsDir, { recursive: true });
+  const srcIcon = join(ROOT, "src-tauri", "icons", "128x128.png");
+  if (existsSync(srcIcon)) cpSync(srcIcon, join(iconsDir, "pi-desktop.png"), { force: true });
+  writeFileSync(
+    join(appsDir, "pi-desktop.desktop"),
+    `[Desktop Entry]\nType=Application\nName=Pi Desktop\nExec=${join(binDir, "pi-desktop")}\nIcon=pi-desktop\nTerminal=false\nCategories=Utility;\n`,
+  );
+  try { spawnSync("update-desktop-database", [appsDir], { stdio: "ignore" }); } catch { /* optional */ }
   if (!(process.env.PATH ?? "").split(":").includes(binDir)) {
     console.error(`note: ${binDir} is not on PATH — add it to your shell rc`);
   }
