@@ -1,9 +1,0 @@
-com.plugin.termuxboot.tauri-plugin-termux-boot-pngs-0 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/build/generated/res/pngs/debug
-com.plugin.termuxboot.tauri-plugin-termux-boot-updated_navigation_xml-1 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/build/generated/updated_navigation_xml/debug
-com.plugin.termuxboot.tauri-plugin-termux-boot-mergeDebugResources-2 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/build/intermediates/incremental/debug/mergeDebugResources/merged.dir
-com.plugin.termuxboot.tauri-plugin-termux-boot-mergeDebugResources-3 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/build/intermediates/incremental/debug/mergeDebugResources/stripped.dir
-com.plugin.termuxboot.tauri-plugin-termux-boot-debug-4 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/build/intermediates/merged_res/debug/mergeDebugResources
-com.plugin.termuxboot.tauri-plugin-termux-boot-debug-5 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/build/intermediates/packaged_res/debug/packageDebugResources
-com.plugin.termuxboot.tauri-plugin-termux-boot-debug-6 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/src/debug/res
-com.plugin.termuxboot.tauri-plugin-termux-boot-main-7 /home/reckobs/Projects/pi-desktop/src-tauri/plugins/termux-boot/android/src/main/res
-gradleHome-0 /home/reckobs/.gradle
