@@ -24,7 +24,7 @@ const apiBase = serverBase ?? "";
 // The termux-boot plugin commands live in the on-device backend even in
 // server mode — they must always go over IPC when available.
 function isBootCmd(cmd: string): boolean {
-  return cmd === "plugin:termux-boot|boot_server" || cmd === "plugin:termux-boot|termux_available";
+  return cmd === "plugin:termux-boot|boot-server" || cmd === "plugin:termux-boot|termux-available";
 }
 
 export async function invoke<T>(cmd: string, args?: any): Promise<T> {
@@ -78,7 +78,7 @@ export async function ensureServerBackend(): Promise<void> {
   };
   if (await ping()) return;
   if (inTauri) {
-    await invoke<{ started: boolean }>("plugin:termux-boot|boot_server", { port });
+    await invoke<{ started: boolean }>("plugin:termux-boot|boot-server", { port });
   }
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 1000));
