@@ -26,4 +26,11 @@ if ! command -v pi >/dev/null 2>&1; then
 fi
 
 PORT="${PORT:-1423}"
-echo "done. run: pi-desktop-server --server $PORT"
+echo "done."
+echo ""
+echo "Phone setup (Termux side, all required for the APK auto-boot):"
+echo "  1. allow-external-apps: echo 'allow-external-apps=true' >> ~/.termux/termux.properties"
+echo "  2. allow external apps: Termux:API app installed (same source as Termux)"
+echo "  3. restart Termux completely (swipe it away), then:"
+echo "     pi-desktop-server --server ${PORT}"
+echo "  4. open the Pi app — it boots the server itself from here on"
