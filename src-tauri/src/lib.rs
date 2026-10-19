@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
+use calamine::Reader as _;
 use tokio::sync::broadcast;
 
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -619,8 +620,8 @@ fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Re
 
 /// Read a media file for inline display. Returns `{"mime", "base64"}`.
 /// Relative paths resolve against `base` (the viewed session's cwd).
-/// Absolute paths are used as-is. Cap 12MB: screenshots are KBs; anything
-/// bigger stays a click-to-open card handled frontend-side.
+/// Absolute paths are used as-is. Cap 64MB (matches save_upload).
+/// Bigger files stay a click-to-open card handled frontend-side.
 ///
 /// Why bytes-over-IPC instead of convertFileSrc/asset URLs: this box's
 /// WebKitGTK fails Tauri custom-scheme loads entirely (asset: *and* the
@@ -659,6 +660,41 @@ fn media_stat_json(meta: &fs::Metadata) -> serde_json::Value {
     serde_json::json!({ "mtimeMs": mtime_ms, "size": meta.len() })
 }
 
+/// MIME table shared by read_media (data URIs for Tauri IPC) and the
+/// HTTP /api/media route (raw bytes for browser mode).
+pub(crate) fn media_mime(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "ogv" => "video/ogg",
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        // Text-ish types ride along as UTF-8 for snippet previews.
+        // Decoded frontend-side; binary office formats stay unsupported.
+        "txt" | "md" | "markdown" | "json" | "csv" | "tsv" | "log"
+        | "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "py" | "rs"
+        | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "cs" | "rb"
+        | "php" | "swift" | "kt" | "html" | "htm" | "css" | "scss"
+        | "sh" | "bash" | "yaml" | "yml" | "toml" | "ini" | "cfg"
+        | "xml" | "sql" | "r" | "dockerfile" | "gitignore" => "text/plain",
+        _ => return None,
+    })
+}
+
 /// Cheap stat for the frontend's media cache: lets it revalidate bytes
 /// without re-transferring them (same-path rewrites re-read, unchanged
 /// files never do). Mirrors read_media's resolution exactly.
@@ -673,26 +709,12 @@ fn media_stat(path: String, base: Option<String>) -> Result<serde_json::Value, S
 fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, String> {
     let p = resolve_media_path(&path, &base)?;
     let meta = fs::metadata(&p).map_err(|e| format!("unreadable media file: {e}"))?;
-    if meta.len() > 12 * 1024 * 1024 {
-        return Err("media file too large for inline display (>12MB)".into());
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err("media file too large for inline display (>64MB)".into());
     }
     let bytes = fs::read(&p).map_err(|e| format!("unreadable media file: {e}"))?;
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "avif" => "image/avif",
-        "mp4" | "m4v" => "video/mp4",
-        "webm" => "video/webm",
-        "mov" => "video/quicktime",
-        "ogv" => "video/ogg",
-        _ => return Err(format!("unsupported media type: .{ext}")),
-    };
+    let mime = media_mime(&ext).ok_or_else(|| format!("unsupported media type: .{ext}"))?;
     // Stat rides along so the frontend can revalidate its cache without
     // re-transferring bytes (see media_stat + the data-fast loop).
     let stat = media_stat_json(&meta);
@@ -702,6 +724,121 @@ fn read_media(path: String, base: Option<String>) -> Result<serde_json::Value, S
         "mtimeMs": stat.get("mtimeMs"),
         "size": stat.get("size"),
     }))
+}
+
+/// First rows of a spreadsheet for table previews: xlsx/xls/ods/csv.
+/// Returns `{sheets, sheet, rows, truncated}` (rows capped 50x20,
+/// default 8x8). Pure-Rust (calamine), no system deps.
+#[tauri::command]
+fn read_sheet(path: String, base: Option<String>, sheet: Option<String>, max_rows: Option<usize>, max_cols: Option<usize>) -> Result<serde_json::Value, String> {
+    let p = resolve_media_path(&path, &base)?;
+    let meta = fs::metadata(&p).map_err(|e| format!("unreadable sheet file: {e}"))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err("sheet file too large (>64MB)".into());
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if !["xlsx", "xls", "ods", "csv"].contains(&ext.as_str()) {
+        return Err(format!("unsupported sheet type: .{ext}"));
+    }
+    let mut wb = calamine::open_workbook_auto(&p).map_err(|e| format!("unreadable sheet: {e}"))?;
+    let names = wb.sheet_names().to_vec();
+    let first = names.first().cloned().unwrap_or_default();
+    let which = sheet.filter(|s| !s.is_empty()).unwrap_or(first);
+    let range = wb.worksheet_range(&which).map_err(|e| format!("unreadable sheet: {e}"))?;
+    let max_r = max_rows.unwrap_or(8).clamp(1, 50);
+    let max_c = max_cols.unwrap_or(8).clamp(1, 20);
+    let rows: Vec<Vec<String>> = range
+        .rows()
+        .take(max_r)
+        .map(|r| r.iter().take(max_c).map(|c| c.to_string()).collect())
+        .collect();
+    let truncated = range.height() > max_r || range.width() > max_c;
+    Ok(serde_json::json!({ "sheets": names, "sheet": which, "rows": rows, "truncated": truncated }))
+}
+
+/// Text content of office documents for preview cards: docx (word/
+/// document.xml // w:t), pptx (ppt/slides/slide*.xml // a:t), odt
+/// (content.xml // text:p|h). Pure-Rust zip+xml, no system deps.
+/// Returns `{text, truncated}` (6000 chars max).
+#[tauri::command]
+fn read_office_text(path: String, base: Option<String>) -> Result<serde_json::Value, String> {
+    let p = resolve_media_path(&path, &base)?;
+    let meta = fs::metadata(&p).map_err(|e| format!("unreadable office file: {e}"))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err("office file too large (>64MB)".into());
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let (entry_filter, text_tag, para_tag): (fn(&str) -> bool, &[u8], &[u8]) = match ext.as_str() {
+        "docx" => (|n| n == "word/document.xml", b"w:t", b"w:p"),
+        "pptx" => (|n| n.starts_with("ppt/slides/slide") && n.ends_with(".xml"), b"a:t", b"a:p"),
+        "odt" => (|n| n == "content.xml", b"text:p", b"text:p"),
+        _ => return Err(format!("unsupported office type: .{ext}")),
+    };
+    let file = fs::File::open(&p).map_err(|e| format!("unreadable office file: {e}"))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("unreadable office file: {e}"))?;
+    let mut names: Vec<String> = zip.file_names().filter(|n| entry_filter(n)).map(|s| s.to_string()).collect();
+    // Slide order: slide1, slide2, ... slide10 (lexical sort lies).
+    names.sort_by_key(|n| {
+        n.rsplit('/')
+            .next()
+            .unwrap_or(n)
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+    if names.is_empty() {
+        return Err("no readable content in office file".into());
+    }
+    let mut out = String::new();
+    for name in names {
+        use std::io::Read as _;
+        let mut f = zip.by_name(&name).map_err(|e| format!("unreadable office file: {e}"))?;
+        let mut xml = Vec::new();
+        f.read_to_end(&mut xml).map_err(|e| format!("unreadable office file: {e}"))?;
+        let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
+        reader.trim_text(true);
+        let mut buf = Vec::new();
+        let mut depth: i32 = 0;
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Start(ref e)) if e.name().as_ref() == text_tag => depth += 1,
+                Ok(quick_xml::events::Event::End(ref e)) if e.name().as_ref() == text_tag => {
+                    depth -= 1;
+                    if para_tag == text_tag {
+                        out.push('\n');
+                    }
+                }
+                Ok(quick_xml::events::Event::End(ref e)) if e.name().as_ref() == para_tag => out.push('\n'),
+                Ok(quick_xml::events::Event::Text(ref e)) if depth > 0 => {
+                    if let Ok(t) = e.unescape() {
+                        out.push_str(&t);
+                        out.push(' ');
+                    }
+                }
+                Ok(quick_xml::events::Event::Eof) => break,
+                Err(e) => return Err(format!("unreadable office file: {e}")),
+                _ => {}
+            }
+            buf.clear();
+            if out.len() > 7000 {
+                break;
+            }
+        }
+        out.push('\n');
+        if out.len() > 7000 {
+            break;
+        }
+    }
+    let joined: String = out
+        .split('\n')
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let truncated = joined.len() > 6000;
+    let text: String = joined.chars().take(6000).collect();
+    Ok(serde_json::json!({ "text": text, "truncated": truncated }))
 }
 
 #[tauri::command]
@@ -1037,8 +1174,9 @@ impl AppState {
     /// Store an uploaded file inside the session cwd so the agent can
     /// read it: `<cwd>/.pi-desktop-uploads/<name>`. Returns `{path}`.
     /// Browser File objects have no path; this bridges them to one.
-    /// Cap 12MB (matches read_media), names sanitized, collisions
-    /// suffixed. The frontend appends the path to the message text.
+    /// Cap 64MB (disk is cheap; the 12MB read_media cap still guards
+    /// inline rendering). Names sanitized, collisions suffixed.
+    /// The frontend appends the path to the message text.
     fn save_upload_core(cwd: String, name: String, data: String) -> Result<serde_json::Value, String> {
         let clean: String = std::path::Path::new(&name)
             .file_name()
@@ -1054,8 +1192,8 @@ impl AppState {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data.trim())
             .map_err(|_| "invalid base64".to_string())?;
-        if bytes.len() > 12 * 1024 * 1024 {
-            return Err("file too large (>12MB)".into());
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err("file too large (>64MB)".into());
         }
         let (stem, ext) = match clean.rfind('.') {
             Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
@@ -1341,6 +1479,21 @@ fn open_in_main(app: AppHandle, cwd: String, session_path: Option<String>, state
     Ok(())
 }
 
+/// Native file picker (desktop only): real paths, no copying. Browser
+/// mode keeps the file-input + save_upload flow (see attachbtn).
+#[tauri::command]
+fn pick_files(app: AppHandle) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Choose files to attach")
+        .blocking_pick_files();
+    Ok(picked
+        .map(|v| v.into_iter().map(|p| p.to_string()).collect())
+        .unwrap_or_default())
+}
+
 #[tauri::command]
 async fn pick_dir(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -1486,6 +1639,8 @@ pub fn run() {
             read_spawn_log,
             delete_spawn_run,
             save_upload,
+            read_sheet,
+            read_office_text,
             get_config,
             set_config,
             toggle_quickbar,
@@ -1495,6 +1650,7 @@ pub fn run() {
             qb_hide_self,
             open_in_main,
             pick_dir,
+            pick_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

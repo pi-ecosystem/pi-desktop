@@ -264,14 +264,45 @@ details.toolrow > summary:hover { color: var(--text); }
 .ax:hover { color: var(--text); }
 /* Sent-attachment previews: own wrapping row above the user bubble.
    Thumbnails stay small so many files scale; full image on click. */
-.umsgwrap > .uatt { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-bottom: 6px; }
+.umsgwrap > .uatt { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; align-items: flex-start; margin-bottom: 6px; }
 .umsgwrap > .uatt:empty { display: none; }
 .umsgwrap > .uatt figure.media { margin: 0; max-width: 220px; }
-.umsgwrap > .uatt figure.media img { max-height: 220px; }
+.umsgwrap > .uatt figure.media img { max-height: 220px; min-width: 120px; min-height: 120px; object-fit: contain; }
 .umsgwrap > .uatt.solo figure.media { max-width: 380px; }
 .umsgwrap > .uatt.solo figure.media img { max-height: 420px; }
 .umsgwrap > .uatt figure.media figcaption { font-size: 11px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .umsgwrap > .uatt .media-card { max-width: 280px; }
+.umsgwrap > .uatt .acard { display: flex; flex-direction: column; gap: 6px; max-width: 220px; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 12px; padding: 8px; }
+.umsgwrap > .uatt .acard canvas.pdfthumb { width: 100%; height: auto; border-radius: 8px; background: #111; }
+#attachbar canvas.athumbpdf { width: 64px; height: auto; border-radius: 8px; background: #111; flex: none; }
+.umsgwrap > .uatt .acard audio { width: 204px; }
+.umsgwrap > .uatt .acard pre.textthumb { margin: 0; max-height: 160px; overflow: hidden; font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--dim); background: rgba(0,0,0,0.25); border-radius: 8px; padding: 8px; width: 204px; }
+.umsgwrap > .uatt .acard table.sheetthumb { border-collapse: collapse; font-size: 11px; table-layout: fixed; width: 204px; display: block; overflow: hidden; }
+.umsgwrap > .uatt .acard table.sheetthumb td { padding: 3px 8px; border-bottom: 1px solid rgba(255,255,255,0.07); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 102px; color: var(--text); }
+.umsgwrap > .uatt .acard table.sheetthumb tr:first-child td { color: var(--dim); }
+.umsgwrap > .uatt .acard .fext { align-self: flex-start; font-family: var(--mono); font-size: 11px; font-weight: 700; background: rgba(255,255,255,0.08); border-radius: 6px; padding: 2px 8px; }
+.umsgwrap > .uatt .acard .fsize { font-size: 11px; color: var(--dim); }
+.umsgwrap > .uatt .acard.broken canvas { display: none; }
+/* Attachment zoom overlay: click any preview card to enlarge,
+   backdrop or Esc (or x) to close. */
+.uatt-zoom { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,0.85); padding: 4vmin; }
+.uatt-zoom-card { position: relative; max-width: 92vw; max-height: 88vh; overflow: auto; background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 16px; }
+.uatt-zoom-card > .acard { max-width: none; }
+.uatt-zoom-card canvas.pdfthumb { width: auto; max-width: 84vw; height: auto; }
+.uatt-zoom-card pre.textthumb { max-height: none; width: auto; min-width: min(60vw, 560px); }
+.uatt-zoom-card table.sheetthumb { width: auto; min-width: min(60vw, 560px); display: table; }
+.uatt-zoom-card table.sheetthumb td { max-width: none; }
+.uatt-zoom-x { position: absolute; top: 8px; right: 8px; width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 16px; line-height: 1; padding: 0; }
+.uatt-zoom-head { display: flex; align-items: center; gap: 8px; padding: 0 40px 12px 0; }
+.uatt-zoom-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--dim); }
+.uatt-zoom-body { min-width: min(80vw, 560px); min-height: 120px; display: flex; flex-direction: column; }
+.uatt-zoom-body canvas.fullpdf { max-width: 84vw; height: auto; border-radius: 8px; background: #fff; }
+.uatt-zoom-body pre.fulltext { margin: 0; max-height: 80vh; width: min(80vw, 720px); overflow: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.uatt-zoom-body table.fullsheet { border-collapse: collapse; font-size: 12.5px; display: block; max-width: 86vw; max-height: 80vh; overflow: auto; }
+.uatt-zoom-body table.fullsheet td { padding: 6px 12px; border-bottom: 1px solid rgba(255,255,255,0.07); white-space: nowrap; }
+.uatt-zoom-body table.fullsheet tr:first-child td { color: var(--dim); }
+.uatt-zoom-note { font-size: 12px; color: var(--dim); padding-top: 8px; }
+#attachbar .fext { font-family: var(--mono); font-size: 11px; font-weight: 700; background: rgba(255,255,255,0.08); border-radius: 6px; padding: 2px 8px; flex: none; }
 #input { width: 100%; resize: none; background: transparent; border: none; border-radius: 0; padding: 4px; font-size: 14.5px; line-height: 22px; }
 #input::placeholder { color: #afafaf; }
 #input:focus { border: none; }

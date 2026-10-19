@@ -943,6 +943,13 @@ function wireMedia(container: HTMLElement): void {
             el.setAttribute("src", url);
             el.removeAttribute("data-local");
             el.addEventListener("load", mediaSettled, { once: true });
+            // Click-to-lightbox lives in the figure loop below, but that
+            // loop skips data-local images (marked _wired) — attach here
+            // on resolve, or local images never pop up.
+            el.addEventListener("click", () => {
+              const src = (el as HTMLImageElement).currentSrc || el.getAttribute("src") || "";
+              if (src) openLightbox(src, el.getAttribute("alt") ?? "");
+            });
           } else if (tries < 3) {
             setTimeout(() => {
               if (el.isConnected && el.hasAttribute("data-local")) attempt();

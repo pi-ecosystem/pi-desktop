@@ -23,7 +23,7 @@ use tokio_stream::StreamExt as _;
 
 use super::{
     delete_session, delete_spawn_run, list_sessions, media_stat, pids_alive,
-    read_media, read_session_messages, read_spawn_log, read_spawn_transcript, AppState,
+    read_media, read_office_text, read_session_messages, read_sheet, read_spawn_log, read_spawn_transcript, AppState,
 };
 
 // ---------------------------------------------------------------- params
@@ -144,6 +144,19 @@ fn dispatch(
             let run_id = req_s(p, "run_id", "runId", "run_id")?;
             delete_spawn_run(run_id).map(|_| serde_json::Value::Null)
         }
+        "read_sheet" => {
+            let path = req_s(p, "path", "path", "path")?;
+            let base = s(p, "base", "base");
+            let sheet = s(p, "sheet", "sheet");
+            let max_rows = opt_u(p, "max_rows", "maxRows");
+            let max_cols = opt_u(p, "max_cols", "maxCols");
+            read_sheet(path, base, sheet, max_rows, max_cols)
+        }
+        "read_office_text" => {
+            let path = req_s(p, "path", "path", "path")?;
+            let base = s(p, "base", "base");
+            read_office_text(path, base)
+        }
         "save_upload" => {
             let cwd = req_s(p, "cwd", "cwd", "cwd")?;
             let name = s(p, "name", "name").unwrap_or_default();
@@ -157,7 +170,7 @@ fn dispatch(
         }
         // Window-only: no-ops in server mode (no windows to toggle).
         "toggle_quickbar" | "toggle_main" | "show_window" | "hide_window" | "qb_hide_self"
-        | "open_in_main" | "pick_dir" => Ok(serde_json::Value::Null),
+        | "open_in_main" | "pick_dir" | "pick_files" => Ok(serde_json::Value::Null),
         _ => Err(format!("unknown command: {cmd}")),
     }
 }

@@ -3,12 +3,15 @@
 
 import { invoke } from "./tauri-shim";
 import { listen } from "./tauri-shim";
-import { getCurrentWindow } from "./tauri-window-shim";
+import { getCurrentWindow, getCurrentWebview } from "./tauri-window-shim";
 import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
 import { renderMd, setMediaBase, clearMediaCache, wireCopy } from "./md";
+import * as pdfjs from "pdfjs-dist";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 let cwd = "";
 let liveRun: HTMLElement | null = null;
@@ -657,29 +660,276 @@ function liveToolRow(toolName: string, args: any): HTMLElement {
 }
 
 // Sent attachments arrive as `[attached file: PATH]` lines (see send()).
-// Image/video ones render as real previews through the markdown media
-// pipeline (figure.media + wireMedia resolution); anything else stays
-// a plain path line. Angle brackets survive spaces in paths.
-const PREVIEW_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "mp4", "m4v", "webm", "mov", "ogv"]);
-function splitUserAttachments(raw: string): { text: string; media: string } {
+// Attachment taxonomy: images/video reuse the markdown media pipeline;
+// pdf/audio/text/other render as their own cards below (see attachCard).
+// TEXT_EXTS mirrors read_media's text list in src-tauri/src/lib.rs.
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"]);
+const VIDEO_EXTS = new Set(["mp4", "m4v", "webm", "mov", "ogv"]);
+const AUDIO_EXTS = new Set(["mp3", "wav", "ogg", "oga", "m4a", "flac", "aac"]);
+const SHEET_EXTS = new Set(["xlsx", "xls", "ods", "csv"]);
+const DOC_EXTS = new Set(["docx", "pptx", "odt"]);
+const TEXT_EXTS = new Set(["txt", "md", "markdown", "json", "tsv", "log", "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "rs", "go", "java", "c", "h", "cpp", "hpp", "cs", "rb", "php", "swift", "kt", "html", "htm", "css", "scss", "sh", "bash", "yaml", "yml", "toml", "ini", "cfg", "xml", "sql", "r", "dockerfile", "gitignore"]);
+type AttachKind = "image" | "video" | "pdf" | "audio" | "text" | "sheet" | "doc" | "file";
+interface AttachItem { kind: AttachKind; path: string; name: string; }
+function splitUserAttachments(raw: string): { text: string; md: string; files: AttachItem[] } {
   const texts: string[] = [];
-  const media: string[] = [];
+  const md: string[] = [];
+  const files: AttachItem[] = [];
   for (const line of raw.split("\n")) {
     const m = line.match(/^\[attached file: (.+)\]$/);
     const p = (m?.[1] ?? "").trim();
-    const ext = p.split("?")[0].split(".").pop()?.toLowerCase() ?? "";
-    if (m && p) {
-      const name = (p.split("/").pop() ?? p).replace(/[\[\]]/g, "_") || p;
-      if (PREVIEW_EXTS.has(ext)) {
-        media.push(`![${name}](<${p}>)`);
-      } else {
-        texts.push(`\`${name}\``);
-      }
-    } else {
-      texts.push(line);
-    }
+    if (!m || !p) { texts.push(line); continue; }
+    const clean = p.split("?")[0];
+    const ext = clean.split(".").pop()?.toLowerCase() ?? "";
+    const name = (clean.split("/").pop() ?? clean).replace(/[\[\]]/g, "_") || clean;
+    if (IMAGE_EXTS.has(ext) || VIDEO_EXTS.has(ext)) md.push(`![${name}](<${p}>)`);
+    else if (ext === "pdf") files.push({ kind: "pdf", path: p, name });
+    else if (AUDIO_EXTS.has(ext)) files.push({ kind: "audio", path: p, name });
+    else if (SHEET_EXTS.has(ext)) files.push({ kind: "sheet", path: p, name });
+    else if (DOC_EXTS.has(ext)) files.push({ kind: "doc", path: p, name });
+    else if (TEXT_EXTS.has(ext)) files.push({ kind: "text", path: p, name });
+    else files.push({ kind: "file", path: p, name });
   }
-  return { text: texts.join("\n").trim(), media: media.join("\n") };
+  return { text: texts.join("\n").trim(), md: md.join("\n"), files };
+}
+
+function attachCard(f: AttachItem): HTMLElement {
+  const card = el("div", `acard ${f.kind}`);
+  card.setAttribute("data-apath", f.path);
+  if (f.kind === "pdf") {
+    const cv = document.createElement("canvas");
+    cv.className = "pdfthumb";
+    cv.setAttribute("data-pdfpath", f.path);
+    card.appendChild(cv);
+  } else if (f.kind === "audio") {
+    const au = document.createElement("audio");
+    au.controls = true;
+    au.preload = "none";
+    au.setAttribute("data-audiopath", f.path);
+    card.appendChild(au);
+  } else if (f.kind === "text" || f.kind === "doc") {
+    const pre = el("pre", "textthumb", "loading\u2026");
+    pre.setAttribute(f.kind === "doc" ? "data-docpath" : "data-textpath", f.path);
+    card.appendChild(pre);
+  } else if (f.kind === "sheet") {
+    const tbl = document.createElement("table");
+    tbl.className = "sheetthumb";
+    tbl.setAttribute("data-sheetpath", f.path);
+    card.appendChild(tbl);
+  } else {
+    card.appendChild(el("span", "fext", esc((f.name.split(".").pop() ?? "file").toUpperCase().slice(0, 5))));
+    const sz = el("span", "fsize", "\u2026");
+    sz.setAttribute("data-sizepath", f.path);
+    card.appendChild(sz);
+  }
+  card.appendChild(el("span", "aname", esc(f.name)));
+  return card;
+}
+
+const attachCache = new Map<string, string>();
+const inTauriMain = typeof window !== "undefined" && "__TAURI__" in window;
+// Single preview pipeline: everything renders from read_media data URIs
+// on both clients (no per-client transports, no parallel endpoints).
+async function attachData(path: string): Promise<string | null> {
+  const hit = attachCache.get(path);
+  if (hit) return hit;
+  try {
+    const r = await invoke<{ mime: string; base64: string }>("read_media", { path, base: cwd || null });
+    if (!r?.base64) return null;
+    const uri = `data:${r.mime};base64,${r.base64}`;
+    attachCache.set(path, uri);
+    return uri;
+  } catch { return null; }
+}
+async function attachText(path: string): Promise<string | null> {
+  const uri = await attachData(path);
+  if (!uri) return null;
+  try {
+    const b64 = uri.slice(uri.indexOf(",") + 1);
+    return new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+  } catch { return null; }
+}
+async function renderPdfBytes(cv: HTMLCanvasElement, data: Uint8Array, targetW?: number): Promise<void> {
+  const pdf = await pdfjs.getDocument({ data }).promise;
+  const page = await pdf.getPage(1);
+  const solo = !!cv.closest(".uatt.solo");
+  targetW = targetW ?? (solo ? 360 : 220);
+  const vp1 = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: targetW / vp1.width });
+  cv.width = Math.floor(vp.width);
+  cv.height = Math.floor(vp.height);
+  await page.render({ canvas: cv, viewport: vp }).promise;
+}
+async function renderPdfThumb(cv: HTMLCanvasElement, path: string, targetW?: number): Promise<void> {
+  try {
+    const uri = await attachData(path);
+    if (!uri || !cv.isConnected) return;
+    const b64 = uri.slice(uri.indexOf(",") + 1);
+    await renderPdfBytes(cv, Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)), targetW);
+  } catch {
+    cv.closest(".acard")?.classList.add("broken");
+  }
+}
+let attachZoomEsc = false;
+// Full-content zoom: the browser renders the file itself — native PDF
+// viewer, full table, full text — not a bigger thumbnail. Audio has
+// controls already and opaque files have nothing to show: no zoom.
+function openAttachZoom(card: HTMLElement): void {
+  if (document.querySelector(".uatt-zoom")) return;
+  const cls = card.classList;
+  const kind = cls.contains("pdf") ? "pdf" : cls.contains("sheet") ? "sheet"
+    : cls.contains("doc") ? "doc" : cls.contains("text") ? "text" : null;
+  if (!kind) return;
+  const path = card.getAttribute("data-apath") ?? "";
+  const name = card.querySelector(".aname")?.textContent ?? "file";
+  if (!path) return;
+  const overlay = el("div", "uatt-zoom");
+  const holder = el("div", "uatt-zoom-card");
+  const head = el("div", "uatt-zoom-head");
+  head.appendChild(el("span", "uatt-zoom-name", esc(name)));
+  const closeBtn = el("button", "uatt-zoom-x", "\u00d7") as HTMLButtonElement;
+  closeBtn.title = "Close";
+  head.appendChild(closeBtn);
+  holder.appendChild(head);
+  const body = el("div", "uatt-zoom-body", "loading\u2026");
+  holder.appendChild(body);
+  overlay.appendChild(holder);
+  document.body.appendChild(overlay);
+  document.body.style.overflow = "hidden";
+  const close = () => { overlay.remove(); document.body.style.overflow = ""; };
+  closeBtn.onclick = (e) => { e.stopPropagation(); close(); };
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+  if (!attachZoomEsc) {
+    attachZoomEsc = true;
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") document.querySelector(".uatt-zoom button.uatt-zoom-x")?.dispatchEvent(new Event("click"));
+    });
+  }
+  if (kind === "pdf") {
+    const cv = document.createElement("canvas");
+    cv.className = "fullpdf";
+    body.innerHTML = "";
+    body.appendChild(cv);
+    attachData(path).then((uri) => {
+      if (!uri || !cv.isConnected) { if (cv.isConnected) body.textContent = "could not load file"; return; }
+      const b64 = uri.slice(uri.indexOf(",") + 1);
+      void renderPdfBytes(cv, Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)), 720).catch(() => {
+        if (body.isConnected) body.textContent = "could not load file";
+      });
+    }).catch(() => { if (body.isConnected) body.textContent = "could not load file"; });
+  } else if (kind === "sheet") {
+    invoke<{ sheets: string[]; sheet: string; rows: string[][]; truncated: boolean } | null>("read_sheet", { path, base: cwd || null, maxRows: 200, maxCols: 20 })
+      .then((r) => {
+        if (!body.isConnected) return;
+        if (!r?.rows?.length) { body.textContent = "could not load sheet"; return; }
+        const tbl = document.createElement("table");
+        tbl.className = "fullsheet";
+        const tb = document.createElement("tbody");
+        for (const row of r.rows) {
+          const tr = document.createElement("tr");
+          for (const cell of row) {
+            const td = document.createElement("td");
+            td.textContent = cell;
+            tr.appendChild(td);
+          }
+          tb.appendChild(tr);
+        }
+        tbl.appendChild(tb);
+        body.innerHTML = "";
+        body.appendChild(tbl);
+        if (r.truncated) body.appendChild(el("div", "uatt-zoom-note", "showing first 200 rows"));
+      })
+      .catch(() => { if (body.isConnected) body.textContent = "could not load sheet"; });
+  } else {
+    // text + doc: full content, not the card's 24-line excerpt.
+    const load = kind === "doc"
+      ? invoke<{ text: string } | null>("read_office_text", { path, base: cwd || null }).then((r) => r?.text ?? null)
+      : attachText(path);
+    load.then((txt) => {
+      if (!body.isConnected) return;
+      if (txt == null) { body.textContent = "could not load file"; return; }
+      const pre = el("pre", "fulltext", "");
+      pre.textContent = txt || "(empty file)";
+      body.innerHTML = "";
+      body.appendChild(pre);
+    }).catch(() => { if (body.isConnected) body.textContent = "could not load file"; });
+  }
+}
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+function wireAttachFiles(container: HTMLElement): void {
+  container.querySelectorAll<HTMLCanvasElement>("canvas[data-pdfpath]").forEach((cv) => {
+    const path = cv.getAttribute("data-pdfpath") ?? "";
+    cv.removeAttribute("data-pdfpath");
+    void renderPdfThumb(cv, path);
+  });
+  container.querySelectorAll<HTMLAudioElement>("audio[data-audiopath]").forEach((au) => {
+    const path = au.getAttribute("data-audiopath") ?? "";
+    au.removeAttribute("data-audiopath");
+    void attachData(path).then((uri) => { if (uri && au.isConnected) au.src = uri; });
+  });
+  container.querySelectorAll<HTMLElement>("pre[data-textpath]").forEach((pre) => {
+    const path = pre.getAttribute("data-textpath") ?? "";
+    pre.removeAttribute("data-textpath");
+    void attachText(path).then((txt) => {
+      if (!pre.isConnected) return;
+      if (txt == null) { pre.textContent = "could not load file"; return; }
+      pre.textContent = txt.split("\n").slice(0, 24).join("\n").slice(0, 1500) || "(empty file)";
+    });
+  });
+  container.querySelectorAll<HTMLTableElement>("table[data-sheetpath]").forEach((tbl) => {
+    const path = tbl.getAttribute("data-sheetpath") ?? "";
+    tbl.removeAttribute("data-sheetpath");
+    invoke<{ sheets: string[]; sheet: string; rows: string[][]; truncated: boolean } | null>("read_sheet", { path, base: cwd || null })
+      .then((r) => {
+        if (!tbl.isConnected) return;
+        if (!r?.rows?.length) { tbl.outerHTML = "<span class='dim'>could not load sheet</span>"; return; }
+        const tb = document.createElement("tbody");
+        for (const row of r.rows.slice(0, 8)) {
+          const tr = document.createElement("tr");
+          for (const cell of row.slice(0, 8)) {
+            const td = document.createElement("td");
+            td.textContent = cell;
+            td.title = cell;
+            tr.appendChild(td);
+          }
+          tb.appendChild(tr);
+        }
+        tbl.appendChild(tb);
+      })
+      .catch(() => {});
+  });
+  container.querySelectorAll<HTMLElement>("pre[data-docpath]").forEach((pre) => {
+    const path = pre.getAttribute("data-docpath") ?? "";
+    pre.removeAttribute("data-docpath");
+    invoke<{ text: string; truncated: boolean } | null>("read_office_text", { path, base: cwd || null })
+      .then((r) => {
+        if (!pre.isConnected) return;
+        if (!r?.text) { pre.textContent = "could not load file"; return; }
+        pre.textContent = r.text.split("\n").slice(0, 24).join("\n").slice(0, 1500) + (r.truncated ? "\n\u2026" : "");
+      })
+      .catch(() => { if (pre.isConnected) pre.textContent = "could not load file"; });
+  });
+  // Click a card (not audio controls) to zoom it in an overlay.
+  container.querySelectorAll<HTMLElement>(".acard").forEach((card) => {
+    if ((card as any)._zoomwired) return;
+    (card as any)._zoomwired = true;
+    card.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest("audio,button,a")) return;
+      if (card.classList.contains("audio")) return;
+      openAttachZoom(card);
+    });
+  });
+  container.querySelectorAll<HTMLElement>("span[data-sizepath]").forEach((sp) => {
+    const path = sp.getAttribute("data-sizepath") ?? "";
+    sp.removeAttribute("data-sizepath");
+    invoke<{ mtimeMs: number; size: number } | null>("media_stat", { path, base: cwd || null })
+      .then((st) => { if (sp.isConnected) sp.textContent = st && typeof st.size === "number" ? fmtSize(st.size) : ""; })
+      .catch(() => {});
+  });
 }
 
 function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement {
@@ -695,13 +945,15 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
     const wrap = el("div", "umsgwrap");
     // Attached previews render ABOVE the bubble as their own wrapping
     // row (scales to many files); the bubble holds text only.
-    let { text: utext, media: umedia } = splitUserAttachments(textOf(m.content) || "");
-    if (!utext && !umedia) utext = "(empty)";
-    if (umedia) {
+    let { text: utext, md: umd, files: ufiles } = splitUserAttachments(textOf(m.content) || "");
+    if (!utext && !umd && !ufiles.length) utext = "(empty)";
+    if (umd || ufiles.length) {
       const prev = el("div", "uatt");
-      if (umedia.split("\n").length === 1) prev.classList.add("solo");
-      prev.innerHTML = renderMd(umedia);
+      if (!ufiles.length && umd.split("\n").length === 1) prev.classList.add("solo");
+      if (umd) prev.innerHTML = renderMd(umd);
+      for (const f of ufiles) prev.appendChild(attachCard(f));
       wrap.appendChild(prev);
+      wireAttachFiles(prev);
     }
     if (utext) {
       const box = el("div", "msg user");
@@ -3320,19 +3572,28 @@ async function syncRunFlag() {
 
 // Pending uploads: files picked/pasted/dropped but not yet sent. Stored
 // as data URLs client-side; uploaded at send time into the session cwd
-// with paths appended to the message text. 12MB cap matches save_upload.
-interface PendingAttachment { name: string; dataUrl: string; size: number; kind: string; }
+// with paths appended to the message text. 64MB cap matches save_upload.
+// Two flavors: bytes (browser file input/paste/drop — must upload) and
+// path (desktop native picker/drop — real path, referenced in place).
+interface PendingAttachment { name: string; dataUrl: string; size: number; kind: string; source: "bytes" | "path"; path?: string; }
 const pendingAttachments: PendingAttachment[] = [];
 function addFiles(files: FileList | File[]) {
   for (const f of Array.from(files)) {
-    if (f.size > 12 * 1024 * 1024) { toastErr(`${f.name}: over 12MB, skipped`); continue; }
+    if (f.size > 64 * 1024 * 1024) { toastErr(`${f.name}: over 64MB, skipped`); continue; }
     const rd = new FileReader();
     rd.onload = () => {
-      pendingAttachments.push({ name: f.name, dataUrl: String(rd.result ?? ""), size: f.size, kind: f.type });
+      pendingAttachments.push({ name: f.name, dataUrl: String(rd.result ?? ""), size: f.size, kind: f.type, source: "bytes" });
       renderAttachbar();
     };
     rd.readAsDataURL(f);
   }
+}
+function addFilesByPath(paths: string[]) {
+  for (const p of paths) {
+    const name = p.split("/").pop() ?? p;
+    pendingAttachments.push({ name, dataUrl: "", size: 0, kind: "", source: "path", path: p });
+  }
+  renderAttachbar();
 }
 function clearAttachments() { pendingAttachments.length = 0; renderAttachbar(); }
 function renderAttachbar() {
@@ -3342,10 +3603,20 @@ function renderAttachbar() {
   syncSendBtn();
   pendingAttachments.forEach((a, i) => {
     const chip = el("span", "achip");
-    if (a.kind.startsWith("image/")) {
+    if (a.source === "path") {
+      chip.appendChild(el("span", "fext", esc((a.name.split(".").pop() ?? "file").toUpperCase().slice(0, 5))));
+    } else if (a.kind.startsWith("image/")) {
       const img = document.createElement("img");
       img.src = a.dataUrl; img.className = "athumb"; img.alt = "";
       chip.appendChild(img);
+    } else if (a.kind === "application/pdf" || a.name.toLowerCase().endsWith(".pdf")) {
+      const cv = document.createElement("canvas");
+      cv.className = "athumbpdf";
+      chip.appendChild(cv);
+      try {
+        const b64 = a.dataUrl.slice(a.dataUrl.indexOf(",") + 1);
+        void renderPdfBytes(cv, Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)), 128).catch(() => {});
+      } catch { /* thumbnail optional; chip remains */ }
     }
     chip.appendChild(el("span", "aname", esc(a.name)));
     const x = el("button", "ax", "×") as HTMLButtonElement;
@@ -3369,6 +3640,9 @@ async function send() {
     try {
       const paths: string[] = [];
       for (const a of pendingAttachments) {
+        // Desktop native paths reference in place (no copy); browser
+        // blobs upload into the session dir (see save_upload).
+        if (a.source === "path" && a.path) { paths.push(a.path); continue; }
         const b64 = a.dataUrl.slice(a.dataUrl.indexOf(",") + 1);
         paths.push(await pi.upload(cwd, a.name, b64));
       }
@@ -4029,7 +4303,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   ($("abortbtn") as HTMLButtonElement).addEventListener("click", () => {
     stopOnly();
   });
-  ($("attachbtn") as HTMLButtonElement).addEventListener("click", () => {
+  ($("attachbtn") as HTMLButtonElement).addEventListener("click", async () => {
+    // Desktop: native picker returns real paths — reference in place,
+    // no copy. Browser: file input + save_upload (see send()).
+    if (inTauriMain) {
+      try {
+        const picked = await invoke<string[]>("pick_files", {});
+        if (picked?.length) addFilesByPath(picked);
+      } catch (e: any) {
+        toastErr(`pick failed: ${e.message ?? e}`);
+      }
+      return;
+    }
     ($("attachfile") as HTMLInputElement).click();
   });
   ($("attachfile") as HTMLInputElement).addEventListener("change", (e) => {
@@ -4041,8 +4326,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   comp.addEventListener("dragover", (e) => e.preventDefault());
   comp.addEventListener("drop", (e) => {
     e.preventDefault();
+    // Desktop: the native drag-drop event owns file drops (real paths);
+    // the web event carries no usable files there.
+    if (inTauriMain) return;
     if (e.dataTransfer?.files.length) addFiles(e.dataTransfer.files);
   });
+  // Desktop native drops (real paths, no copy). Browser: no-op.
+  try {
+    void getCurrentWebview()?.onDragDropEvent?.((ev: any) => {
+      if (ev?.payload?.type === "drop" && Array.isArray(ev.payload.paths)) addFilesByPath(ev.payload.paths);
+    });
+  } catch { /* browser mode: no-op */ }
   const inp = $("input") as HTMLTextAreaElement;
   const autogrow = () => {
     inp.style.height = "auto";
