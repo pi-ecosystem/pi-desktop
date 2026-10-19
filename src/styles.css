@@ -350,7 +350,7 @@ details.toolrow > summary:hover { color: var(--text); }
 
 /* settings modal */
 .hidden { display: none !important; }
-#settingsmodal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
+#settingsmodal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 70; }
 .modalcard { background: var(--surface); border: none; border-radius: 12px; padding: 20px; width: 440px; display: flex; flex-direction: column; gap: 10px; }
 .modalcard h3 { margin: 0; font-weight: 500; }
 .ver { font-size: 12px; font-weight: 400; color: var(--dim); }
@@ -463,6 +463,30 @@ body.qb { background: var(--surface); }
 #panebtn.open { color: var(--text); }
 #panebadge { position: absolute; top: -4px; right: -4px; min-width: 16px; height: 16px; border-radius: 999px; background: #7aa2f7; color: #0f1115; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; padding: 0 4px; }
 #panebadge.hidden { display: none; }
+
+/* Header new-chat: mobile only (desktop has it in the sidebar). */
+#newchatbtn { display: none; }
+
+/* Mobile: sidebar + sidepane become overlays, composer tightens, no iOS zoom. */
+@media (max-width: 768px) {
+  #newchatbtn { display: inline-flex; }
+  #side { position: fixed; left: 0; top: 0; bottom: 0; z-index: 60; width: min(84vw, 320px); min-width: 0; box-shadow: 8px 0 32px rgba(0,0,0,0.5); }
+  #sidepane { position: fixed; left: 0; right: 0; bottom: 0; top: 12%; z-index: 60; flex: none; min-width: 0; border-left: none; border-top: 1px solid var(--sideborder); border-radius: 16px 16px 0 0; box-shadow: 0 -8px 32px rgba(0,0,0,0.5); }
+  #sideresize { display: none; }
+  #msgs { padding: 16px 12px 32px; width: calc(100% - 16px); gap: 20px; }
+  .msg.user { max-width: 92%; }
+  #composer { margin: 0 12px calc(12px + env(safe-area-inset-bottom)); width: calc(100% - 24px); border-radius: 20px; padding: 8px 8px 8px 16px; }
+  #input { font-size: 16px; }
+  .cbtns { flex-wrap: wrap; }
+  .ctools { flex-wrap: wrap; }
+  .ctools select { max-width: 110px; }
+  #dirlabel { max-width: 90px; }
+  #chathead { min-height: 48px; padding: 6px 8px; }
+  #scrollbtn { bottom: 170px; }
+  .modalcard { width: calc(100vw - 32px); }
+  .msg table, #qbanswer table { display: block; overflow-x: auto; }
+  .greet h2 { font-size: 24px; line-height: 30px; }
+}
 
 /* Agents panel: past dropdown + transcript detail (one at a time) */
 /* Agents split view: list on top, selected transcript below, one scroll each */

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none'%3E%3Ccircle cx='12' cy='12' r='9' stroke='%237aa2f7' stroke-width='1.8'/%3E%3Ccircle cx='12' cy='12' r='3' fill='%237aa2f7'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/src/styles.css" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Pi</title>
     <script type="module" src="/src/main.ts" defer></script>
   </head>
@@ -42,6 +42,9 @@
         <header id="chathead">
           <button id="expandbtn" class="iconbtn hidden" title="Open sidebar">
             <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="2" y="3" width="16" height="14" rx="2" stroke="currentColor" stroke-width="1.5"/><line x1="7" y1="3" x2="7" y2="17" stroke="currentColor" stroke-width="1.5"/></svg>
+          </button>
+          <button id="newchatbtn" class="iconbtn" title="New chat">
+            <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M13.5 3.5l3 3L8 15H5v-3l8.5-8.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
           </button>
           <span id="sesstitle">—</span>
           <span class="hsp"></span>

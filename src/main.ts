@@ -3977,6 +3977,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.body.classList.remove("side-collapsed");
     ($("expandbtn") as HTMLButtonElement).classList.add("hidden");
   });
+  // Header new-chat (mobile): same action as the sidebar button.
+  ($("newchatbtn") as HTMLButtonElement).addEventListener("click", () => {
+    ($("newsess") as HTMLButtonElement).click();
+  });
+  // Mobile: sidebar starts closed (overlay drawer), header holds new-chat.
+  if (window.matchMedia("(max-width: 768px)").matches) {
+    document.body.classList.add("side-collapsed");
+    ($("expandbtn") as HTMLButtonElement).classList.remove("hidden");
+  }
   const scrollerEl = $("scrollwrap");
   const scroller = () => {
     const away = scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight;
