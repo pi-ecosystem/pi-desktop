@@ -4495,6 +4495,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     cwdGen++; // invalidate any in-flight setCwd (see switchSession)
     resetRunState();
     paintEmpty();
+    ($("input") as HTMLTextAreaElement).focus();
     refreshSessions();
     try {
       await openFresh();
