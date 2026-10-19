@@ -8,12 +8,17 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
+use tokio::sync::broadcast;
 
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_global_shortcut::ShortcutState;
+
+mod server;
+pub use server::run_server;
 
 // Bundled app prompt (src/system-prompt.md): what the transcript can render
 // plus how to format answers for it. Embedded at compile time so installed
@@ -21,8 +26,8 @@ use tauri_plugin_global_shortcut::ShortcutState;
 // changes edit the md file only, never this code. Override with
 // PI_DESKTOP_APP_PROMPT=/path/to/file.md, disable with PI_DESKTOP_APP_PROMPT=0.
 // The effective text also rides PI_DESKTOP_APP_PROMPT_TEXT down to pi-spawn
-// grandchildren (CLI flags don't propagate; env does). web-backend.mjs
-// mirrors this exactly for browser dev.
+// grandchildren (CLI flags don't propagate; env does). The HTTP server
+// mode shares this core, so browser dev gets the identical behavior.
 const SYSTEM_PROMPT: &str = include_str!("../../src/system-prompt.md");
 
 fn bundled_prompt_text() -> Option<String> {
@@ -43,7 +48,7 @@ fn bundled_prompt_text() -> Option<String> {
 // DIFFERENT paths (vendored copy + user install = dead child, zombie
 // proc, everything RPC-shaped breaks at once). The only exception is an
 // explicit PI_DESKTOP_SPAWN_EXT override (dev escape hatch).
-fn spawn_ext_path(_app: &AppHandle) -> Option<PathBuf> {
+fn spawn_ext_path() -> Option<PathBuf> {
     // Explicit override only (dev escape hatch):
     // PI_DESKTOP_SPAWN_EXT=/path/to/index.ts
     if let Ok(p) = std::env::var("PI_DESKTOP_SPAWN_EXT") {
@@ -138,6 +143,73 @@ struct AppState {
     // it changes: a reboot ends every supervised run (or reaps orphans),
     // so pre-reboot liveness is never carried forward.
     boot_id: String,
+    // Fan-out for forwarded pi records. The Tauri bridge thread re-emits
+    // these as pi-record IPC; the standalone HTTP server streams them
+    // as SSE. Senders never block: lagging receivers drop, frontends
+    // re-sync via pi_states + history reads.
+    events: broadcast::Sender<serde_json::Value>,
+}
+
+impl AppState {
+    /// Shared constructor for both hosts: Tauri `run()` and the
+    /// standalone HTTP server (`--server`). Loads config, ensures dirs,
+    /// reaps orphans, mints a boot id, opens the event broadcast.
+    pub(crate) fn new_shared() -> Arc<Self> {
+        reap_stale_children();
+        let cfg = load_config();
+        // Ensure default Q&A dir exists so first run just works.
+        let _ = fs::create_dir_all(&cfg.default_dir);
+        if cfg.last_cwd.is_empty() {
+            let mut c = cfg.clone();
+            c.last_cwd = c.default_dir.clone();
+            save_config(&c);
+        }
+        let (events, _) = broadcast::channel(256);
+        Arc::new(Self {
+            procs: Mutex::new(HashMap::new()),
+            config: Mutex::new(cfg.clone()),
+            run_states: Mutex::new(HashMap::new()),
+            boot_id: {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u128)
+                    .unwrap_or(0);
+                format!("{:x}-{}", nanos, std::process::id())
+            },
+            events,
+        })
+    }
+
+    /// One forwarded pi record: maintain run lifecycle, then fan out to
+    /// Tauri IPC (via the bridge thread in `run()`) and HTTP SSE.
+    fn on_record(&self, cwd: &str, tag: &str, key: &str, record: serde_json::Value) {
+        if let Some(t) = record.get("type").and_then(|v| v.as_str()) {
+            if t == "agent_start" || t == "agent_settled" {
+                if let Ok(mut rs) = self.run_states.lock() {
+                    rs.insert(format!("{}\n{}", tag, key), t == "agent_start");
+                }
+            }
+        }
+        let _ = self.events.send(serde_json::json!({
+            "cwd": cwd,
+            "tag": tag,
+            "key": key,
+            "record": record,
+        }));
+    }
+
+    /// Kill every supervised pi child. Server shutdown path (mirrors the
+    /// SIGTERM handler the old Node bridge had); Tauri uses quit_app.
+    pub(crate) fn kill_all(&self) {
+        if let Ok(mut procs) = self.procs.lock() {
+            for (_, p) in procs.drain() {
+                if let Ok(mut c) = p.child.lock() {
+                    let _ = c.kill();
+                }
+            }
+        }
+    }
 }
 
 fn session_root_default() -> String {
@@ -190,11 +262,16 @@ fn proc_key(tag: &Option<String>, key: &str) -> String {
     format!("{}\n{}", tag.clone().unwrap_or_else(|| "main".to_string()), key)
 }
 
-#[tauri::command]
-fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key: String, session_path: Option<String>, app: AppHandle, state: State<AppState>) -> Result<String, String> {
+impl AppState {
+    /// Spawn (or reuse) a `pi --mode rpc` child rooted at `cwd`.
+    /// Child identity: (window tag, session key). One pi child per session, so
+    /// runs proceed independently and switching views never touches agent state.
+    /// `key` is the session file path when known, else a unique fresh id.
+    /// `cwd` is only the process working directory for spawning.
+    fn pi_ensure_core(self: &Arc<Self>, cwd: String, session_dir: Option<String>, tag: Option<String>, key: String, session_path: Option<String>) -> Result<String, String> {
     let pkey = proc_key(&tag, &key);
     {
-        let procs = state.procs.lock().map_err(|e| e.to_string())?;
+        let procs = self.procs.lock().map_err(|e| e.to_string())?;
         if let Some(p) = procs.get(&pkey) {
             if proc_alive(p) {
                 return Ok("running".into());
@@ -203,7 +280,7 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     }
     // Reap dead proc if present.
     {
-        let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
+        let mut procs = self.procs.lock().map_err(|e| e.to_string())?;
         procs.remove(&pkey);
     }
 
@@ -228,7 +305,7 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // Single bundled prompt (mirrors web-backend.mjs): capability primer +
+    // Single bundled prompt (shared core, both hosts): capability primer +
     // formatting guide, one flag. Grandchild subagents don't inherit CLI
     // flags, so the effective text also rides the env down for pi-spawn
     // to re-append (absent when disabled via PI_DESKTOP_APP_PROMPT=0).
@@ -238,7 +315,7 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     }
     // Spawn extension only on explicit PI_DESKTOP_SPAWN_EXT override;
     // normally subagents come from the user's own pi packages.
-    if let Some(ext) = spawn_ext_path(&app) {
+    if let Some(ext) = spawn_ext_path() {
         cmd.arg("--extension").arg(ext);
     }
     if let Some(sd) = session_dir {
@@ -259,8 +336,10 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     let stdout = child.stdout.take().ok_or("no stdout")?;
 
     // Forward every stdout JSONL record tagged with its session key, so
-    // each window renders only its currently viewed session.
-    let app2 = app.clone();
+    // each window renders only its currently viewed session. Records flow
+    // through the shared broadcast: Tauri re-emits them as pi-record IPC,
+    // the HTTP server streams them as SSE (see on_record).
+    let this = Arc::clone(self);
     let cwd2 = cwd.clone();
     let tag2 = tag.clone().unwrap_or_else(|| "main".to_string());
     let key2 = key.clone();
@@ -276,26 +355,11 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
             }
             let record: serde_json::Value =
                 serde_json::from_str(&line).unwrap_or(serde_json::Value::String(line));
-            // Track run lifecycle for cross-session status (sidebar dots).
-            // try_state per event is fine: two events per run, no hot path.
-            if let Some(t) = record.get("type").and_then(|v| v.as_str()) {
-                if t == "agent_start" || t == "agent_settled" {
-                    let rk = format!("{}\n{}", tag2, key2);
-                    if let Some(st) = app2.try_state::<AppState>() {
-                        if let Ok(mut rs) = st.run_states.lock() {
-                            rs.insert(rk, t == "agent_start");
-                        }
-                    }
-                }
-            }
-            let _ = app2.emit(
-                "pi-record",
-                serde_json::json!({ "cwd": cwd2, "tag": tag2, "key": key2, "record": record }),
-            );
+            this.on_record(&cwd2, &tag2, &key2, record);
         }
     });
 
-    let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
+    let mut procs = self.procs.lock().map_err(|e| e.to_string())?;
     procs.insert(
         pkey.clone(),
         PiProc {
@@ -309,19 +373,25 @@ fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key:
     // with no settled event), or the sidebar dot sticks until reboot.
     // The alive fast-path above deliberately skips this: mid-run
     // ensures must never erase a true mark.
-    if let Ok(mut rs) = state.run_states.lock() {
+    if let Ok(mut rs) = self.run_states.lock() {
         rs.remove(&pkey);
     }
     // Remember as last used. Quickbar dirs stay out of the shared recents:
     // its throwaway Q&A dirs would drown the real project list.
     if tag.as_deref() != Some("quickbar") {
-        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        let mut cfg = self.config.lock().map_err(|e| e.to_string())?;
         cfg.last_cwd = cwd.clone();
         cfg.recents = push_recent(cfg.recents.clone(), &cwd);
         let snapshot = cfg.clone();
         save_config(&snapshot);
     }
     Ok("started".into())
+    }
+}
+
+#[tauri::command]
+fn pi_ensure(cwd: String, session_dir: Option<String>, tag: Option<String>, key: String, session_path: Option<String>, state: State<Arc<AppState>>) -> Result<String, String> {
+    state.pi_ensure_core(cwd, session_dir, tag, key, session_path)
 }
 
 fn push_recent(mut recents: Vec<String>, cwd: &str) -> Vec<String> {
@@ -332,9 +402,10 @@ fn push_recent(mut recents: Vec<String>, cwd: &str) -> Vec<String> {
 }
 
 /// Write one JSON command line to the pi child for `cwd`.
-#[tauri::command]
-fn pi_send(_cwd: String, payload: serde_json::Value, tag: Option<String>, key: String, state: State<AppState>) -> Result<(), String> {
-    let procs = state.procs.lock().map_err(|e| e.to_string())?;
+impl AppState {
+    /// Write one JSON command line to the pi child for `cwd`.
+    fn pi_send_core(&self, _cwd: String, payload: serde_json::Value, tag: Option<String>, key: String) -> Result<(), String> {
+    let procs = self.procs.lock().map_err(|e| e.to_string())?;
     let p = procs.get(&proc_key(&tag, &key)).ok_or("no pi running for this session (call pi_ensure)")?;
     if !proc_alive(p) {
         return Err("pi exited (call pi_ensure)".into());
@@ -347,13 +418,19 @@ fn pi_send(_cwd: String, payload: serde_json::Value, tag: Option<String>, key: S
         .write_all(line.as_bytes())
         .map_err(|e| e.to_string())?;
     Ok(())
+    }
 }
 
 #[tauri::command]
-fn pi_stop(_cwd: String, tag: Option<String>, key: String, state: State<AppState>) -> Result<(), String> {
+fn pi_send(_cwd: String, payload: serde_json::Value, tag: Option<String>, key: String, state: State<Arc<AppState>>) -> Result<(), String> {
+    state.pi_send_core(_cwd, payload, tag, key)
+}
+
+impl AppState {
+    fn pi_stop_core(&self, _cwd: String, tag: Option<String>, key: String) -> Result<(), String> {
     let pkey = proc_key(&tag, &key);
     {
-        let mut procs = state.procs.lock().map_err(|e| e.to_string())?;
+        let mut procs = self.procs.lock().map_err(|e| e.to_string())?;
         if let Some(p) = procs.remove(&pkey) {
             if let Ok(mut c) = p.child.lock() {
                 let _ = c.kill();
@@ -362,10 +439,16 @@ fn pi_stop(_cwd: String, tag: Option<String>, key: String, state: State<AppState
     }
     // A stopped run is over: drop its lifecycle mark too, or run_states
     // (and every sidebar snapshot) accumulates dead keys forever.
-    if let Ok(mut rs) = state.run_states.lock() {
+    if let Ok(mut rs) = self.run_states.lock() {
         rs.remove(&pkey);
     }
     Ok(())
+    }
+}
+
+#[tauri::command]
+fn pi_stop(_cwd: String, tag: Option<String>, key: String, state: State<Arc<AppState>>) -> Result<(), String> {
+    state.pi_stop_core(_cwd, tag, key)
 }
 
 // ---------------------------------------------------------------- sessions
@@ -801,9 +884,9 @@ fn pids_alive(pids: Vec<i32>) -> Vec<bool> {
 
 /// [{tag, key, streaming}]}. Read from the tracked map (no pi traffic).
 /// Unknown sessions are simply absent (= idle).
-#[tauri::command]
-fn pi_states(state: State<AppState>) -> serde_json::Value {
-    let runs = match state.run_states.lock() {
+impl AppState {
+    fn pi_states_core(&self) -> serde_json::Value {
+    let runs = match self.run_states.lock() {
         Ok(rs) => rs
             .iter()
             .map(|(k, v)| {
@@ -815,7 +898,13 @@ fn pi_states(state: State<AppState>) -> serde_json::Value {
             .collect(),
         Err(_) => vec![],
     };
-    serde_json::json!({ "bootId": state.boot_id, "runs": runs })
+    serde_json::json!({ "bootId": self.boot_id, "runs": runs })
+    }
+}
+
+#[tauri::command]
+fn pi_states(state: State<Arc<AppState>>) -> serde_json::Value {
+    state.pi_states_core()
 }
 
 /// Transcript of one spawned subagent (see agent/SPAWN.md). Scoped to the
@@ -946,32 +1035,25 @@ fn delete_spawn_run(run_id: String) -> Result<(), String> {
 
 // ---------------------------------------------------------------- config
 
-#[tauri::command]
-fn get_config(state: State<AppState>) -> AppConfig {
-    state.config.lock().map(|c| c.clone()).unwrap_or_default()
+impl AppState {
+    fn get_config_core(&self) -> AppConfig {
+    self.config.lock().map(|c| c.clone()).unwrap_or_default()
+    }
 }
 
 #[tauri::command]
-fn set_config(patch: serde_json::Value, app: AppHandle, state: State<AppState>) -> Result<AppConfig, String> {
-    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
-    if let Some(v) = patch.get("default_dir").and_then(|v| v.as_str()) {
-        cfg.default_dir = v.to_string();
-    }
-    if let Some(v) = patch.get("last_cwd").and_then(|v| v.as_str()) {
-        cfg.last_cwd = v.to_string();
-    }
-    if let Some(arr) = patch.get("recents").and_then(|v| v.as_array()) {
-        cfg.recents = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
-    }
-    if let Some(v) = patch.get("run_in_bg").and_then(|v| v.as_bool()) {
-        cfg.run_in_bg = v;
-        let snapshot = cfg.clone();
-        save_config(&snapshot);
-        drop(cfg);
-        apply_tray(&app, snapshot.run_in_bg);
-        return Ok(snapshot);
-    }
+fn get_config(state: State<Arc<AppState>>) -> AppConfig {
+    state.get_config_core()
+}
+
+impl AppState {
+    /// Apply a config patch: validate, mutate, persist. Returns the
+    /// snapshot plus which window-side effects the host must apply
+    /// (hotkey re-registration, tray visibility). Validation runs before
+    /// any mutation; the old code mutated first and failed dirty.
+    fn set_config_core(&self, patch: &serde_json::Value) -> Result<(AppConfig, bool, bool), String> {
     if patch.get("quickbar_hotkey").or(patch.get("main_hotkey")).is_some() {
+        let cfg = self.config.lock().map_err(|e| e.to_string())?;
         let q = patch
             .get("quickbar_hotkey")
             .and_then(|v| v.as_str())
@@ -982,27 +1064,58 @@ fn set_config(patch: serde_json::Value, app: AppHandle, state: State<AppState>) 
             .and_then(|v| v.as_str())
             .unwrap_or(&cfg.main_hotkey)
             .to_string();
+        drop(cfg);
         // Validate BEFORE unregister_all: a typo must not wipe working keys.
         let _: tauri_plugin_global_shortcut::Shortcut =
             q.parse().map_err(|_| format!("bad hotkey: {q}"))?;
         let _: tauri_plugin_global_shortcut::Shortcut =
             m.parse().map_err(|_| format!("bad hotkey: {m}"))?;
-        cfg.quickbar_hotkey = q;
-        cfg.main_hotkey = m;
-        let snapshot = cfg.clone();
-        drop(cfg);
-        apply_hotkeys(&app, &state, &snapshot)?;
-        let cfg2 = state.config.lock().map_err(|e| e.to_string())?;
-        let snapshot2 = cfg2.clone();
-        save_config(&snapshot2);
-        return Ok(snapshot2);
+    }
+    let mut cfg = self.config.lock().map_err(|e| e.to_string())?;
+    if let Some(v) = patch.get("default_dir").and_then(|v| v.as_str()) {
+        cfg.default_dir = v.to_string();
+    }
+    if let Some(v) = patch.get("last_cwd").and_then(|v| v.as_str()) {
+        cfg.last_cwd = v.to_string();
+    }
+    if let Some(arr) = patch.get("recents").and_then(|v| v.as_array()) {
+        cfg.recents = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+    }
+    let mut tray_changed = false;
+    if let Some(v) = patch.get("run_in_bg").and_then(|v| v.as_bool()) {
+        cfg.run_in_bg = v;
+        tray_changed = true;
+    }
+    let mut hotkeys_changed = false;
+    if patch.get("quickbar_hotkey").or(patch.get("main_hotkey")).is_some() {
+        // Validated above: infallible here.
+        if let Some(v) = patch.get("quickbar_hotkey").and_then(|v| v.as_str()) {
+            cfg.quickbar_hotkey = v.to_string();
+        }
+        if let Some(v) = patch.get("main_hotkey").and_then(|v| v.as_str()) {
+            cfg.main_hotkey = v.to_string();
+        }
+        hotkeys_changed = true;
     }
     let snapshot = cfg.clone();
     save_config(&snapshot);
+    Ok((snapshot, hotkeys_changed, tray_changed))
+    }
+}
+
+#[tauri::command]
+fn set_config(patch: serde_json::Value, app: AppHandle, state: State<Arc<AppState>>) -> Result<AppConfig, String> {
+    let (snapshot, hotkeys_changed, tray_changed) = state.set_config_core(&patch)?;
+    if hotkeys_changed {
+        apply_hotkeys(&app, &state, &snapshot)?;
+    }
+    if tray_changed {
+        apply_tray(&app, snapshot.run_in_bg);
+    }
     Ok(snapshot)
 }
 
-fn apply_hotkeys(app: &AppHandle, _state: &State<AppState>, cfg: &AppConfig) -> Result<(), String> {
+fn apply_hotkeys(app: &AppHandle, _state: &State<Arc<AppState>>, cfg: &AppConfig) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
     let _ = app.global_shortcut().unregister_all();
     for (key, win) in [(&cfg.quickbar_hotkey, "quickbar"), (&cfg.main_hotkey, "main")] {
@@ -1160,9 +1273,9 @@ fn qb_hide_self(app: AppHandle) {
 
 /// Bring up the full sessions window for a cwd (used by quickbar's "Open").
 #[tauri::command]
-fn open_in_main(app: AppHandle, cwd: String, session_path: Option<String>, state: State<AppState>) -> Result<(), String> {
+fn open_in_main(app: AppHandle, cwd: String, session_path: Option<String>, state: State<Arc<AppState>>) -> Result<(), String> {
     let key = session_path.clone().unwrap_or_else(|| cwd.clone());
-    pi_ensure(cwd.clone(), None, None, key, session_path.clone(), app.clone(), state)?;
+    state.pi_ensure_core(cwd.clone(), None, None, key, session_path.clone())?;
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.set_focus();
@@ -1240,19 +1353,8 @@ fn reap_stale_children() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Unclean shutdowns (SIGKILL, dev restarts) orphan pi children that
-    // keep running + writing while a fresh backend serves stale views.
-    // Reap them before anything else. Our own live children (if any)
-    // are never reaped: only ppid-1 processes carry the marker check.
-    reap_stale_children();
-    let cfg = load_config();
-    // Ensure default Q&A dir exists so first run just works.
-    let _ = fs::create_dir_all(&cfg.default_dir);
-    if cfg.last_cwd.is_empty() {
-        let mut c = cfg.clone();
-        c.last_cwd = c.default_dir.clone();
-        save_config(&c);
-    }
+    // Shared core (config, procs, broadcast) also used by `--server`.
+    let backend = AppState::new_shared();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
@@ -1269,20 +1371,20 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState {
-            procs: Mutex::new(HashMap::new()),
-            config: Mutex::new(cfg.clone()),
-            run_states: Mutex::new(HashMap::new()),
-            boot_id: {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u128)
-                    .unwrap_or(0);
-                format!("{:x}-{}", nanos, std::process::id())
-            },
-        })
+        .manage(backend)
         .setup(move |app| {
+            // Bridge: forwarded pi records fan out over the broadcast;
+            // re-emit them as pi-record IPC for the frontend.
+            let st = app.state::<Arc<AppState>>();
+            let bridge_rx = st.inner().clone();
+            let ah = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut rx = bridge_rx.events.subscribe();
+                while let Ok(payload) = rx.blocking_recv() {
+                    let _ = ah.emit("pi-record", payload);
+                }
+            });
+            let cfg = st.get_config_core();
             // First-launch flags (also used by the KDE custom shortcut).
             let args: Vec<String> = std::env::args().collect();
             if args.iter().any(|a| a == "--toggle-quickbar" || a == "--show-quickbar") {
@@ -1295,7 +1397,7 @@ pub fn run() {
                     let _ = w.center();
                 }
             }
-            if let Err(e) = apply_hotkeys(&app.handle(), &app.state::<AppState>(), &cfg) {
+            if let Err(e) = apply_hotkeys(&app.handle(), &st, &cfg) {
                 eprintln!("hotkey registration failed: {e} (edit in Settings; KDE shortcut still works)");
             }
             apply_tray(&app.handle(), cfg.run_in_bg);

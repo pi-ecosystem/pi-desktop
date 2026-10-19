@@ -5,8 +5,8 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 ## Web mode (quickest, no Rust)
 
 - `npm run dev:web` → frontend `:1422`, api `:1423`, open `http://localhost:1422/`
-- Backend is `server/web-backend.mjs` (dev only). Window ops are no-ops in a tab; everything else is real.
-- Stop: kill the exact PIDs (`vite`, `web-backend.mjs`). Never `pkill -f` with a pattern matching your own command.
+- Backend is the Rust binary in `--server` mode (dev only). Window ops are no-ops in a tab; everything else is real.
+- Stop: kill the exact PIDs (`vite`, `pi-desktop --server`). Never `pkill -f` with a pattern matching your own command.
 
 ## App mode (Tauri, needs Rust + WebKitGTK)
 
@@ -27,7 +27,7 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 
 ## Backend rules
 
-- `src-tauri/src/lib.rs` is truth. `server/web-backend.mjs` must mirror it (same commands, same semantics). Change both or neither.
+- Backend core is shared: Tauri IPC commands + `--server` HTTP dispatch onto the same fns (`src-tauri/src/server.rs`). One implementation, no mirror to keep in sync.
 - History reads are windowed (`read_session_messages`: byte budget + offset). Never load full transcripts.
 - Extensions: never `--extension` anything by default. pi dedupes an
   identical path but FATALS on the same tool from two different paths
@@ -44,7 +44,7 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
   text is passed to pi children via `--append-system-prompt` plus
   `PI_DESKTOP_APP_PROMPT_TEXT` env so pi-spawn grandchildren re-append it.
   Prompt changes edit the md file only — never the backends.
-- `PORT` — web-backend port (default 1423)
+- `PORT` — backend server port (default 1423)
 
 ## Process hygiene
 

@@ -1063,7 +1063,7 @@ function playVideoCard(b: HTMLButtonElement): void {
   };
   if (local) {
     const abs = resolveLocal(local);
-    // Data-URI inline play; web-backend mirrors read_media so this works
+    // Data-URI inline play; the HTTP backend serves read_media so this works
     // in browser dev too. System player stays one click away regardless.
     toAssetUrl(abs).then((url) => {
       if (url) finish(url, abs, null);

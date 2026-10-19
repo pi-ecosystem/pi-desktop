@@ -25,10 +25,10 @@ npm install
 
 ### Browser mode (quickest, all platforms)
 
-No Rust, no WebView libs. Same app, same real backend (`pi --mode rpc`
-children, real sessions, real streaming) in Chrome via a small Node
-bridge (`server/web-backend.mjs`, dev only — the Tauri build never
-touches it):
+No WebView libs. Same app, same real backend (`pi --mode rpc`
+children, real sessions, real streaming) in Chrome via the Rust binary
+in `--server` mode (dev only — the Tauri build serves the same core
+over IPC instead):
 
 ```bash
 npm run dev:web   # frontend :1422, api :1423 — open http://localhost:1422/
@@ -177,5 +177,5 @@ windows stay hidden until a hotkey, unless `--toggle-quickbar` is passed).
 - `src/md.ts` — tiny markdown renderer
 - `src/tauri-shim.ts` + `src/tauri-window-shim.ts` — fetch/SSE + no-op
   window shims, active only outside Tauri (browser mode)
-- `server/web-backend.mjs` — dev-only Node bridge mirroring the Rust
-  backend (`npm run dev:web`); Tauri builds never touch it
+- `src-tauri/src/server.rs` — HTTP dispatch onto the same backend core
+  (`POST /api/invoke`, `GET /api/events`); serves `npm run dev:web`

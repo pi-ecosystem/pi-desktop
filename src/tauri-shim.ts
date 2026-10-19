@@ -1,6 +1,6 @@
 // Drop-in replacement for @tauri-apps/api core/event imports.
 // Inside Tauri: real IPC. In a plain browser (npm run dev:web): fetch + SSE
-// against server/web-backend.mjs (same commands, same event shapes).
+// against the Rust backend in --server mode (same commands, same event shapes).
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 
