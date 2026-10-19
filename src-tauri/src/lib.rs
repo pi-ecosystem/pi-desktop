@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use base64::Engine as _;
 
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -1082,7 +1083,30 @@ fn bg_enabled(app: &AppHandle) -> bool {
         .unwrap_or(true)
 }
 
+// Toggle de-dup: a held hotkey repeats (~30ms) and double-fires across
+// the in-app shortcut + KDE fallback. Sub-250ms toggles are repeats,
+// never intent. The quickbar frontend also hides itself instantly on
+// the chord (see quickbar.ts); the stale backend toggle arriving after
+// must not re-show it, so self-hides buy 400ms of immunity.
+static LAST_TOGGLE_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_QB_SELF_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 fn toggle_window(app: &AppHandle, label: &str) {
+    let now = now_ms();
+    if now.wrapping_sub(LAST_TOGGLE_MS.load(Ordering::SeqCst)) < 250 {
+        return;
+    }
+    LAST_TOGGLE_MS.store(now, Ordering::SeqCst);
+    if label == "quickbar"
+        && now.wrapping_sub(LAST_QB_SELF_HIDE_MS.load(Ordering::SeqCst)) < 400
+    {
+        return;
+    }
     if let Some(w) = app.get_webview_window(label) {
         if w.is_visible().unwrap_or(false) {
             let _ = w.hide();
@@ -1118,6 +1142,18 @@ fn show_window(app: AppHandle, label: String) {
 #[tauri::command]
 fn hide_window(app: AppHandle, label: String) {
     if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.hide();
+    }
+}
+/// Chord self-hide: the quickbar frontend hides instantly on its own
+/// toggle chord (the backend toggle arrives a beat later via hotkey
+/// daemon round-trip). Records the moment so toggle_window can drop
+/// that stale toggle instead of re-showing. Plain hide_window (Esc,
+/// buttons) grants no immunity — a fast manual reopen must always win.
+#[tauri::command]
+fn qb_hide_self(app: AppHandle) {
+    LAST_QB_SELF_HIDE_MS.store(now_ms(), Ordering::SeqCst);
+    if let Some(w) = app.get_webview_window("quickbar") {
         let _ = w.hide();
     }
 }
@@ -1299,6 +1335,7 @@ pub fn run() {
             toggle_main,
             show_window,
             hide_window,
+            qb_hide_self,
             open_in_main,
             pick_dir,
         ])

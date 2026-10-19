@@ -24,6 +24,40 @@ function ensureSub() {
 }
 let buf = "";
 let lastText = "";
+// Toggle-show timestamp: the toggle hotkey that opened the popup can
+// leak a stray keypress into the freshly focused input (race). The
+// swallow below kills exactly that.
+let shownAt = 0;
+// Parsed toggle hotkey (configurable, e.g. "Super+Shift+J"): the KEY
+// part is what can leak, so it — not a hardcoded "j" — is swallowed.
+let qbHotKey = "j";
+let qbHotMods: string[] = ["super"];
+function parseHotkey(spec: unknown): void {
+  const parts = String(spec ?? "").split("+").map((s) => s.trim()).filter(Boolean);
+  const key = parts.pop();
+  if (key) qbHotKey = key.toLowerCase();
+  qbHotMods = parts.map((p) => p.toLowerCase());
+}
+function hotModHeld(m: string, e: KeyboardEvent): boolean {
+  if (m === "super" || m === "meta" || m === "cmd" || m === "win") return e.metaKey;
+  if (m === "ctrl" || m === "control") return e.ctrlKey;
+  if (m === "shift") return e.shiftKey;
+  if (m === "alt" || m === "opt") return e.altKey;
+  return false;
+}
+function isHotkeyLeak(e: KeyboardEvent): boolean {
+  if (e.key.toLowerCase() !== qbHotKey) return false;
+  // Toggle chord still held (either direction) — always ours.
+  if (qbHotMods.length === 0 || qbHotMods.some((m) => hotModHeld(m, e))) return true;
+  // Modifiers released early on show: empty input + first 300ms only,
+  // so real typing is never eaten.
+  const inp = $("qbinput") as HTMLInputElement;
+  return inp.value === "" && Date.now() - shownAt < 300;
+}
+function hotChordHeld(e: KeyboardEvent): boolean {
+  return e.key.toLowerCase() === qbHotKey &&
+    (qbHotMods.length === 0 || qbHotMods.some((m) => hotModHeld(m, e)));
+}
 let qbLastRender = 0; // throttle: full re-parse at most every ~250ms
 // Start offset of the currently streaming turn inside buf. message_end
 // carries one turn's authoritative text; without this, replacing buf
@@ -37,6 +71,7 @@ function setStatus(s: string) {
 async function boot() {
   setTag("quickbar");
   const c = await config.get().catch(() => null);
+  parseHotkey((c as any)?.quickbar_hotkey ?? "Super+J");
   cwd = c?.last_cwd || c?.default_dir || "";
   setMediaBase(cwd);
   // Size follows content, always: observe instead of trusting call sites.
@@ -46,13 +81,20 @@ async function boot() {
   try {
     new ResizeObserver(() => {
       if (fitT) window.clearTimeout(fitT);
-      fitT = window.setTimeout(autofit, 150);
+      fitT = window.setTimeout(autofit, 80);
     }).observe($("qbwrap"));
   } catch { /* ignore */ }
   // Fresh session per open: showing the popup after a hide starts a new
   // session and clears the UI. Asks while open share one session.
   try {
     await listen("quickbar-shown", () => {
+      shownAt = Date.now();
+      // Hotkey may have been rebound in Settings since boot.
+      config.get().then((cc) => parseHotkey((cc as any)?.quickbar_hotkey ?? "Super+J")).catch(() => {});
+      // Appear in the same place every time, immediately — the reset
+      // below awaits network first and must not delay positioning.
+      try { getCurrentWindow().center?.()?.catch(() => {}); } catch { /* ignore */ }
+      autofit();
       // Unconditional: toggle means new session. A stale `busy` flag must
       // never veto this (a run that never settled would stick it forever).
       freshSession();
@@ -76,6 +118,22 @@ async function boot() {
   freshSession().catch(() => {});
 
   inp.addEventListener("keydown", async (e) => {
+    // The toggle hotkey itself can leak into this input (both directions:
+    // showing focuses us mid-keystroke, hiding lags a beat behind the
+    // key). Swallow it — the chord means nothing in a text field.
+    // Chord-held: also hide instantly (qb_hide_self), so repeats land
+    // nowhere and the stale backend toggle is dropped, not re-shown.
+    if (hotChordHeld(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      invoke("qb_hide_self").catch(() => {});
+      return;
+    }
+    if (isHotkeyLeak(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (e.key === "Enter") {
       e.preventDefault();
       ask();
@@ -199,6 +257,9 @@ function route(rec: any) {
       autofit();
     } else if (ev.type === "toolcall_start") {
       ($("qbstatus") as HTMLElement).innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
+      // Dots grow the content: fit now, not on the observer debounce,
+      // or the window trails a beat behind.
+      autofit();
     }
     return;
   }
@@ -249,10 +310,14 @@ function done() {
 }
 
 // Shrink/grow the popup to its content so no black void ever shows.
+// Re-centered on every fit: setSize anchors top-left, so growing in
+// place would walk the popup down the screen.
 async function autofit() {
   try {
+    const win = getCurrentWindow();
     const want = Math.min(Math.max($("qbwrap").scrollHeight + 4, 72), 620);
-    await getCurrentWindow().setSize(new LogicalSize(680, want));
+    await win.setSize(new LogicalSize(680, want));
+    await win.center?.();
 
   } catch (e) {
     // Visible in `tauri dev` terminal: silent failure = permanent big box.

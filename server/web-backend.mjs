@@ -596,6 +596,7 @@ const handlers = {
   toggle_main: () => null,
   show_window: () => null,
   hide_window: () => null,
+  qb_hide_self: () => null,
   open_in_main: () => null,
   pick_dir: () => null,
 };

@@ -416,6 +416,7 @@ figure.media.broken { border: 1px dashed var(--border); border-radius: 12px; pad
 /* quickbar popup: trying real transparency + radius (works if WebKit honors
    the RGBA visual in software mode; black corners = it doesn't). */
 body.qb { background: var(--surface); }
+html:has(> body.qb) { background: var(--surface); }
 #qbwrap { background: var(--surface); border: none; border-radius: 16px; padding: 12px; overflow: hidden; }
 #qbinput { width: 100%; font-size: 14.5px; padding: 8px 4px; background: transparent; border: none; }
 #qbanswer { font-size: 14px; line-height: 1.7; }

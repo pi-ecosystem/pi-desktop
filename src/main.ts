@@ -3819,6 +3819,7 @@ async function openSettings() {
   const c = await config.get();
   ($("cfg-quick") as HTMLInputElement).value = c.quickbar_hotkey;
   ($("cfg-main") as HTMLInputElement).value = c.main_hotkey;
+  parseHotChords(c.quickbar_hotkey, c.main_hotkey);
   ($("cfg-dir") as HTMLInputElement).value = c.default_dir;
   ($("cfg-bg") as HTMLInputElement).checked = c.run_in_bg !== false;
   $("cfgerr").textContent = "";
@@ -3827,11 +3828,45 @@ async function openSettings() {
 
 // ---- boot ----
 
+// Toggle-chord swallow: Super+J / Super+Shift+J can leak a keypress
+// into whatever input holds focus (both toggle directions race focus
+// changes). Swallow the chord anywhere — it means nothing in a text
+// field, and the backend owns the toggle. Parsed from config
+// (rebindable); modifier-free "j" is NEVER swallowed here, it's
+// indistinguishable from real typing in this window.
+const hotChords: { key: string; mods: string[] }[] = [];
+function parseHotChords(qb: unknown, main: unknown): void {
+  hotChords.length = 0;
+  for (const spec of [qb, main]) {
+    const parts = String(spec ?? "").split("+").map((s) => s.trim()).filter(Boolean);
+    const key = parts.pop();
+    if (!key) continue;
+    hotChords.push({ key: key.toLowerCase(), mods: parts.map((p) => p.toLowerCase()) });
+  }
+}
+function chordHeld(c: { key: string; mods: string[] }, e: KeyboardEvent): boolean {
+  if (e.key.toLowerCase() !== c.key) return false;
+  if (!c.mods.length) return true;
+  return c.mods.some((m) =>
+    (m === "super" || m === "meta" || m === "cmd" || m === "win") ? e.metaKey
+    : (m === "ctrl" || m === "control") ? e.ctrlKey
+    : m === "shift" ? e.shiftKey
+    : (m === "alt" || m === "opt") ? e.altKey : false);
+}
+parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines below
+
   // Hover toolbars: copy message text, speak it, or revert (fork) at a user
   // message. Queued-message edit/steer live on the queue bar (pi's data),
   // not on bubbles. Sending after a revert forks a branch (shows
   // "No summary" in pi's tree view until pi summarizes the abandoned
   // branch).
+  // Capture phase: kill the toggle chord before any input sees it.
+  document.addEventListener("keydown", (e) => {
+    if (hotChords.some((c) => chordHeld(c, e as KeyboardEvent))) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
   document.addEventListener("click", async (e) => {
     const rv = (e.target as HTMLElement).closest?.(".act-revert") as HTMLButtonElement | null;
     if (rv?.dataset.entry) {
@@ -4325,6 +4360,9 @@ window.addEventListener("DOMContentLoaded", async () => {
         run_in_bg: ($("cfg-bg") as HTMLInputElement).checked,
       });
       $("settingsmodal").classList.add("hidden");
+      parseHotChords(
+        ($("cfg-quick") as HTMLInputElement).value.trim(),
+        ($("cfg-main") as HTMLInputElement).value.trim());
     } catch (e: any) {
       $("cfgerr").textContent = `save failed: ${e.message ?? e}`;
     }
