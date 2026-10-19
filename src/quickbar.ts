@@ -2,6 +2,7 @@
 // streams inline, copy + open-in-sessions. Esc hides.
 
 import { invoke } from "./tauri-shim";
+import { ensureServerBackend } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { LogicalSize, getCurrentWindow } from "./tauri-window-shim";
 import { config, ensure, onRecord, pi, setKey, setTag, stopChild } from "./pi";
@@ -70,6 +71,17 @@ function setStatus(s: string) {
 
 async function boot() {
   setTag("quickbar");
+  // Android (APK): wait for the Termux backend like the main window does.
+  // Quickbar loads in parallel with main — without this it fires fetches
+  // before Termux is up and every first action fails. No-op elsewhere.
+  try {
+    await ensureServerBackend();
+  } catch (e: any) {
+    const a = $("qbanswer");
+    a.classList.remove("hidden");
+    a.innerHTML = renderMd(`backend: ${e.message ?? e}`);
+    return;
+  }
   const c = await config.get().catch(() => null);
   parseHotkey((c as any)?.quickbar_hotkey ?? "Super+J");
   cwd = c?.last_cwd || c?.default_dir || "";
