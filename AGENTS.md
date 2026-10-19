@@ -51,6 +51,19 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
 - Dev servers (vite `:1422`/`:1420`, backend `:1423`) + `pi --mode rpc` children linger after crashes. Reap by exact PID, verify with `ps`.
 - Stale pi children carry `PI_DESKTOP_CHILD=1` in environ; backends reap ppid-1 orphans on boot (Linux).
 
+## Android (APK boots Termux backend)
+
+- Build: `npx tauri android build --apk --target aarch64` with
+  `ANDROID_HOME=~/Android/Sdk NDK_HOME=~/.android/ndk/android-ndk-r27c
+  JAVA_HOME=/usr/lib/jvm/java-17-openjdk` (Gradle fails on newer JDKs).
+  Sign with apksigner + `~/.android/debug.keystore` (pass `android`).
+- `src-tauri/gen/` is gitignored. After any fresh `tauri android init`,
+  re-apply: `<queries>` for `com.termux` + `com.termux.api` in
+  `gen/android/app/src/main/AndroidManifest.xml` (else the boot plugin
+  always reports Termux missing on Android 11+).
+- Debug on-device: `adb logcat`, screenshots via
+  `adb exec-out screencap -p` (readable as images here).
+
 ## Contributions
 
 - Do not commit or push unless asked. No `Co-Authored-By` lines.
