@@ -2,6 +2,7 @@
 // settings (hotkeys). Thin view over pi RPC — pi owns everything.
 
 import { invoke } from "./tauri-shim";
+import { ensureServerBackend } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { getCurrentWindow, getCurrentWebview } from "./tauri-window-shim";
 import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
@@ -4277,6 +4278,15 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
 window.addEventListener("DOMContentLoaded", async () => {
   trapErrors();
   setTag("main");
+  // Android (APK): the backend lives in Termux — boot it over
+  // RUN_COMMAND and wait for localhost before binding anything.
+  // No-op on desktop and in browser dev.
+  try {
+    await ensureServerBackend();
+  } catch (e: any) {
+    toastErr(`backend: ${e.message ?? e}`);
+    return;
+  }
   // Background run lifecycle -> sidebar dots (viewed session is driven
   // by run events directly; this covers everything else).
   onRunStatus((st) => {

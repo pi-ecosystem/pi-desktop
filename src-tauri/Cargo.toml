@@ -24,6 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 tauri-plugin-dialog = "2"
+tauri-plugin-termux-boot = { path = "plugins/termux-boot" }
 dirs = "7.0.0"
 libc = "0.2"
 axum = "0.8"

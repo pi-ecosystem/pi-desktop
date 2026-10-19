@@ -1632,6 +1632,10 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Termux boot (Android): fires RUN_COMMAND at Termux to start the
+        // --server backend, then the frontend talks to it over localhost.
+        // Desktop stub always errors / reports unavailable — harmless.
+        .plugin(tauri_plugin_termux_boot::init())
         .manage(backend)
         .setup(move |app| {
             // Bridge: forwarded pi records fan out over the broadcast;

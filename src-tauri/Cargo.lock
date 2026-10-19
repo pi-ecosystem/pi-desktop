@@ -2788,6 +2788,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tauri-plugin-termux-boot",
  "tokio",
  "tokio-stream",
  "zip",
@@ -3992,6 +3993,16 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-termux-boot"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
