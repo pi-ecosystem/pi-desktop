@@ -4854,6 +4854,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   ($("modelbtn") as HTMLButtonElement).addEventListener("click", (e) => {
     e.stopPropagation();
+    toastErr("DBG modelbtn tap");
     const opening = $("modellist").classList.contains("hidden");
     closeDrops();
     if (opening) {
