@@ -4410,7 +4410,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const root = document.documentElement.style;
     if (typeof ins?.top === "number" && ins.top > 0) root.setProperty("--sat", `${ins.top}px`);
     if (typeof ins?.bottom === "number" && ins.bottom > 0) root.setProperty("--sab", `${ins.bottom}px`);
-  } catch { /* desktop or old backend: CSS env() fallback applies */ }
+  } catch (e) { console.warn("[insets] unavailable:", String((e as any)?.message ?? e)); }
   // Android (APK): the backend lives in Termux — boot it over
   // RUN_COMMAND and wait for localhost before binding anything.
   // No-op on desktop and in browser dev.
