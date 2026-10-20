@@ -4434,16 +4434,6 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
 window.addEventListener("DOMContentLoaded", async () => {
   trapErrors();
   setTag("main");
-  // Edge-to-edge insets for old WebViews: env(safe-area-inset-*) reads 0
-  // on pre-Chrome-117, so pull the real system-bar heights natively and
-  // expose them as --sat/--sab (CSS falls back to env() when unset).
-  // No-op off-device (desktop IPC has no termux-boot plugin command).
-  try {
-    const ins = await invoke<{ top: number; bottom: number }>("plugin:termux-boot|insets", {});
-    const root = document.documentElement.style;
-    if (typeof ins?.top === "number" && ins.top > 0) root.setProperty("--sat", `${ins.top}px`);
-    if (typeof ins?.bottom === "number" && ins.bottom > 0) root.setProperty("--sab", `${ins.bottom}px`);
-  } catch (e) { console.warn("[insets] unavailable:", String((e as any)?.message ?? e)); }
   // Android (APK): the backend lives in Termux — boot it over
   // RUN_COMMAND and wait for localhost before binding anything.
   // No-op on desktop and in browser dev.
@@ -4538,32 +4528,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       vv.addEventListener("scroll", liftComposer);
     }
   } catch { /* old webviews: no-op */ }
-  // Old WebViews (pre-Chrome-116ish) never shrink visualViewport for the
-  // keyboard, so the lift above never fires there. Fall back to the
-  // native IME height on focus (polled: the keyboard animates in after
-  // focus), cleared on blur. Device px -> CSS px via devicePixelRatio.
-  // Touch devices only; desktop keeps native behavior.
-  if (navigator.maxTouchPoints > 0) {
-    let imeTimer: number | null = null;
-    inp.addEventListener("focus", () => {
-      const applyNative = async (tries = 0): Promise<void> => {
-        try {
-          const ins = await invoke<{ ime?: number }>("plugin:termux-boot|insets", {});
-          const kb = (Number(ins?.ime) || 0) / (window.devicePixelRatio || 1);
-          if (kb > 0) {
-            ($("composer") as HTMLElement).style.transform = `translateY(${-kb}px)`;
-            return;
-          }
-        } catch { /* desktop/dev: vv path (above) owns this */ }
-        if (tries < 8) imeTimer = window.setTimeout(() => void applyNative(tries + 1), 200);
-      };
-      void applyNative();
-    });
-    inp.addEventListener("blur", () => {
-      if (imeTimer !== null) { window.clearTimeout(imeTimer); imeTimer = null; }
-      ($("composer") as HTMLElement).style.transform = "";
-    });
-  }
   inp.addEventListener("paste", (e) => {
     const files = e.clipboardData?.files;
     if (files?.length) addFiles(files);

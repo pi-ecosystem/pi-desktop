@@ -6,7 +6,6 @@ Default permissions for the plugin
 
 - `allow-termux-available`
 - `allow-boot-server`
-- `allow-insets`
 
 ## Permission Table
 
@@ -39,32 +38,6 @@ Enables the boot-server command without any pre-configured scope.
 <td>
 
 Denies the boot-server command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`termux-boot:allow-insets`
-
-</td>
-<td>
-
-Enables the insets command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`termux-boot:deny-insets`
-
-</td>
-<td>
-
-Denies the insets command without any pre-configured scope.
 
 </td>
 </tr>
