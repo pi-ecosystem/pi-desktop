@@ -327,6 +327,18 @@ impl AppState {
     // resolved path down; an explicit PI_BIN override passes through
     // unchanged (pi_bin() returns it first).
     cmd.env("PI_BIN", &bin);
+    // Termux: an npm-installed `pi` is a symlink to cli.js with a
+    // `#!/usr/bin/env node` shebang — env(1) resolves node via PATH, but
+    // RUN_COMMAND background services get a minimal PATH without
+    // $PREFIX/bin, so exec fails ENOENT even with the absolute pi path.
+    // Hand a working PATH down (also benefits everything pi spawns).
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        let termux_bin = format!("{prefix}/bin");
+        if std::path::Path::new(&termux_bin).is_dir() {
+            let path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{termux_bin}:{path}"));
+        }
+    }
     cmd.arg("--mode")
         .arg("rpc")
         .current_dir(&cwd)
