@@ -233,11 +233,25 @@ fn session_root_default() -> String {
 // Launched from a terminal, `pi` is on PATH. Launched from the KDE
 // launcher it is NOT (~/.pi/agent/bin is shell-only). So resolve it:
 // explicit PI_BIN first, then well-known locations, then PATH lookup.
+// Termux (Android) also has a minimal-PATH problem: RUN_COMMAND
+// background services don't carry $PREFIX/bin, so bare "pi" fails
+// there although the interactive shell finds it at $PREFIX/bin/pi.
 fn pi_bin() -> String {
     if let Ok(v) = std::env::var("PI_BIN") {
         if !v.is_empty() {
             return v;
         }
+    }
+    // PREFIX is set in every Termux process, including RUN_COMMAND services.
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        let p = std::path::PathBuf::from(prefix).join("bin/pi");
+        if p.is_file() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    // Same path hardcoded, for Termux services launched without PREFIX.
+    if std::path::Path::new("/data/data/com.termux/files/usr/bin/pi").is_file() {
+        return "/data/data/com.termux/files/usr/bin/pi".to_string();
     }
     if let Some(home) = dirs::home_dir() {
         for sub in [".pi/agent/bin/pi", ".local/bin/pi"] {
