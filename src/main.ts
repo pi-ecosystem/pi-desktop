@@ -4538,6 +4538,32 @@ window.addEventListener("DOMContentLoaded", async () => {
       vv.addEventListener("scroll", liftComposer);
     }
   } catch { /* old webviews: no-op */ }
+  // Old WebViews (pre-Chrome-116ish) never shrink visualViewport for the
+  // keyboard, so the lift above never fires there. Fall back to the
+  // native IME height on focus (polled: the keyboard animates in after
+  // focus), cleared on blur. Device px -> CSS px via devicePixelRatio.
+  // Touch devices only; desktop keeps native behavior.
+  if (navigator.maxTouchPoints > 0) {
+    let imeTimer: number | null = null;
+    inp.addEventListener("focus", () => {
+      const applyNative = async (tries = 0): Promise<void> => {
+        try {
+          const ins = await invoke<{ ime?: number }>("plugin:termux-boot|insets", {});
+          const kb = (Number(ins?.ime) || 0) / (window.devicePixelRatio || 1);
+          if (kb > 0) {
+            ($("composer") as HTMLElement).style.transform = `translateY(${-kb}px)`;
+            return;
+          }
+        } catch { /* desktop/dev: vv path (above) owns this */ }
+        if (tries < 8) imeTimer = window.setTimeout(() => void applyNative(tries + 1), 200);
+      };
+      void applyNative();
+    });
+    inp.addEventListener("blur", () => {
+      if (imeTimer !== null) { window.clearTimeout(imeTimer); imeTimer = null; }
+      ($("composer") as HTMLElement).style.transform = "";
+    });
+  }
   inp.addEventListener("paste", (e) => {
     const files = e.clipboardData?.files;
     if (files?.length) addFiles(files);

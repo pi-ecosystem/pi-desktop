@@ -51,29 +51,37 @@ class TermuxBootPlugin(private val activity: Activity) : Plugin(activity) {
     invoke.resolve(res)
   }
 
-  // System-bar insets in px (status + navigation). Old WebViews report
+  // System-bar insets in px (status + navigation) plus the open keyboard
+  // height (ime, 0 when closed). Old WebViews report
   // env(safe-area-inset-*) as 0 even when the activity is edge-to-edge,
-  // so the frontend reads the real values here and sets --sat/--sab.
-  // Framework APIs only (the plugin module has no androidx dependency).
+  // and never shrink visualViewport for the keyboard under adjustNothing
+  // (modern Chromium does) — so the frontend reads the real values here
+  // and sets --sat/--sab / lifts the composer. Framework APIs only (the
+  // plugin module has no androidx dependency).
   @Command
   fun insets(invoke: Invoke) {
     try {
       val decor = activity.window?.decorView
       var top = 0
       var bottom = 0
+      var ime = 0
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        val w = decor?.rootWindowInsets?.getInsets(android.view.WindowInsets.Type.systemBars())
-        top = w?.top ?: 0
-        bottom = w?.bottom ?: 0
+        val root = decor?.rootWindowInsets
+        val sys = root?.getInsets(android.view.WindowInsets.Type.systemBars())
+        top = sys?.top ?: 0
+        bottom = sys?.bottom ?: 0
+        ime = root?.getInsets(android.view.WindowInsets.Type.ime())?.bottom ?: 0
       } else {
         @Suppress("DEPRECATION")
         val w = decor?.rootWindowInsets
         top = w?.systemWindowInsetTop ?: 0
         bottom = w?.systemWindowInsetBottom ?: 0
+        ime = 0
       }
       val res = JSObject()
       res.put("top", top)
       res.put("bottom", bottom)
+      res.put("ime", ime)
       invoke.resolve(res)
     } catch (e: Exception) {
       invoke.reject(e.message ?: "insets unavailable")
