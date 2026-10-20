@@ -3115,7 +3115,13 @@ function menuPick(list: HTMLElement): void {
 // options. Touch users tap an option directly, or tap the search field
 // itself when they want to filter.
 function focusSearch(el: HTMLInputElement): void {
-  if (!window.matchMedia("(hover: none)").matches) el.focus();
+  // Touch-first devices: focusing pops the keyboard over the just-opened
+  // menu (adjustNothing: the view never shrinks). Media queries can't be
+  // trusted here (VMs report hover-capable mice that don't exist), so gate
+  // on real touch hardware. Touch users tap an option directly, or tap the
+  // search field itself when they want to filter.
+  if (navigator.maxTouchPoints > 0) return;
+  el.focus();
 }
 
 function closeDrops() {
