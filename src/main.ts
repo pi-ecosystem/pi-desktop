@@ -3124,6 +3124,22 @@ function focusSearch(el: HTMLInputElement): void {
   el.focus();
 }
 
+// Mobile: the dropdown lists live inside the horizontally scrolling
+// .ctools row. overflow-x:auto forces overflow-y into auto as well, which
+// clips the upward-opening menus entirely. Pop them to <body> with fixed
+// positioning on open (desktop keeps the CSS-anchored absolute lists).
+function popMenu(list: HTMLElement, btn: HTMLElement): void {
+  if (!window.matchMedia("(max-width: 768px)").matches) return;
+  const r = btn.getBoundingClientRect();
+  document.body.appendChild(list);
+  list.style.position = "fixed";
+  list.style.bottom = `${Math.max(8, window.innerHeight - r.top + 6)}px`;
+  list.style.left = `${Math.min(Math.max(8, r.left), window.innerWidth - 268)}px`;
+  list.style.right = "auto";
+  list.style.width = "min(260px, calc(100vw - 16px))";
+  list.style.zIndex = "90";
+}
+
 function closeDrops() {
   hideSessMenu();
   $("modellist").classList.add("hidden");
@@ -3358,6 +3374,7 @@ async function runLocalCmd(text: string): Promise<boolean> {
     syncSendBtn();
     closeDrops();
     $("modellist").classList.remove("hidden");
+    popMenu($("modellist"), $("modelbtn"));
     ($("modelbtn") as HTMLButtonElement).classList.add("open");
     renderModelOpts();
     focusSearch($("modeltype") as HTMLInputElement);
@@ -3369,6 +3386,7 @@ async function runLocalCmd(text: string): Promise<boolean> {
     syncSendBtn();
     closeDrops();
     $("thinklist").classList.remove("hidden");
+    popMenu($("thinklist"), $("thinkbtn"));
     ($("thinkbtn") as HTMLButtonElement).classList.add("open");
     renderThinkOpts();
     focusSearch($("thinktype") as HTMLInputElement);
@@ -4834,6 +4852,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     closeDrops();
     if (opening) {
       $("dirlist").classList.remove("hidden");
+      popMenu($("dirlist"), $("dirbtn"));
       ($("dirbtn") as HTMLButtonElement).classList.add("open");
       renderDirRecents();
       focusSearch($("dirtype") as HTMLInputElement);
@@ -4873,6 +4892,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     closeDrops();
     if (opening) {
       $("modellist").classList.remove("hidden");
+      popMenu($("modellist"), $("modelbtn"));
       ($("modelbtn") as HTMLButtonElement).classList.add("open");
       renderModelOpts();
       focusSearch($("modeltype") as HTMLInputElement);
@@ -4898,6 +4918,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     closeDrops();
     if (opening) {
       $("thinklist").classList.remove("hidden");
+      popMenu($("thinklist"), $("thinkbtn"));
       ($("thinkbtn") as HTMLButtonElement).classList.add("open");
       renderThinkOpts();
       focusSearch($("thinktype") as HTMLInputElement);
