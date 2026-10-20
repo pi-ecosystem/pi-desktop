@@ -4189,7 +4189,7 @@ function baseName(p: string): string {
 
 let cwdGen = 0;
 
-async function setCwd(next: string, save = true) {
+async function setCwd(next: string, save = true, resume = true) {
   const gen = ++cwdGen;
   cwd = next;
   setMediaBase(next);
@@ -4200,7 +4200,7 @@ async function setCwd(next: string, save = true) {
   try {
     const files = await sessions.list(cwd).catch(() => []);
     if (gen !== cwdGen) return;
-    if (files.length) {
+    if (files.length && resume) {
       // Continue the most recent session in its own child — reattaching
       // to a live proc when one already serves it (see switchSession).
       const f = files[0].path;
@@ -4995,5 +4995,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   }).catch(() => {});
 
   const c = await config.get();
-  await setCwd(c.last_cwd || c.default_dir, false);
+  // Mobile (detached Termux backend): open on a fresh chat instead of
+  // resuming the last session — a phone open is a new glance, and the
+  // old transcript stays one tap away in the sidebar. Desktop keeps
+  // resume-where-you-left-off.
+  await setCwd(c.last_cwd || c.default_dir, false, !isServerMode);
 });
