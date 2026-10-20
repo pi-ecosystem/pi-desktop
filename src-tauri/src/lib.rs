@@ -316,9 +316,11 @@ impl AppState {
     fs::create_dir_all(&cwd).map_err(|e| format!("cannot use working dir '{cwd}': {e}"))?;
 
     let bin = pi_bin();
-    let mut cmd = Command::new(&bin);
     // Marker for boot-time orphan reaping (see reap_stale_children):
     // survives in /proc/<pid>/environ, invisible everywhere else.
+    // (Program selection below may replace a script shim with its
+    // interpreter; PI_BIN still reports the canonical entry point.)
+    let mut cmd = Command::new(&bin);
     cmd.env("PI_DESKTOP_CHILD", "1");
     // Grandchildren (pi-spawn subagents) exec `process.env.PI_BIN || "pi"`:
     // a bare "pi" relies on PATH, which is minimal under a KDE-launched
@@ -327,19 +329,14 @@ impl AppState {
     // resolved path down; an explicit PI_BIN override passes through
     // unchanged (pi_bin() returns it first).
     cmd.env("PI_BIN", &bin);
-    // Termux: an npm-installed `pi` is a symlink to cli.js with a
-    // `#!/usr/bin/env node` shebang — env(1) resolves node via PATH, but
-    // RUN_COMMAND background services get a minimal PATH without
-    // $PREFIX/bin, so exec fails ENOENT even with the absolute pi path.
-    // Hand a working PATH down (also benefits everything pi spawns).
-    // PREFIX is normally set in every Termux process; fall back to the
-    // hardcoded prefix for services launched without it.
-    //
-    // That alone is still not enough: Termux has no /usr/bin — the
-    // shebang only resolves through libtermux-exec (LD_PRELOAD), which
-    // login shells set up but background services do not. Export both
-    // so the pi child (and everything it spawns) behaves exactly like
-    // it was launched from an interactive Termux shell.
+    // Termux service environments (RUN_COMMAND background) are bare:
+    // minimal PATH, no PREFIX, no exec-interception. An npm-installed
+    // `pi` is a symlink to cli.js with a `#!/usr/bin/env node` shebang,
+    // and Termux has no /usr/bin — the shebang only resolves through
+    // libtermux-exec, which login shells preload but services do not.
+    // So: run script shims through node directly (no kernel shebang
+    // lookup at all), and export a full Termux env for everything the
+    // child and its descendants exec from here on.
     let termux_prefix = std::env::var("PREFIX").ok().filter(|p| !p.is_empty()).or_else(|| {
         let hard = "/data/data/com.termux/files/usr";
         if std::path::Path::new(&format!("{hard}/bin")).is_dir() {
@@ -349,6 +346,24 @@ impl AppState {
         }
     });
     if let Some(prefix) = termux_prefix {
+        // Script shim (symlink or .js) with a node shebang: bypass it.
+        let canon = fs::canonicalize(&bin).unwrap_or_else(|_| std::path::PathBuf::from(&bin));
+        let is_node_script = canon.extension().and_then(|e| e.to_str()) == Some("js")
+            && fs::read_to_string(&canon)
+                .map(|head| head.bytes().take(200).collect::<Vec<_>>())
+                .ok()
+                .and_then(|h| String::from_utf8(h).ok())
+                .map(|s| s.lines().next().map(|l| l.contains("node")).unwrap_or(false))
+                .unwrap_or(false);
+        if is_node_script {
+            let node = format!("{prefix}/bin/node");
+            if std::path::Path::new(&node).is_file() {
+                cmd = Command::new(&node);
+                cmd.env("PI_DESKTOP_CHILD", "1");
+                cmd.env("PI_BIN", &bin);
+                cmd.arg(&canon);
+            }
+        }
         let termux_bin = format!("{prefix}/bin");
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{termux_bin}:{path}"));
