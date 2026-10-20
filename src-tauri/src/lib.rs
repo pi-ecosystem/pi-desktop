@@ -472,6 +472,9 @@ struct SessionInfo {
     path: String,
     id: String,
     timestamp: String,
+    /// Last activity: file mtime (every message append bumps it), so the
+    /// sidebar sorts and stamps by latest message, not session creation.
+    updated: String,
     cwd: String,
     name: Option<String>,
     preview: Option<String>,
@@ -617,17 +620,27 @@ fn list_sessions(cwd_filter: Option<String>, session_root: Option<String>) -> Re
             let timestamp = head.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let name = scan_name(&tail_win);
             let preview = scan_preview(&preview_win);
+            // Last activity = file mtime: every message (mine or agent's)
+            // appends, so a reply in an old session bumps it to the top.
+            // Falls back to creation time when the clock can't be read.
+            let updated = f.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| timestamp.clone());
             out.push(SessionInfo {
                 path: p.to_string_lossy().into_owned(),
                 id,
                 timestamp,
+                updated,
                 cwd,
                 name,
                 preview,
             });
         }
     }
-    out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    out.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| b.timestamp.cmp(&a.timestamp)));
     Ok(out)
 }
 

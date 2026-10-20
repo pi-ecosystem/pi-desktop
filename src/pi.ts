@@ -211,6 +211,7 @@ export interface SessionInfo {
   path: string;
   id: string;
   timestamp: string;
+  updated: string | null;
   cwd: string;
   name: string | null;
   preview: string | null;

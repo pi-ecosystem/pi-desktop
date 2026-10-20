@@ -2369,6 +2369,7 @@ async function refreshSessions() {
           path: f ?? "",
           id: s?.sessionId ?? "",
           timestamp: new Date(pendingSend.at).toISOString(),
+          updated: new Date(pendingSend.at).toISOString(),
           cwd,
           name: pendingSend.title,
           preview: null,
@@ -2426,7 +2427,7 @@ async function refreshSessions() {
     // Live sessions are exempt: pi buffers file writes, so a running
     // chat's file can momentarily lack its user text.
     if (!s.name && !s.preview && runLive.get(s.path) !== true) continue;
-    const label = `${s.name ?? ""} ${s.id.slice(0, 8)} ${s.timestamp}`.toLowerCase();
+    const label = `${s.name ?? ""} ${s.id.slice(0, 8)} ${s.timestamp} ${s.updated ?? ""}`.toLowerCase();
     if (f && !label.includes(f)) continue;
     const d = el(
       "div",
@@ -2597,7 +2598,14 @@ function subText(s: SessionInfo): string {
   return stamp(s);
 }
 function stamp(s: SessionInfo): string {
-  return s.timestamp.replace("T", " ").slice(0, 19);
+  // Backend stamps are UTC ISO; render in the viewer's local timezone.
+  const iso = s.updated ?? s.timestamp;
+  const d = new Date(iso);
+  if (!isNaN(d.getTime())) {
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  return (s.timestamp ?? "").replace("T", " ").slice(0, 19);
 }
 
 // Activity auto-collapse: only the newest container stays open. A manual
