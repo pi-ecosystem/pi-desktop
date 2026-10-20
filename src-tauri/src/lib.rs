@@ -334,12 +334,29 @@ impl AppState {
     // Hand a working PATH down (also benefits everything pi spawns).
     // PREFIX is normally set in every Termux process; fall back to the
     // hardcoded prefix for services launched without it.
-    let termux_bin = std::env::var("PREFIX")
-        .map(|p| format!("{p}/bin"))
-        .unwrap_or_else(|_| "/data/data/com.termux/files/usr/bin".to_string());
-    if std::path::Path::new(&termux_bin).is_dir() {
+    //
+    // That alone is still not enough: Termux has no /usr/bin — the
+    // shebang only resolves through libtermux-exec (LD_PRELOAD), which
+    // login shells set up but background services do not. Export both
+    // so the pi child (and everything it spawns) behaves exactly like
+    // it was launched from an interactive Termux shell.
+    let termux_prefix = std::env::var("PREFIX").ok().filter(|p| !p.is_empty()).or_else(|| {
+        let hard = "/data/data/com.termux/files/usr";
+        if std::path::Path::new(&format!("{hard}/bin")).is_dir() {
+            Some(hard.to_string())
+        } else {
+            None
+        }
+    });
+    if let Some(prefix) = termux_prefix {
+        let termux_bin = format!("{prefix}/bin");
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{termux_bin}:{path}"));
+        cmd.env("PREFIX", &prefix);
+        let exec_so = format!("{prefix}/lib/libtermux-exec.so");
+        if std::path::Path::new(&exec_so).is_file() {
+            cmd.env("LD_PRELOAD", &exec_so);
+        }
     }
     cmd.arg("--mode")
         .arg("rpc")
