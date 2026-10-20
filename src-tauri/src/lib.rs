@@ -332,12 +332,14 @@ impl AppState {
     // RUN_COMMAND background services get a minimal PATH without
     // $PREFIX/bin, so exec fails ENOENT even with the absolute pi path.
     // Hand a working PATH down (also benefits everything pi spawns).
-    if let Ok(prefix) = std::env::var("PREFIX") {
-        let termux_bin = format!("{prefix}/bin");
-        if std::path::Path::new(&termux_bin).is_dir() {
-            let path = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{termux_bin}:{path}"));
-        }
+    // PREFIX is normally set in every Termux process; fall back to the
+    // hardcoded prefix for services launched without it.
+    let termux_bin = std::env::var("PREFIX")
+        .map(|p| format!("{p}/bin"))
+        .unwrap_or_else(|_| "/data/data/com.termux/files/usr/bin".to_string());
+    if std::path::Path::new(&termux_bin).is_dir() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{termux_bin}:{path}"));
     }
     cmd.arg("--mode")
         .arg("rpc")
