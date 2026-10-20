@@ -3115,7 +3115,7 @@ function menuPick(list: HTMLElement): void {
 // options. Touch users tap an option directly, or tap the search field
 // itself when they want to filter.
 function focusSearch(el: HTMLInputElement): void {
-  if (window.matchMedia("(pointer: fine)").matches) el.focus();
+  if (!window.matchMedia("(hover: none)").matches) el.focus();
 }
 
 function closeDrops() {
