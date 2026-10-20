@@ -29,7 +29,11 @@ export const isServerMode = serverBase !== null;
 // The termux-boot plugin commands live in the on-device backend even in
 // server mode — they must always go over IPC when available.
 function isBootCmd(cmd: string): boolean {
-  return cmd === "plugin:termux-boot|boot-server" || cmd === "plugin:termux-boot|termux-available";
+  return (
+    cmd === "plugin:termux-boot|boot-server" ||
+    cmd === "plugin:termux-boot|termux-available" ||
+    cmd === "plugin:termux-boot|insets"
+  );
 }
 
 export async function invoke<T>(cmd: string, args?: any): Promise<T> {
