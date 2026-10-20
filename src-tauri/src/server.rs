@@ -177,6 +177,17 @@ fn dispatch(
         // Window-only: no-ops in server mode (no windows to toggle).
         "toggle_quickbar" | "toggle_main" | "show_window" | "hide_window" | "qb_hide_self"
         | "open_in_main" | "pick_dir" | "pick_files" => Ok(serde_json::Value::Null),
+        // Explicit backend stop (Android settings UI). Delay exit so the
+        // {ok:true} response flushes first; the app re-boots on reopen.
+        "shutdown_server" => {
+            let st = be.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                st.kill_all();
+                std::process::exit(0);
+            });
+            Ok(serde_json::Value::Null)
+        }
         _ => Err(format!("unknown command: {cmd}")),
     }
 }

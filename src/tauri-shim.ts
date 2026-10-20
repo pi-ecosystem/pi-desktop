@@ -21,6 +21,11 @@ const serverBase: string | null =
 // "" → same-origin /api/... (browser dev mode via vite proxy).
 const apiBase = serverBase ?? "";
 
+// True when talking to a detached backend over HTTP (Android APK against
+// the Termux server, or browser dev with ?server=). Only there does the
+// backend outlive the UI — desktop IPC backends die with the app.
+export const isServerMode = serverBase !== null;
+
 // The termux-boot plugin commands live in the on-device backend even in
 // server mode — they must always go over IPC when available.
 function isBootCmd(cmd: string): boolean {

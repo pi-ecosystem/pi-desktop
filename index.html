@@ -135,6 +135,13 @@
         <label>Quick-bar hotkey <input id="cfg-quick" spellcheck="false" /></label>
         <label>Sessions hotkey <input id="cfg-main" spellcheck="false" /></label>
         <label>Default dir <input id="cfg-dir" spellcheck="false" /></label>
+        <div id="cfg-backend-row" class="hidden">
+          <span>Termux backend: <span id="cfg-backend-status">…</span></span>
+          <div class="modalbtns">
+            <button id="cfg-backend-stop">Stop server</button>
+            <button id="cfg-backend-restart">Restart server</button>
+          </div>
+        </div>
         <p class="hint">Format like <code>Super+J</code>, <code>Super+Shift+J</code>. In-app hotkeys may not fire on Wayland while another app is focused — add a KDE fallback: <br /><code>System Settings → Shortcuts → Custom → pi-desktop --toggle-quickbar</code></p>
         <p id="cfgerr" class="err"></p>
         <div class="modalbtns">

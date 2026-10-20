@@ -2,7 +2,7 @@
 // settings (hotkeys). Thin view over pi RPC — pi owns everything.
 
 import { invoke } from "./tauri-shim";
-import { ensureServerBackend } from "./tauri-shim";
+import { ensureServerBackend, isServerMode } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { getCurrentWindow, getCurrentWebview } from "./tauri-window-shim";
 import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
@@ -4293,7 +4293,25 @@ async function openSettings() {
   ($("cfg-dir") as HTMLInputElement).value = c.default_dir;
   ($("cfg-bg") as HTMLInputElement).checked = c.run_in_bg !== false;
   $("cfgerr").textContent = "";
+  // Detached-backend controls (Android/Termux server mode only — the
+  // desktop backend dies with the app, so there is nothing to stop).
+  if (isServerMode) {
+    $("cfg-backend-row").classList.remove("hidden");
+    await refreshBackendStatus();
+  } else {
+    $("cfg-backend-row").classList.add("hidden");
+  }
   $("settingsmodal").classList.remove("hidden");
+}
+
+async function refreshBackendStatus(): Promise<void> {
+  const el = $("cfg-backend-status");
+  try {
+    const snap = await runStates.snapshot();
+    el.textContent = `running${snap?.bootId ? ` (${snap.bootId.slice(0, 8)}…)` : ""}`;
+  } catch {
+    el.textContent = "unreachable";
+  }
 }
 
 // ---- boot ----
@@ -4918,6 +4936,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("settingsbtn") as HTMLButtonElement).addEventListener("click", openSettings);
+  ($("cfg-backend-stop") as HTMLButtonElement).addEventListener("click", async () => {
+    try {
+      await invoke("shutdown_server", {});
+      $("cfg-backend-status").textContent = "stopped — reopen the app to start it again";
+    } catch (e: any) {
+      $("cfgerr").textContent = `stop failed: ${e.message ?? e}`;
+    }
+  });
+  ($("cfg-backend-restart") as HTMLButtonElement).addEventListener("click", async () => {
+    try {
+      $("cfg-backend-status").textContent = "restarting…";
+      await invoke("shutdown_server", {}).catch(() => {});
+      await new Promise((r) => setTimeout(r, 2000));
+      await ensureServerBackend();
+      await refreshBackendStatus();
+    } catch (e: any) {
+      $("cfg-backend-status").textContent = "unreachable";
+      $("cfgerr").textContent = `restart failed: ${e.message ?? e}`;
+    }
+  });
   ($("cfgclose") as HTMLButtonElement).addEventListener("click", () =>
     $("settingsmodal").classList.add("hidden")
   );

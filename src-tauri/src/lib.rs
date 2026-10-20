@@ -1089,6 +1089,21 @@ fn read_session_messages(path: String, session_root: Option<String>, max_bytes: 
     Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more, "bytes": bytes }))
 }
 
+/// Stop the backend itself (Android/Termux only in practice: the server
+/// outlives the app there, so the UI needs an explicit stop). Kills
+/// supervised pi children, then exits after the response flushes.
+/// Reopening the app re-boots via RUN_COMMAND.
+#[tauri::command]
+fn shutdown_server(state: State<Arc<AppState>>) -> Result<(), String> {
+    let st = state.inner().clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        st.kill_all();
+        std::process::exit(0);
+    });
+    Ok(())
+}
+
 /// Run-lifecycle snapshot for sidebar status dots: {bootId, runs:
 /// Process liveness probe (kill(pid, 0): no signal sent). Lets the UI
 /// reconcile subagent rows orphaned by a crash/reboot: no completion
@@ -1801,6 +1816,7 @@ pub fn run() {
             open_in_main,
             pick_dir,
             pick_files,
+            shutdown_server,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
