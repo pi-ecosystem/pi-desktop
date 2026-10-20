@@ -8,6 +8,7 @@
     "core:event:default",
     "opener:default",
     "termux-boot:allow-termux-available",
-    "termux-boot:allow-boot-server"
+    "termux-boot:allow-boot-server",
+    "termux-boot:allow-insets"
   ]
 }

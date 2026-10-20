@@ -307,6 +307,18 @@
           "markdownDescription": "Denies the boot-server command without any pre-configured scope."
         },
         {
+          "description": "Enables the insets command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-insets",
+          "markdownDescription": "Enables the insets command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the insets command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-insets",
+          "markdownDescription": "Denies the insets command without any pre-configured scope."
+        },
+        {
           "description": "Enables the termux-available command without any pre-configured scope.",
           "type": "string",
           "const": "allow-termux-available",
@@ -319,10 +331,10 @@
           "markdownDescription": "Denies the termux-available command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-termux-available`\n- `allow-boot-server`",
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-termux-available`\n- `allow-boot-server`\n- `allow-insets`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-termux-available`\n- `allow-boot-server`"
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-termux-available`\n- `allow-boot-server`\n- `allow-insets`"
         }
       ]
     }

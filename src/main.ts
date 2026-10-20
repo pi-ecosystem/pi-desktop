@@ -4401,6 +4401,16 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
 window.addEventListener("DOMContentLoaded", async () => {
   trapErrors();
   setTag("main");
+  // Edge-to-edge insets for old WebViews: env(safe-area-inset-*) reads 0
+  // on pre-Chrome-117, so pull the real system-bar heights natively and
+  // expose them as --sat/--sab (CSS falls back to env() when unset).
+  // No-op off-device (desktop IPC has no termux-boot plugin command).
+  try {
+    const ins = await invoke<{ top: number; bottom: number }>("plugin:termux-boot|insets", {});
+    const root = document.documentElement.style;
+    if (typeof ins?.top === "number" && ins.top > 0) root.setProperty("--sat", `${ins.top}px`);
+    if (typeof ins?.bottom === "number" && ins.bottom > 0) root.setProperty("--sab", `${ins.bottom}px`);
+  } catch { /* desktop or old backend: CSS env() fallback applies */ }
   // Android (APK): the backend lives in Termux — boot it over
   // RUN_COMMAND and wait for localhost before binding anything.
   // No-op on desktop and in browser dev.

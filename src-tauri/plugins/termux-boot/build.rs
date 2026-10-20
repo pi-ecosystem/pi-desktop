@@ -1,4 +1,4 @@
-const COMMANDS: &[&str] = &["termux-available", "boot-server"];
+const COMMANDS: &[&str] = &["termux-available", "boot-server", "insets"];
 
 fn main() {
   tauri_plugin::Builder::new(COMMANDS)
