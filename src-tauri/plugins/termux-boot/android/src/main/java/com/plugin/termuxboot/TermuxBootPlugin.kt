@@ -13,8 +13,6 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 
 @InvokeArg
 class BootArgs {
@@ -56,15 +54,26 @@ class TermuxBootPlugin(private val activity: Activity) : Plugin(activity) {
   // System-bar insets in px (status + navigation). Old WebViews report
   // env(safe-area-inset-*) as 0 even when the activity is edge-to-edge,
   // so the frontend reads the real values here and sets --sat/--sab.
+  // Framework APIs only (the plugin module has no androidx dependency).
   @Command
   fun insets(invoke: Invoke) {
     try {
       val decor = activity.window?.decorView
-      val root = if (decor != null) ViewCompat.getRootWindowInsets(decor) else null
-      val sys = root?.getInsets(WindowInsetsCompat.Type.systemBars())
+      var top = 0
+      var bottom = 0
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val w = decor?.rootWindowInsets?.getInsets(android.view.WindowInsets.Type.systemBars())
+        top = w?.top ?: 0
+        bottom = w?.bottom ?: 0
+      } else {
+        @Suppress("DEPRECATION")
+        val w = decor?.rootWindowInsets
+        top = w?.systemWindowInsetTop ?: 0
+        bottom = w?.systemWindowInsetBottom ?: 0
+      }
       val res = JSObject()
-      res.put("top", sys?.top ?: 0)
-      res.put("bottom", sys?.bottom ?: 0)
+      res.put("top", top)
+      res.put("bottom", bottom)
       invoke.resolve(res)
     } catch (e: Exception) {
       invoke.reject(e.message ?: "insets unavailable")
