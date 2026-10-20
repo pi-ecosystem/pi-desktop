@@ -1,6 +1,7 @@
 // Sessions window: sidebar (dir + sessions), chat, model/thinking pickers,
 // settings (hotkeys). Thin view over pi RPC — pi owns everything.
 
+import "./compat";
 import { invoke } from "./tauri-shim";
 import { ensureServerBackend, isServerMode } from "./tauri-shim";
 import { listen } from "./tauri-shim";
