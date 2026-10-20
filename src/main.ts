@@ -3109,6 +3109,15 @@ function menuPick(list: HTMLElement): void {
   (hl ?? first)?.click();
 }
 
+// Autofocus a dropdown search field only where there is no touch
+// keyboard to fight: on touch, focus() pops the keyboard over the just
+// opened menu (adjustNothing: the view never shrinks), burying the
+// options. Touch users tap an option directly, or tap the search field
+// itself when they want to filter.
+function focusSearch(el: HTMLInputElement): void {
+  if (window.matchMedia("(pointer: fine)").matches) el.focus();
+}
+
 function closeDrops() {
   hideSessMenu();
   $("modellist").classList.add("hidden");
@@ -3345,7 +3354,7 @@ async function runLocalCmd(text: string): Promise<boolean> {
     $("modellist").classList.remove("hidden");
     ($("modelbtn") as HTMLButtonElement).classList.add("open");
     renderModelOpts();
-    ($("modeltype") as HTMLInputElement).focus();
+    focusSearch($("modeltype") as HTMLInputElement);
     return true;
   }
   if (name === "thinking") {
@@ -3356,7 +3365,7 @@ async function runLocalCmd(text: string): Promise<boolean> {
     $("thinklist").classList.remove("hidden");
     ($("thinkbtn") as HTMLButtonElement).classList.add("open");
     renderThinkOpts();
-    ($("thinktype") as HTMLInputElement).focus();
+    focusSearch($("thinktype") as HTMLInputElement);
     return true;
   }
   if (name === "reload") {
@@ -4821,7 +4830,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       $("dirlist").classList.remove("hidden");
       ($("dirbtn") as HTMLButtonElement).classList.add("open");
       renderDirRecents();
-      ($("dirtype") as HTMLInputElement).focus();
+      focusSearch($("dirtype") as HTMLInputElement);
     }
   });
   ($("dirlist") as HTMLElement).addEventListener("click", (e) => e.stopPropagation());
@@ -4854,14 +4863,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   ($("modelbtn") as HTMLButtonElement).addEventListener("click", (e) => {
     e.stopPropagation();
-    toastErr("DBG modelbtn tap");
     const opening = $("modellist").classList.contains("hidden");
     closeDrops();
     if (opening) {
       $("modellist").classList.remove("hidden");
       ($("modelbtn") as HTMLButtonElement).classList.add("open");
       renderModelOpts();
-      ($("modeltype") as HTMLInputElement).focus();
+      focusSearch($("modeltype") as HTMLInputElement);
     }
   });
   ($("modellist") as HTMLElement).addEventListener("click", (e) => e.stopPropagation());
@@ -4886,7 +4894,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       $("thinklist").classList.remove("hidden");
       ($("thinkbtn") as HTMLButtonElement).classList.add("open");
       renderThinkOpts();
-      ($("thinktype") as HTMLInputElement).focus();
+      focusSearch($("thinktype") as HTMLInputElement);
     }
   });
   ($("thinklist") as HTMLElement).addEventListener("click", (e) => e.stopPropagation());
