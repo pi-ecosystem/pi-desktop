@@ -2,10 +2,10 @@
 // streams inline, copy + open-in-sessions. Esc hides.
 
 import { invoke } from "./tauri-shim";
-import { ensureServerBackend } from "./tauri-shim";
+import { ensureServerBackend, isServerMode, sendShutdownBeacon } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { LogicalSize, getCurrentWindow } from "./tauri-window-shim";
-import { config, ensure, onRecord, pi, setKey, setTag, stopChild } from "./pi";
+import { config, ensure, onRecord, pi, recycleEvents, setKey, setTag, stopChild } from "./pi";
 import { renderMd, setMediaBase, clearMediaCache, wireCopy } from "./md";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -69,23 +69,61 @@ function setStatus(s: string) {
   $("qbstatus").textContent = s;
 }
 
-async function boot() {
-  setTag("quickbar");
-  // Android (APK): wait for the Termux backend like the main window does.
-  // Quickbar loads in parallel with main — without this it fires fetches
-  // before Termux is up and every first action fails. No-op elsewhere.
+// Backend boots in the background (see main.ts): the popup stays usable
+// while Termux is down, and tapping the error retries the boot.
+let qbBackendUp = false;
+let qbBooting = false;
+let qbBootDead = false;
+async function bootBackendQb(): Promise<void> {
+  if (qbBooting || qbBackendUp) return;
+  qbBooting = true;
   try {
+    // Android (APK): boot the Termux backend like the main window does.
+    // No-op elsewhere.
     await ensureServerBackend();
   } catch (e: any) {
+    qbBooting = false;
+    qbBootDead = true;
     const a = $("qbanswer");
     a.classList.remove("hidden");
-    a.innerHTML = renderMd(`backend: ${e.message ?? e}`);
+    a.innerHTML = renderMd(`backend: ${e.message ?? e} — tap here to retry`);
     return;
   }
-  const c = await config.get().catch(() => null);
-  parseHotkey((c as any)?.quickbar_hotkey ?? "Super+J");
-  cwd = c?.last_cwd || c?.default_dir || "";
-  setMediaBase(cwd);
+  qbBooting = false;
+  qbBackendUp = true;
+  qbBootDead = false;
+  const loadCfg = async () => {
+    const c = await config.get().catch(() => null);
+    parseHotkey((c as any)?.quickbar_hotkey ?? "Super+J");
+    cwd = c?.last_cwd || c?.default_dir || "";
+    setMediaBase(cwd);
+  };
+  try {
+    await loadCfg();
+  } catch {
+    // Same half-open channel suspicion as main window: fresh channel,
+    // one retry, then leave the tap-to-retry error up.
+    recycleEvents();
+    try {
+      await loadCfg();
+    } catch (e: any) {
+      qbBackendUp = false;
+      qbBootDead = true;
+      const a = $("qbanswer");
+      a.classList.remove("hidden");
+      a.innerHTML = renderMd(`backend: ${e.message ?? e} — tap here to retry`);
+    }
+  }
+}
+
+async function boot() {
+  setTag("quickbar");
+  // Android close: stop the Termux backend with the app (re-boots on open).
+  window.addEventListener("pagehide", () => { if (isServerMode) sendShutdownBeacon(); });
+  ($("qbanswer") as HTMLElement).addEventListener("click", () => {
+    if (qbBootDead) { qbBootDead = false; void bootBackendQb(); }
+  });
+  void bootBackendQb();
   // Size follows content, always: observe instead of trusting call sites.
   // ResizeObserver fires per streamed token: debounce or the window
   // resizes dozens of times per answer.

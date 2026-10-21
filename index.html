@@ -53,6 +53,7 @@
             <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="3" y="4" width="14" height="12" rx="2" stroke="currentColor" stroke-width="1.5"/><line x1="10" y1="4" x2="10" y2="16" stroke="currentColor" stroke-width="1.5"/></svg>
             <span id="panebadge" class="hidden"></span>
           </button>
+          <button id="backendpill" class="pillbtn hidden" title="Backend status — tap to retry"></button>
         </header>
         <div id="scrollwrap">
           <div id="msgs"></div>
@@ -131,9 +132,9 @@
     <div id="settingsmodal" class="hidden">
       <div class="modalcard">
         <h3>Settings <span id="appver" class="ver"></span></h3>
-        <label class="checkrow"><input type="checkbox" id="cfg-bg" /> Run in background with tray icon</label>
-        <label>Quick-bar hotkey <input id="cfg-quick" spellcheck="false" /></label>
-        <label>Sessions hotkey <input id="cfg-main" spellcheck="false" /></label>
+        <label class="checkrow deskonly"><input type="checkbox" id="cfg-bg" /> Run in background with tray icon</label>
+        <label class="deskonly">Quick-bar hotkey <input id="cfg-quick" spellcheck="false" /></label>
+        <label class="deskonly">Sessions hotkey <input id="cfg-main" spellcheck="false" /></label>
         <label>Default dir <input id="cfg-dir" spellcheck="false" /></label>
         <div id="cfg-backend-row" class="hidden">
           <span>Termux backend: <span id="cfg-backend-status">…</span></span>
@@ -142,7 +143,7 @@
             <button id="cfg-backend-restart">Restart server</button>
           </div>
         </div>
-        <p class="hint">Format like <code>Super+J</code>, <code>Super+Shift+J</code>. In-app hotkeys may not fire on Wayland while another app is focused — add a KDE fallback: <br /><code>System Settings → Shortcuts → Custom → pi-desktop --toggle-quickbar</code></p>
+        <p class="hint deskonly">Format like <code>Super+J</code>, <code>Super+Shift+J</code>. In-app hotkeys may not fire on Wayland while another app is focused — add a KDE fallback: <br /><code>System Settings → Shortcuts → Custom → pi-desktop --toggle-quickbar</code></p>
         <p id="cfgerr" class="err"></p>
         <div class="modalbtns">
           <button id="cfgsave">Save</button>

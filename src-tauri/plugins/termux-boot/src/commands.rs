@@ -16,3 +16,10 @@ pub(crate) async fn boot_server<R: Runtime>(
 ) -> Result<BootServerResponse> {
   app.termux_boot().boot_server(port.unwrap_or(1423))
 }
+
+#[command]
+pub(crate) async fn kill_server<R: Runtime>(
+  app: AppHandle<R>,
+) -> Result<KillServerResponse> {
+  app.termux_boot().kill_server()
+}

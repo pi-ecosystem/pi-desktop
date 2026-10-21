@@ -29,7 +29,7 @@ export const isServerMode = serverBase !== null;
 // The termux-boot plugin commands live in the on-device backend even in
 // server mode — they must always go over IPC when available.
 function isBootCmd(cmd: string): boolean {
-  return cmd === "plugin:termux-boot|boot-server" || cmd === "plugin:termux-boot|termux-available";
+  return cmd === "plugin:termux-boot|boot-server" || cmd === "plugin:termux-boot|termux-available" || cmd === "plugin:termux-boot|kill-server";
 }
 
 export async function invoke<T>(cmd: string, args?: any): Promise<T> {
@@ -61,10 +61,24 @@ export async function listen(event: string, cb: (e: any) => void): Promise<() =>
   return () => {};
 }
 
+// Best-effort backend stop on page unload (Android app close): fetch with
+// keepalive survives the dying page; failures are silent by design.
+export function sendShutdownBeacon(): void {
+  if (serverBase === null) return;
+  try {
+    fetch(`${apiBase}/api/invoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cmd: "shutdown_server", params: {} }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch { /* dying page: ignore */ }
+}
+
 // Android only: make sure the Termux backend is up before the UI talks to
 // it. No-op everywhere else (desktop IPC, browser dev). Ping; on failure
 // fire the RUN_COMMAND intent at Termux, then poll ~30s. Throws when the
-// backend never answers — callers surface it and stop init.
+// backend never answers — callers surface it and keep the UI usable.
 export async function ensureServerBackend(): Promise<void> {
   if (serverBase === null) return;
   const port = Number(new URL(serverBase).port) || 1423;

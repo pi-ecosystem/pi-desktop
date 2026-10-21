@@ -38,4 +38,11 @@ impl<R: Runtime> TermuxBoot<R> {
       .run_mobile_plugin("bootServer", BootServerRequest { port: Some(port) })
       .map_err(Into::into)
   }
+
+  pub fn kill_server(&self) -> crate::Result<KillServerResponse> {
+    self
+      .0
+      .run_mobile_plugin("killServer", ())
+      .map_err(Into::into)
+  }
 }

@@ -3,10 +3,10 @@
 
 import "./compat";
 import { invoke } from "./tauri-shim";
-import { ensureServerBackend, isServerMode } from "./tauri-shim";
+import { ensureServerBackend, isServerMode, sendShutdownBeacon } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { getCurrentWindow, getCurrentWebview } from "./tauri-window-shim";
-import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, recycleEvents, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -2553,8 +2553,13 @@ function openSessMenu(s: SessionInfo, x: number, y: number) {
   m.appendChild(del);
   document.body.appendChild(m);
   const r = m.getBoundingClientRect();
+  // Clamp inside the system bars too: innerHeight spans behind them.
+  const cs = getComputedStyle(document.documentElement);
+  const px = (v: string) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+  const sat = px(cs.getPropertyValue("--sat"));
+  const sab = px(cs.getPropertyValue("--sab"));
   m.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + "px";
-  m.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+  m.style.top = Math.max(8 + sat, Math.min(y, window.innerHeight - r.height - 8 - sab)) + "px";
   sessMenuEl = m;
   document.addEventListener("keydown", sessMenuEsc, true);
 }
@@ -4329,6 +4334,7 @@ async function openSettings() {
   $("cfgerr").textContent = "";
   // Detached-backend controls (Android/Termux server mode only — the
   // desktop backend dies with the app, so there is nothing to stop).
+  $("settingsmodal").classList.toggle("server", isServerMode);
   if (isServerMode) {
     $("cfg-backend-row").classList.remove("hidden");
     await refreshBackendStatus();
@@ -4431,18 +4437,68 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
     doCopy(b);
   });
 
-window.addEventListener("DOMContentLoaded", async () => {
-  trapErrors();
-  setTag("main");
-  // Android (APK): the backend lives in Termux — boot it over
-  // RUN_COMMAND and wait for localhost before binding anything.
-  // No-op on desktop and in browser dev.
+// Backend boots in the background: the UI is fully wired first so a dead
+// backend never bricks the app — Settings (Stop/Restart) stays reachable
+// and the header pill retries the boot.
+let backendUp = false;
+let booting = false;
+function setPill(mode: "up" | "conn" | "down") {
+  const p = $("backendpill") as HTMLButtonElement;
+  if (!isServerMode) { p.classList.add("hidden"); return; }
+  p.classList.remove("hidden");
+  p.classList.toggle("down", mode === "down");
+  p.textContent = mode === "up" ? "" : mode === "conn" ? "connecting…" : "backend down — tap to retry";
+  if (mode === "up") p.classList.add("hidden");
+}
+async function bootBackend(): Promise<void> {
+  if (booting || backendUp) return;
+  booting = true;
+  setPill("conn");
   try {
+    // Android (APK): the backend lives in Termux — boot it over
+    // RUN_COMMAND and wait for localhost. No-op on desktop/dev.
     await ensureServerBackend();
   } catch (e: any) {
+    booting = false;
+    setPill("down");
     toastErr(`backend: ${e.message ?? e}`);
     return;
   }
+  booting = false;
+  backendUp = true;
+  setPill("up");
+  const loadInitial = async () => {
+    const c = await config.get();
+    // Mobile (detached Termux backend): open on a fresh chat instead of
+    // resuming the last session — a phone open is a new glance, and the
+    // old transcript stays one tap away in the sidebar. Desktop keeps
+    // resume-where-you-left-off.
+    await setCwd(c.last_cwd || c.default_dir, false, !isServerMode);
+  };
+  try {
+    await loadInitial();
+  } catch (e: any) {
+    // First contact failed on a live server: suspect a half-open event
+    // channel (built while Termux was frozen). Fresh channel, one retry.
+    recycleEvents();
+    try {
+      await loadInitial();
+    } catch (e2: any) {
+      backendUp = false;
+      setPill("down");
+      toastErr(`backend data: ${e2.message ?? e2}`);
+    }
+  }
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+  trapErrors();
+  setTag("main");
+  ($("backendpill") as HTMLButtonElement).addEventListener("click", () => { void bootBackend(); });
+  // Android close: stop the Termux backend with the app (it re-boots on
+  // next open). Desktop backends die with the app — nothing to do there.
+  window.addEventListener("pagehide", () => { if (isServerMode) sendShutdownBeacon(); });
+  void bootBackend();
   // Background run lifecycle -> sidebar dots (viewed session is driven
   // by run events directly; this covers everything else).
   onRunStatus((st) => {
@@ -4973,9 +5029,14 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("settingsbtn") as HTMLButtonElement).addEventListener("click", openSettings);
+  // Old backends predate shutdown_server — asking them to exit throws
+  // "unknown command" and the button would silently do nothing. Fall back
+  // to the version-independent kill (pkill inside Termux over RUN_COMMAND).
   ($("cfg-backend-stop") as HTMLButtonElement).addEventListener("click", async () => {
     try {
-      await invoke("shutdown_server", {});
+      await invoke("shutdown_server", {}).catch(() =>
+        invoke("plugin:termux-boot|kill-server", {})
+      );
       $("cfg-backend-status").textContent = "stopped — reopen the app to start it again";
     } catch (e: any) {
       $("cfgerr").textContent = `stop failed: ${e.message ?? e}`;
@@ -4985,6 +5046,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     try {
       $("cfg-backend-status").textContent = "restarting…";
       await invoke("shutdown_server", {}).catch(() => {});
+      await invoke("plugin:termux-boot|kill-server", {}).catch(() => {});
       await new Promise((r) => setTimeout(r, 2000));
       await ensureServerBackend();
       await refreshBackendStatus();
@@ -5020,10 +5082,4 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (p.sessionPath) await switchSession(p.sessionPath);
   }).catch(() => {});
 
-  const c = await config.get();
-  // Mobile (detached Termux backend): open on a fresh chat instead of
-  // resuming the last session — a phone open is a new glance, and the
-  // old transcript stays one tap away in the sidebar. Desktop keeps
-  // resume-where-you-left-off.
-  await setCwd(c.last_cwd || c.default_dir, false, !isServerMode);
 });

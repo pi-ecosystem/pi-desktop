@@ -63,6 +63,23 @@ Read this before starting/stopping anything. Two runtimes, same frontend.
   always reports Termux missing on Android 11+).
 - Debug on-device: `adb logcat`, screenshots via
   `adb exec-out screencap -p` (readable as images here).
+- Remote Termux shell (full I/O stream, no screenshots/typing):
+  `sh scripts/termux-ssh-enable.sh` generates `~/.ssh/pi-termux`, pushes
+  the phone setup + pubkey to /sdcard, and forwards 8022. Then in Termux
+  run `sh /sdcard/pi-ssh-setup.sh` (one short command; or inject it with
+  Termux in the foreground via
+  `adb shell input text 'sh%s/sdcard/pi-ssh-setup.sh'` + Enter keyevent
+  66). Connect: `ssh -p 8022 -i ~/.ssh/pi-termux termux@127.0.0.1`.
+  Key-only, sshd bound to 127.0.0.1 (adb-forward only). Direct shell
+  (`adb shell`) can never reach Termux (separate UID/sandbox) and
+  `am`-fired RUN_COMMAND intents are rejected from shell — the app (which
+  holds the runtime RUN_COMMAND grant) or this ssh channel are the only
+  ways in.
+- Stale-server trap: `install-termux.sh` replaces the binary but the app
+  only boots the server when the port is DOWN — a live backend keeps
+  serving old code. The script now kills the live backend after install;
+  next app open auto-boots fresh. Symptom of staleness: `/proc/<pid>/exe`
+  reads `(deleted)` and md5(exe) ≠ md5($PREFIX/bin/pi-desktop-server).
 - After any fresh `tauri android init`, also re-apply in
   `gen/android/app/build.gradle.kts`: release `usesCleartextTraffic`
   must be `"true"` (app talks to Termux backend over localhost HTTP;

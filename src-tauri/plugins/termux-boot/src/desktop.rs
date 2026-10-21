@@ -19,10 +19,15 @@ impl<R: Runtime> TermuxBoot<R> {
     Ok(TermuxAvailableResponse {
       termux: false,
       termux_api: false,
+      termux_stopped: false,
     })
   }
 
   pub fn boot_server(&self, _port: u16) -> crate::Result<BootServerResponse> {
     Err(crate::Error::Backend("termux boot is Android-only".into()))
+  }
+
+  pub fn kill_server(&self) -> crate::Result<KillServerResponse> {
+    Err(crate::Error::Backend("termux kill is Android-only".into()))
   }
 }

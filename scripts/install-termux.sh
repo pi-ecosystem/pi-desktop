@@ -21,6 +21,17 @@ echo "→ install $DEST"
 cp -f "$BIN" "$DEST"
 chmod 755 "$DEST"
 
+# A replaced binary doesn't replace the running process — and the app only
+# boots the server when the port is down, so a live backend keeps serving
+# the OLD code forever (stale ENOENT spawns and all). Stop it here; the
+# next app open auto-boots this fresh binary over RUN_COMMAND.
+# (-f: comm truncates to 15 chars so -x can never match this 18-char name;
+# the pattern is the full install path, nothing else on the phone matches.)
+if pgrep -f "$DEST" >/dev/null 2>&1; then
+  echo "→ stopping live backend (old binary still in memory)"
+  pkill -f "$DEST" || true
+fi
+
 if ! command -v pi >/dev/null 2>&1; then
   echo "warn: 'pi' not on PATH — install the pi CLI first (the backend spawns it)."
 fi

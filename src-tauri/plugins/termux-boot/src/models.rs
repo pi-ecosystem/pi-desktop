@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct TermuxAvailableResponse {
   pub termux: bool,
   pub termux_api: bool,
+  #[serde(default)]
+  pub termux_stopped: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -17,4 +19,10 @@ pub struct BootServerRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BootServerResponse {
   pub started: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillServerResponse {
+  pub killed: bool,
 }

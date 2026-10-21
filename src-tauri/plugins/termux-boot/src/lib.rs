@@ -35,7 +35,7 @@ impl<R: Runtime, T: Manager<R>> crate::TermuxBootExt<R> for T {
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   Builder::new("termux-boot")
-    .invoke_handler(tauri::generate_handler![commands::termux_available, commands::boot_server])
+    .invoke_handler(tauri::generate_handler![commands::termux_available, commands::boot_server, commands::kill_server])
     .setup(|app, api| {
       #[cfg(mobile)]
       let termux_boot = mobile::init(app, api)?;

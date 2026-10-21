@@ -33,10 +33,24 @@ function subKey(cwd: string): string {
   return `${NS}\n${cwd}`;
 }
 
+let unlistenEvents: (() => void) | null = null;
+
+// Drop the event channel so the next ensureListening() opens a fresh one.
+// Heals half-open zombies (e.g. created while Termux was frozen: TCP up,
+// no data, no error, no reconnect — every call hangs till its timeout).
+// Only used on paths with no healthy long runs in flight (boot/retry).
+export function recycleEvents(): void {
+  try {
+    unlistenEvents?.();
+  } catch { /* ignore */ }
+  unlistenEvents = null;
+  listening = false;
+}
+
 export async function ensureListening(): Promise<void> {
   if (listening) return;
   listening = true;
-  await listen("pi-record", (e: any) => {
+  unlistenEvents = await listen("pi-record", (e: any) => {
     const p = e.payload ?? {};
     const { cwd, tag, key, record } = p;
     if (tag !== NS) return;
