@@ -7,6 +7,18 @@ import { ensureServerBackend, isServerMode, sendShutdownBeacon } from "./tauri-s
 import { listen } from "./tauri-shim";
 import { getCurrentWindow, getCurrentWebview } from "./tauri-window-shim";
 import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, recycleEvents, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
+import {
+  deleteDirectChat,
+  getDirectChat,
+  listDirectModels,
+  listDirectChats,
+  loadDirectSettings,
+  saveDirectSettings,
+  newDirectChat,
+  renameDirectChat,
+  saveDirectChat,
+  streamDirectChat,
+} from "./direct";
 
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
@@ -78,13 +90,33 @@ function dropToBottom(): void {
 // Late media bytes extend the page under a pinned viewport (the #1
 // autoscroll miss: text pinned fine, then images landed below it).
 window.addEventListener("pi-media-settled", pin);
+// OpenUI round-trip (see openui.ts): widget actions (@ToAssistant,
+// form submits) come back as user messages. Mid-run they queue as
+// follow-ups; idle they send fresh.
+window.addEventListener("pi-genui-submit", (e) => {
+  try {
+    const ev: any = (e as CustomEvent).detail ?? {};
+    const msg = typeof ev.humanFriendlyMessage === "string" && ev.humanFriendlyMessage
+      ? ev.humanFriendlyMessage
+      : typeof ev.params?.message === "string" ? ev.params.message : JSON.stringify(ev.params ?? ev);
+    const extra = ev.formState && Object.keys(ev.formState).length
+      ? `\n[data] ${JSON.stringify(ev.formState)}` : "";
+    const text = `[ui action] ${msg}${extra}`;
+    if (streaming) void sendFollowUp(text);
+    else {
+      const inp = document.getElementById("input") as HTMLTextAreaElement | null;
+      if (inp) inp.value = text;
+      void send();
+    }
+  } catch { /* ignore */ }
+});
 // Single-button Send<->Stop morph, ChatGPT-style. The separate #abortbtn
 // is hidden (see styles.css); the composer button does both jobs.
 function syncSendBtn() {
   const inp = document.getElementById("input") as HTMLTextAreaElement | null;
   const btn = document.getElementById("send") as HTMLButtonElement | null;
   if (!inp || !btn) return;
-  if (streaming) {
+  if (streaming || directStreaming) {
     btn.disabled = false;
     btn.dataset.mode = "stop";
     btn.innerHTML = ICO_STOP;
@@ -583,6 +615,14 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
 // toast, and destructive buttons arm-to-confirm in place.
 function toastErr(msg: string): void {
   try {
+    // Mirror into the persisted errlog so toasts survive to Settings → Debug.
+    const raw = localStorage.getItem("errlog");
+    const arr = raw ? (JSON.parse(raw) as unknown[]) : [];
+    const list = Array.isArray(arr) ? arr : [];
+    list.push({ at: new Date().toISOString(), msg: String(msg).slice(0, 500) });
+    localStorage.setItem("errlog", JSON.stringify(list.slice(-20)));
+  } catch { /* ignore */ }
+  try {
     const t = el("div", "errtoast", esc(msg.slice(0, 300)));
     document.body.appendChild(t);
     setTimeout(() => t.remove(), 6000);
@@ -611,12 +651,18 @@ function trapErrors(): void {
   };
   window.addEventListener("error", (e) => {
     const msg = `Error: ${(e as ErrorEvent).message || String((e as ErrorEvent).error ?? e)}`;
+    try {
+      console.error("[app]", msg);
+    } catch { /* ignore */ }
     log(msg);
     show(msg);
   });
   window.addEventListener("unhandledrejection", (e) => {
     const r = (e as PromiseRejectionEvent).reason;
     const msg = `Unhandled: ${(r as any)?.message ?? String(r ?? e)}`;
+    try {
+      console.error("[app]", msg);
+    } catch { /* ignore */ }
     log(msg);
     show(msg);
   });
@@ -2552,16 +2598,21 @@ function openSessMenu(s: SessionInfo, x: number, y: number) {
   });
   m.appendChild(del);
   document.body.appendChild(m);
+  positionSessMenu(m, x, y);
+  sessMenuEl = m;
+  document.addEventListener("keydown", sessMenuEsc, true);
+}
+
+// Shared viewport clamp for floating menus (session + direct-chat):
+// innerHeight spans behind the system bars, so reserve those insets.
+function positionSessMenu(m: HTMLElement, x: number, y: number): void {
   const r = m.getBoundingClientRect();
-  // Clamp inside the system bars too: innerHeight spans behind them.
   const cs = getComputedStyle(document.documentElement);
   const px = (v: string) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
   const sat = px(cs.getPropertyValue("--sat"));
   const sab = px(cs.getPropertyValue("--sab"));
   m.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + "px";
   m.style.top = Math.max(8 + sat, Math.min(y, window.innerHeight - r.height - 8 - sab)) + "px";
-  sessMenuEl = m;
-  document.addEventListener("keydown", sessMenuEsc, true);
 }
 async function deleteSessionFile(s: SessionInfo) {
   const wasActive = s.path === curFile;
@@ -3779,6 +3830,11 @@ async function send() {
     if (streaming) stopOnly();
     return;
   }
+  // No agent, no backend: straight to the provider.
+  if (directMode) {
+    await directSend(text);
+    return;
+  }
   // Uploads first: dropped/pasted files become paths the agent can read.
   if (pendingAttachments.length) {
     try {
@@ -4325,33 +4381,61 @@ function renderDirRecents() {
 
 async function openSettings() {
   $("appver").textContent = `v${__APP_VERSION__}`;
-  const c = await config.get();
-  ($("cfg-quick") as HTMLInputElement).value = c.quickbar_hotkey;
-  ($("cfg-main") as HTMLInputElement).value = c.main_hotkey;
-  parseHotChords(c.quickbar_hotkey, c.main_hotkey);
-  ($("cfg-dir") as HTMLInputElement).value = c.default_dir;
-  ($("cfg-bg") as HTMLInputElement).checked = c.run_in_bg !== false;
-  $("cfgerr").textContent = "";
-  // Detached-backend controls (Android/Termux server mode only — the
-  // desktop backend dies with the app, so there is nothing to stop).
-  $("settingsmodal").classList.toggle("server", isServerMode);
-  if (isServerMode) {
-    $("cfg-backend-row").classList.remove("hidden");
-    await refreshBackendStatus();
-  } else {
-    $("cfg-backend-row").classList.add("hidden");
-  }
-  $("settingsmodal").classList.remove("hidden");
-}
-
-async function refreshBackendStatus(): Promise<void> {
-  const el = $("cfg-backend-status");
+  // Backend fields need a live backend; connection + direct fields are
+  // local-only so Settings stays usable while the backend is down.
+  let cfgSnap: any = null;
   try {
-    const snap = await runStates.snapshot();
-    el.textContent = `running${snap?.bootId ? ` (${snap.bootId.slice(0, 8)}…)` : ""}`;
-  } catch {
-    el.textContent = "unreachable";
+    const c = await config.get();
+    cfgSnap = c;
+    ($("cfg-quick") as HTMLInputElement).value = c.quickbar_hotkey;
+    ($("cfg-main") as HTMLInputElement).value = c.main_hotkey;
+    parseHotChords(c.quickbar_hotkey, c.main_hotkey);
+    ($("cfg-dir") as HTMLInputElement).value = c.default_dir;
+    ($("cfg-bg") as HTMLInputElement).checked = c.run_in_bg !== false;
+  } catch { /* leave backend fields as-is */ }
+  // Desktop-link fields only make sense on the phone; this-device-as-
+  // server + debug stay Android-only (hidden on desktop).
+  const showLocal = isAndroidApp;
+  const showRemote = isAndroidApp || isServerMode;
+  document.querySelectorAll(".desk-local").forEach((elm) => {
+    (elm as HTMLElement).style.display = showLocal ? "" : "none";
+  });
+  document.querySelectorAll(".desk-remote").forEach((elm) => {
+    (elm as HTMLElement).style.display = showRemote ? "" : "none";
+  });
+  document.querySelectorAll(".desk-debug").forEach((elm) => {
+    (elm as HTMLElement).style.display = isAndroidApp ? "" : "none";
+  });
+  // Direct chat is a phone-only mode — desktop already has the full agent.
+  document.querySelectorAll(".desk-direct").forEach((elm) => {
+    (elm as HTMLElement).style.display = isAndroidApp ? "" : "none";
+  });
+  if (showLocal && cfgSnap) {
+    ($("cfg-local-port") as HTMLInputElement).value = String(cfgSnap.remote_port || 1423);
+    ($("cfg-local-token") as HTMLInputElement).value = cfgSnap.remote_token || "";
   }
+  ($("cfg-remote-url") as HTMLInputElement).value = localStorage.getItem("pi-server-url") ?? "";
+  ($("cfg-remote-token") as HTMLInputElement).value = localStorage.getItem("pi-server-token") ?? "";
+  const d = loadDirectSettings();
+  ($("cfg-direct-preset") as HTMLSelectElement).value = d.preset;
+  ($("cfg-direct-url") as HTMLInputElement).value = d.baseUrl;
+  ($("cfg-direct-key") as HTMLInputElement).value = d.apiKey;
+  try {
+    const errs: any[] = JSON.parse(localStorage.getItem("errlog") ?? "[]");
+    const lines = errs.slice(-8).map((e: any) => `${e.at ?? ""} ${e.msg ?? e}`);
+    const dd = loadDirectSettings();
+    lines.push(`direct: preset=${dd.preset} base=${dd.baseUrl || "(empty)"} model=${dd.model || "(empty)"} key=${dd.apiKey ? `set(len=${dd.apiKey.length})` : "MISSING"}`);
+    lines.push(`remote: url=${localStorage.getItem("pi-server-url") || "(empty)"} token=${localStorage.getItem("pi-server-token") ? "set" : "MISSING"}`);
+    ($("cfg-debuglog") as HTMLElement).textContent = lines.join("\n") || "(no errors logged)";
+  } catch {
+    ($("cfg-debuglog") as HTMLElement).textContent = "(unreadable)";
+  }
+  $("cfgerr").textContent = "";
+  // Detached-backend controls (remote server mode only — the
+  // desktop backend dies with the app, so there is nothing to stop).
+  // Direct mode is phone-only too: same desktop rows hidden as server mode.
+  $("settingsmodal").classList.toggle("server", isServerMode || directMode);
+  $("settingsmodal").classList.remove("hidden");
 }
 
 // ---- boot ----
@@ -4437,26 +4521,435 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
     doCopy(b);
   });
 
+// ---- direct chat mode (no backend, no pi) ----
+// Phone-first mode: provider HTTPS straight from the app, chats in
+// localStorage. No subagents, no code tools — so the right panel and
+// its toggle hide (body.direct), and thinking still renders (collapsed).
+let directMode = false;
+let directViewId: string | null = null;
+let directStreaming = false;
+let directAbort: AbortController | null = null;
+
+function enterDirectMode(): void {
+  directMode = true;
+  document.body.classList.add("direct");
+  paintModeToggle();
+  const st = loadDirectSettings();
+  ($("modellabel") as HTMLElement).textContent = st.model || "model";
+  ($("dirlabel") as HTMLElement).textContent = "direct";
+  renderDirectList();
+  openDirectChat(null);
+}
+
+function exitDirectMode(): void {
+  directMode = false;
+  directViewId = null;
+  document.body.classList.remove("direct");
+}
+
+function renderDirectList(): void {
+  hideSessMenu();
+  const f = ($("sessfilter") as HTMLInputElement).value.toLowerCase();
+  const list = $("sesslist");
+  const keepScroll = list.scrollTop;
+  list.innerHTML = "";
+  for (const c of listDirectChats()) {
+    const last = [...c.messages].reverse().find((m) => m.content)?.content ?? "";
+    const label = `${c.title} ${last}`.toLowerCase();
+    if (f && !label.includes(f)) continue;
+    const d = el("div", "sess" + (c.id === directViewId ? " active" : ""),
+      `<div class="stitle">${esc(c.title)}</div><div class="ssub">${esc(last.slice(0, 80))}</div>`);
+    d.addEventListener("click", () => openDirectChat(c.id));
+    const more = el("button", "sdel smore", "…");
+    more.title = "Chat options";
+    more.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      openDirectMenu(c.id, r.left, r.bottom + 4);
+    });
+    d.appendChild(more);
+    d.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openDirectMenu(c.id, e.clientX, e.clientY);
+    });
+    list.appendChild(d);
+  }
+  list.scrollTop = Math.min(keepScroll, Math.max(0, list.scrollHeight - list.clientHeight));
+}
+
+function directBubble(m: { role: string; content: string; thinking?: string }): HTMLElement {
+  if (m.role === "user") {
+    const box = el("div", "msg user");
+    box.appendChild(el("div", "ubody", renderMd(m.content)));
+    return box;
+  }
+  const box = el("div", "msg assistant");
+  if (m.thinking) {
+    const det = document.createElement("details");
+    det.className = "think";
+    const sum = document.createElement("summary");
+    sum.textContent = "Thinking";
+    det.appendChild(sum);
+    det.appendChild(el("div", "think-body", esc(m.thinking)));
+    box.appendChild(det);
+  }
+  box.appendChild(el("div", "atext", renderMd(m.content || "")));
+  return box;
+}
+
+function openDirectChat(id: string | null): void {
+  if (directStreaming) abortDirect();
+  const box = $("msgs");
+  box.innerHTML = "";
+  if (!id) {
+    directViewId = null;
+    box.appendChild(el("div", "greet", `<h2>Ready when you are.</h2>`));
+    ($("sesstitle") as HTMLElement).textContent = "New chat";
+    renderDirectList();
+    syncSendBtn();
+    return;
+  }
+  const chat = getDirectChat(id);
+  if (!chat) {
+    openDirectChat(null);
+    return;
+  }
+  directViewId = id;
+  ($("sesstitle") as HTMLElement).textContent = chat.title;
+  for (const m of chat.messages) box.appendChild(directBubble(m));
+  renderDirectList();
+  dropToBottom();
+  syncSendBtn();
+}
+
+function openDirectMenu(id: string, x: number, y: number): void {
+  closeDrops();
+  hideSessMenu();
+  const chat = getDirectChat(id);
+  if (!chat) return;
+  const m = document.createElement("div");
+  m.id = "sessmenu";
+  m.className = "dd-list";
+  m.addEventListener("click", (e) => e.stopPropagation());
+  sessMenuEl = m;
+  document.addEventListener("keydown", sessMenuEsc, true);
+  const ren = el("div", "dd-opt", "Rename");
+  ren.addEventListener("click", () => {
+    m.innerHTML = "";
+    m.appendChild(el("div", "sessmenu-head", "Rename chat"));
+    const inp = document.createElement("input");
+    inp.className = "sessmenu-input";
+    inp.value = chat.title;
+    inp.spellcheck = false;
+    m.appendChild(inp);
+    const row = el("div", "sessmenu-row");
+    const cancel = el("button", "sessmenu-btn", "Cancel");
+    cancel.addEventListener("click", () => openDirectMenu(id, x, y));
+    const save = el("button", "sessmenu-btn primary", "Save");
+    save.addEventListener("click", () => {
+      renameDirectChat(id, inp.value.trim());
+      const c = getDirectChat(id);
+      if (c && directViewId === id) ($("sesstitle") as HTMLElement).textContent = c.title;
+      renderDirectList();
+      hideSessMenu();
+    });
+    row.appendChild(cancel);
+    row.appendChild(save);
+    m.appendChild(row);
+    inp.focus();
+    inp.select();
+  });
+  m.appendChild(ren);
+  const del = el("div", "dd-opt danger", "Delete");
+  del.addEventListener("click", () => {
+    if (del.dataset.armed) {
+      deleteDirectChat(id);
+      hideSessMenu();
+      if (directViewId === id) openDirectChat(null);
+      else renderDirectList();
+    } else {
+      del.dataset.armed = "1";
+      del.textContent = "Confirm delete";
+    }
+  });
+  m.appendChild(del);
+  document.body.appendChild(m);
+  positionSessMenu(m, x, y);
+}
+
+function abortDirect(): void {
+  try {
+    directAbort?.abort();
+  } catch { /* ignore */ }
+}
+
+let directModelNames: string[] = [];
+
+// Chat model picker in direct mode: live GET /models every open.
+async function openDirectModels(): Promise<void> {
+  closeDrops();
+  directModelNames = [];
+  ($("modellist") as HTMLElement).classList.remove("hidden");
+  popMenu($("modellist"), $("modelbtn"));
+  ($("modelbtn") as HTMLButtonElement).classList.add("open");
+  renderDirectModelOpts(true);
+  try {
+    directModelNames = await listDirectModels(loadDirectSettings());
+  } catch (e: any) {
+    directModelNames = [];
+    toastErr(e.message ?? e);
+  }
+  renderDirectModelOpts();
+}
+
+function renderDirectModelOpts(loading = false): void {
+  const ml = $("modelopts");
+  ml.innerHTML = "";
+  const q = (($("modeltype") as HTMLInputElement).value || "").toLowerCase();
+  if (loading) {
+    ml.appendChild(el("div", "dd-opt", "loading…"));
+    return;
+  }
+  const shown = directModelNames.filter((n) => !q || n.toLowerCase().includes(q));
+  if (!shown.length) {
+    ml.appendChild(el("div", "dd-opt", "no models — check base URL + key"));
+    return;
+  }
+  const cur = loadDirectSettings();
+  for (const name of shown) {
+    const o = el("div", "dd-opt" + (name === cur.model ? " sel" : ""), esc(name));
+    o.addEventListener("click", () => {
+      closeDrops();
+      const s = loadDirectSettings();
+      s.model = name;
+      saveDirectSettings(s);
+      ($("modellabel") as HTMLElement).textContent = name;
+    });
+    ml.appendChild(o);
+  }
+}
+
+async function directSend(text: string): Promise<void> {
+  const inp = $("input") as HTMLTextAreaElement;
+  if (!text && !pendingAttachments.length) return;
+  if (pendingAttachments.length) {
+    toastErr("attachments need the desktop agent — direct chat is text-only");
+    return;
+  }
+  const st = loadDirectSettings();
+  if (!st.baseUrl || !st.apiKey || !st.model) {
+    toastErr("direct chat needs an API key — add it in Settings");
+    return;
+  }
+  if (text.trim() === "/new") {
+    inp.value = "";
+    syncSendBtn();
+    openDirectChat(null);
+    return;
+  }
+  let chat = directViewId ? getDirectChat(directViewId) : null;
+  if (!chat) {
+    chat = newDirectChat(st.model);
+    directViewId = chat.id;
+    ($("sesstitle") as HTMLElement).textContent = chat.title;
+  }
+  const box = $("msgs");
+  box.querySelector(".greet")?.remove();
+  box.appendChild(directBubble({ role: "user", content: text }));
+  const abox = el("div", "msg assistant");
+  const thinkDet = document.createElement("details");
+  thinkDet.className = "think";
+  thinkDet.style.display = "none";
+  const thinkSum = document.createElement("summary");
+  thinkSum.textContent = "Thinking";
+  const thinkBody = el("div", "think-body", "");
+  thinkDet.appendChild(thinkSum);
+  thinkDet.appendChild(thinkBody);
+  abox.appendChild(thinkDet);
+  const abody = el("div", "atext", "");
+  abox.appendChild(abody);
+  box.appendChild(abox);
+  stick = true;
+  dropToBottom();
+  inp.value = "";
+  syncSendBtn();
+  chat.messages.push({ role: "user", content: text, at: Date.now() });
+  if (chat.messages.length === 1) chat.title = text.slice(0, 60);
+  saveDirectChat(chat);
+  renderDirectList();
+  const history = chat.messages.map((mm) => ({ role: mm.role, content: mm.content }));
+  directStreaming = true;
+  syncSendBtn();
+  const ac = new AbortController();
+  directAbort = ac;
+  let latestContent = "";
+  let latestThink = "";
+  let thinkingActive = false;
+  let paintT: number | null = null;
+  let closed = false;
+  const paint = () => {
+    paintT = null;
+    if (thinkingActive) {
+      thinkDet.style.display = "";
+      thinkBody.textContent = latestThink || "…";
+    }
+    abody.innerHTML = renderMd(latestContent);
+    if (stick) dropToBottom();
+  };
+  const schedulePaint = () => {
+    if (paintT !== null || closed) return;
+    paintT = window.setTimeout(paint, 250);
+  };
+  try {
+    const msg = await streamDirectChat(st, history, {
+      onThinking: (th) => { thinkingActive = true; latestThink = th; schedulePaint(); },
+      onContent: (c) => { latestContent = c; schedulePaint(); },
+    }, ac.signal, { sessionId: chat.id });
+    closed = true;
+    if (paintT !== null) { window.clearTimeout(paintT); paintT = null; }
+    // Final state comes from the resolved message (e.g. token-count
+    // placeholder when reasoning text itself is encrypted server-side).
+    if (msg.thinking) { thinkingActive = true; latestThink = msg.thinking; }
+    if (msg.content) latestContent = msg.content;
+    paint();
+    const cur = getDirectChat(chat.id);
+    if (cur) {
+      cur.messages.push(msg);
+      saveDirectChat(cur);
+      renderDirectList();
+    }
+  } catch (e: any) {
+    closed = true;
+    if (paintT !== null) { window.clearTimeout(paintT); paintT = null; }
+    if ((e as any)?.name === "AbortError") {
+      abody.innerHTML += `<div class="meta warn">stopped</div>`;
+    } else {
+      toastErr(e.message ?? e);
+      abox.remove();
+    }
+  } finally {
+    directStreaming = false;
+    directAbort = null;
+    syncSendBtn();
+  }
+}
+
 // Backend boots in the background: the UI is fully wired first so a dead
 // backend never bricks the app — Settings (Stop/Restart) stays reachable
 // and the header pill retries the boot.
-let backendUp = false;
 let booting = false;
 function setPill(mode: "up" | "conn" | "down") {
   const p = $("backendpill") as HTMLButtonElement;
   if (!isServerMode) { p.classList.add("hidden"); return; }
   p.classList.remove("hidden");
   p.classList.toggle("down", mode === "down");
-  p.textContent = mode === "up" ? "" : mode === "conn" ? "connecting…" : "backend down — tap to retry";
+  p.textContent = mode === "up" ? "" : mode === "conn" ? "connecting…" : "desktop down — direct chat, tap to retry";
   if (mode === "up") p.classList.add("hidden");
 }
-async function bootBackend(): Promise<void> {
-  if (booting || backendUp) return;
+// Native system-bar insets (Android): CSS env() reads 0 in windows that
+// never got inset dispatch even with real overlay bars. The OS numbers
+// are authoritative — apply them over env(), never below live values
+// (startup race either direction). Desktop keeps env() (correctly 0).
+async function applyNativeInsets(): Promise<void> {
+  if (!isAndroidApp) return;
+  try {
+    const r = await invoke<{ top: number; bottom: number; left: number; right: number }>(
+      "plugin:sys-insets|get-insets", {});
+    const dpr = window.devicePixelRatio || 1;
+    const cs = getComputedStyle(document.documentElement);
+    const cur = (n: string) => {
+      const v = parseFloat(cs.getPropertyValue(n));
+      return Number.isFinite(v) ? v : 0;
+    };
+    const root = document.documentElement;
+    const set = (name: string, px: number) => {
+      const css = px / dpr;
+      if (css > cur(name)) root.style.setProperty(name, `${css}px`);
+    };
+    set("--sat", r.top);
+    set("--sab", r.bottom);
+  } catch { /* env() fallback stands */ }
+}
+
+// Phone APK without a desktop URL has no backend at all: direct chat.
+// Desktop (and browser dev) always uses the pi backend.
+const isAndroidApp =
+  typeof window !== "undefined" &&
+  "__TAURI__" in window &&
+  typeof navigator !== "undefined" &&
+  /android/i.test(navigator.userAgent);
+
+async function loadRemote(): Promise<void> {
+  exitDirectMode();
+  const c = await config.get();
+  // Phone remote lands in the desktop's default dir (a fresh .pi-qa
+  // space), not whatever the desktop was last doing. Desktop keeps
+  // resume-where-you-left-off; both open fresh, never resume.
+  const dir = isAndroidApp ? c.default_dir : (c.last_cwd || c.default_dir);
+  await setCwd(dir, false, !isServerMode);
+  paintModeToggle();
+}
+
+function paintModeToggle(): void {
+  ($("mode-direct") as HTMLButtonElement).classList.toggle("active", directMode);
+  ($("mode-remote") as HTMLButtonElement).classList.toggle("active", !directMode);
+}
+
+// Sidebar toggle → remote. Switches only onto a reachable desktop;
+// otherwise stays direct with the reason toasted. No auto-switching.
+async function tryRemote(): Promise<void> {
+  if (booting) return;
+  const url = (localStorage.getItem("pi-server-url") ?? "").trim();
+  if (!url) {
+    toastErr("set the desktop URL in Settings first");
+    return;
+  }
   booting = true;
   setPill("conn");
   try {
-    // Android (APK): the backend lives in Termux — boot it over
-    // RUN_COMMAND and wait for localhost. No-op on desktop/dev.
+    await ensureServerBackend();
+  } catch (e: any) {
+    booting = false;
+    setPill("down");
+    toastErr(`desktop unreachable: ${e.message ?? e}`);
+    return;
+  }
+  booting = false;
+  setPill("up");
+  booting = false;
+  setPill("up");
+  try {
+    await loadRemote();
+  } catch (e: any) {
+    // First contact failed on a live server: suspect a half-open event
+    // channel. Fresh channel, one retry.
+    recycleEvents();
+    try {
+      await loadRemote();
+    } catch (e2: any) {
+      enterDirectMode();
+      setPill("down");
+      toastErr(`backend data: ${e2.message ?? e2}`);
+    }
+  }
+}
+
+// Phone always boots direct — instant, no probing a desktop that is
+// usually off. Remote is one explicit toggle tap away. Desktop boots
+// straight into its local backend (unchanged behavior).
+async function bootBackend(): Promise<void> {
+  if (booting) return;
+  booting = true;
+  if (isAndroidApp) {
+    booting = false;
+    enterDirectMode();
+    ($("modetoggle") as HTMLElement).classList.remove("hidden");
+    setPill("up");
+    return;
+  }
+  setPill("conn");
+  try {
     await ensureServerBackend();
   } catch (e: any) {
     booting = false;
@@ -4465,26 +4958,14 @@ async function bootBackend(): Promise<void> {
     return;
   }
   booting = false;
-  backendUp = true;
   setPill("up");
-  const loadInitial = async () => {
-    const c = await config.get();
-    // Mobile (detached Termux backend): open on a fresh chat instead of
-    // resuming the last session — a phone open is a new glance, and the
-    // old transcript stays one tap away in the sidebar. Desktop keeps
-    // resume-where-you-left-off.
-    await setCwd(c.last_cwd || c.default_dir, false, !isServerMode);
-  };
   try {
-    await loadInitial();
+    await loadRemote();
   } catch (e: any) {
-    // First contact failed on a live server: suspect a half-open event
-    // channel (built while Termux was frozen). Fresh channel, one retry.
     recycleEvents();
     try {
-      await loadInitial();
+      await loadRemote();
     } catch (e2: any) {
-      backendUp = false;
       setPill("down");
       toastErr(`backend data: ${e2.message ?? e2}`);
     }
@@ -4494,9 +4975,23 @@ async function bootBackend(): Promise<void> {
 window.addEventListener("DOMContentLoaded", async () => {
   trapErrors();
   setTag("main");
-  ($("backendpill") as HTMLButtonElement).addEventListener("click", () => { void bootBackend(); });
-  // Android close: stop the Termux backend with the app (it re-boots on
-  // next open). Desktop backends die with the app — nothing to do there.
+  ($("backendpill") as HTMLButtonElement).addEventListener("click", () => { void tryRemote(); });
+  ($("mode-direct") as HTMLButtonElement).addEventListener("click", () => {
+    if (directStreaming) abortDirect();
+    enterDirectMode();
+  });
+  ($("mode-remote") as HTMLButtonElement).addEventListener("click", () => { void tryRemote(); });
+  // Bars can appear/change (rotation, nav-mode switch): re-read native
+  // insets. Cheap, idempotent, max-guarded.
+  let insetT: number | null = null;
+  window.addEventListener("resize", () => {
+    if (insetT !== null) window.clearTimeout(insetT);
+    insetT = window.setTimeout(() => { insetT = null; void applyNativeInsets(); }, 400);
+  });
+  window.addEventListener("orientationchange", () => { void applyNativeInsets(); });
+  void applyNativeInsets();
+  // Remote close: ask the desktop backend to stop with the app.
+  // Desktop IPC backends die with the app — nothing to do there.
   window.addEventListener("pagehide", () => { if (isServerMode) sendShutdownBeacon(); });
   void bootBackend();
   // Background run lifecycle -> sidebar dots (viewed session is driven
@@ -4519,11 +5014,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("send") as HTMLButtonElement).addEventListener("click", () => {
-    if (streaming) stopOnly();
+    if (directStreaming) abortDirect();
+    else if (streaming) stopOnly();
     else send();
   });
   ($("abortbtn") as HTMLButtonElement).addEventListener("click", () => {
-    stopOnly();
+    if (directStreaming) abortDirect();
+    else stopOnly();
   });
   ($("attachbtn") as HTMLButtonElement).addEventListener("click", async () => {
     // Desktop: native picker returns real paths — reference in place,
@@ -4633,6 +5130,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (window.matchMedia("(max-width: 768px)").matches) {
       document.body.classList.add("side-collapsed");
       ($("expandbtn") as HTMLButtonElement).classList.remove("hidden");
+    }
+    if (directMode) {
+      openDirectChat(null);
+      ($("input") as HTMLTextAreaElement).focus();
+      return;
     }
     cwdGen++; // invalidate any in-flight setCwd (see switchSession)
     resetRunState();
@@ -4891,9 +5393,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     scrollerEl.scrollTop = scrollerEl.scrollHeight;
     ($("scrollbtn") as HTMLButtonElement).classList.add("hidden");
   });
-  ($("sessfilter") as HTMLInputElement).addEventListener("input", refreshSessions);
+  ($("sessfilter") as HTMLInputElement).addEventListener("input", () => {
+    if (directMode) renderDirectList();
+    else refreshSessions();
+  });
   ($("dirbtn") as HTMLButtonElement).addEventListener("click", (e) => {
     e.stopPropagation();
+    if (directMode) { toastErr("no working directory in direct chat"); return; }
     const opening = $("dirlist").classList.contains("hidden");
     closeDrops();
     if (opening) {
@@ -4934,6 +5440,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   ($("modelbtn") as HTMLButtonElement).addEventListener("click", (e) => {
     e.stopPropagation();
+    if (directMode) { void openDirectModels(); return; }
     const opening = $("modellist").classList.contains("hidden");
     closeDrops();
     if (opening) {
@@ -4946,7 +5453,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   ($("modellist") as HTMLElement).addEventListener("click", (e) => e.stopPropagation());
   ($("modeltype") as HTMLInputElement).addEventListener("click", (e) => e.stopPropagation());
-  ($("modeltype") as HTMLInputElement).addEventListener("input", renderModelOpts);
+  ($("modeltype") as HTMLInputElement).addEventListener("input", () => {
+    if (directMode) renderDirectModelOpts();
+    else renderModelOpts();
+  });
   ($("modeltype") as HTMLInputElement).addEventListener("keydown", (e) => {
     e.stopPropagation();
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -4960,6 +5470,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   ($("thinkbtn") as HTMLButtonElement).addEventListener("click", (e) => {
     e.stopPropagation();
+    if (directMode) { toastErr("no thinking levels in direct chat — reasoning shows inline"); return; }
     const opening = $("thinklist").classList.contains("hidden");
     closeDrops();
     if (opening) {
@@ -5029,49 +5540,56 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
   ($("settingsbtn") as HTMLButtonElement).addEventListener("click", openSettings);
-  // Old backends predate shutdown_server — asking them to exit throws
-  // "unknown command" and the button would silently do nothing. Fall back
-  // to the version-independent kill (pkill inside Termux over RUN_COMMAND).
-  ($("cfg-backend-stop") as HTMLButtonElement).addEventListener("click", async () => {
-    try {
-      await invoke("shutdown_server", {}).catch(() =>
-        invoke("plugin:termux-boot|kill-server", {})
-      );
-      $("cfg-backend-status").textContent = "stopped — reopen the app to start it again";
-    } catch (e: any) {
-      $("cfgerr").textContent = `stop failed: ${e.message ?? e}`;
-    }
-  });
-  ($("cfg-backend-restart") as HTMLButtonElement).addEventListener("click", async () => {
-    try {
-      $("cfg-backend-status").textContent = "restarting…";
-      await invoke("shutdown_server", {}).catch(() => {});
-      await invoke("plugin:termux-boot|kill-server", {}).catch(() => {});
-      await new Promise((r) => setTimeout(r, 2000));
-      await ensureServerBackend();
-      await refreshBackendStatus();
-    } catch (e: any) {
-      $("cfg-backend-status").textContent = "unreachable";
-      $("cfgerr").textContent = `restart failed: ${e.message ?? e}`;
-    }
-  });
   ($("cfgclose") as HTMLButtonElement).addEventListener("click", () =>
     $("settingsmodal").classList.add("hidden")
   );
+  ($("cfg-local-gen") as HTMLButtonElement).addEventListener("click", () => {
+    const abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const rnd = new Uint32Array(32);
+    crypto.getRandomValues(rnd);
+    ($("cfg-local-token") as HTMLInputElement).value = Array.from(rnd, (n) => abc[n % 62]).join("");
+  });
   ($("cfgsave") as HTMLButtonElement).addEventListener("click", async () => {
+    const newUrl = ($("cfg-remote-url") as HTMLInputElement).value.trim();
+    const urlChanged = (localStorage.getItem("pi-server-url") ?? "") !== newUrl;
+    if (newUrl) localStorage.setItem("pi-server-url", newUrl);
+    else localStorage.removeItem("pi-server-url");
+    const newTok = ($("cfg-remote-token") as HTMLInputElement).value;
+    if (newTok) localStorage.setItem("pi-server-token", newTok);
+    else localStorage.removeItem("pi-server-token");
+    // Model lives in the chat dropdown, not here — keep the stored one.
+    const prevDirect = loadDirectSettings();
+    saveDirectSettings({
+      preset: ((v: string) => (v === "anthropic" || v === "responses" ? v : "openai"))(($("cfg-direct-preset") as HTMLSelectElement).value),
+      baseUrl: ($("cfg-direct-url") as HTMLInputElement).value.trim().replace(/\/+$/, ""),
+      // Pasted keys often drag trailing newlines/spaces (file copy) —
+      // the gateway rejects those as invalid credentials.
+      apiKey: ($("cfg-direct-key") as HTMLInputElement).value.trim(),
+      model: prevDirect.model,
+    });
     try {
-      await config.set({
+      const patch: Record<string, unknown> = {
         quickbar_hotkey: ($("cfg-quick") as HTMLInputElement).value.trim(),
         main_hotkey: ($("cfg-main") as HTMLInputElement).value.trim(),
         default_dir: ($("cfg-dir") as HTMLInputElement).value.trim(),
         run_in_bg: ($("cfg-bg") as HTMLInputElement).checked,
-      });
-      $("settingsmodal").classList.add("hidden");
-      parseHotChords(
-        ($("cfg-quick") as HTMLInputElement).value.trim(),
-        ($("cfg-main") as HTMLInputElement).value.trim());
+      };
+      const lp = parseInt(($("cfg-local-port") as HTMLInputElement).value.trim(), 10);
+      if (Number.isFinite(lp)) patch.remote_port = lp;
+      patch.remote_token = ($("cfg-local-token") as HTMLInputElement).value;
+      await config.set(patch);
     } catch (e: any) {
-      $("cfgerr").textContent = `save failed: ${e.message ?? e}`;
+      toastErr(`backend settings not saved (backend down): ${e.message ?? e}`);
+    }
+    $("settingsmodal").classList.add("hidden");
+    parseHotChords(
+      ($("cfg-quick") as HTMLInputElement).value.trim(),
+      ($("cfg-main") as HTMLInputElement).value.trim());
+    // Connection change reboots the app into the right mode.
+    if (urlChanged) location.reload();
+    if (directMode) {
+      const dd = loadDirectSettings();
+      ($("modellabel") as HTMLElement).textContent = dd.model || "model";
     }
   });
 

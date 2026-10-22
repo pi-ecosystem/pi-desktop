@@ -14,12 +14,15 @@ const inTauri = typeof window !== "undefined" && "__TAURI__" in window;
 //   ![alt](https://.../clip.mp4) -> playable card opening the system
 //     player (see VIDEO_FACADE: inline <video> crashes WebKitGTK where
 //     GStreamer is broken, so we never emit a live <video> element).
+//   youtube watch / youtu.be / shorts / live / embed -> click-to-play
+//     youtube-nocookie iframe card (no live iframe until clicked).
 //   bare https://.../pic.png alone on a line -> auto-embed (same rules)
 //   absolute local paths (/home/u/shot.png, file://..., ./rel.png)
 //     render as <img data-local> and resolve via Tauri convertFileSrc at
 //     wire time (needs setMediaBase(dir) for relative paths).
 // Raw <img>/<video> HTML is sanitized down to src+alt+size+playback attrs.
 import hljs from "highlight.js/lib/core";
+import { openuiPlaceholder, wireOpenUI } from "./openui";
 import bash from "highlight.js/lib/languages/bash";
 import c from "highlight.js/lib/languages/c";
 import cpp from "highlight.js/lib/languages/cpp";
@@ -190,7 +193,8 @@ function mediaTag(alt: string, src: string): string {
   if (!safe) return `<span>${esc(alt || src)}</span>`;
   const a = esc(alt);
   const u = esc(safe);
-  if (isVideoSrc(safe)) return videoFacade(a || esc(fileName(safe)), safe);
+  const yt = youTubeId(safe);
+  if (yt) return youTubeFacade(a || "YouTube video", yt.id, yt.start, null);
   // Local files start with NO src attribute: the raw path is not a valid
   // URL and the browser would fire `error` (→ fallback) before read_media
   // resolves. src is set only once real bytes arrive (see wireMedia).
@@ -225,6 +229,74 @@ function fileName(src: string): string {
   } catch {
     return src;
   }
+}
+
+// YouTube: watch / youtu.be / shorts / live / embed URLs can't play in
+// <video> — they need an iframe. Render time holds a click-to-load card
+// (same facade policy as VIDEO_FACADE: no live iframe until the user
+// clicks), then playYouTubeCard swaps in a youtube-nocookie embed.
+function youTubeId(src: string): { id: string; start: number } | null {
+  let u: URL;
+  try {
+    u = new URL(src);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.toLowerCase().replace(/^www\./, "");
+  const okHost =
+    host === "youtube.com" ||
+    host === "m.youtube.com" ||
+    host === "youtu.be" ||
+    host === "youtube-nocookie.com" ||
+    host === "www.youtube-nocookie.com";
+  if (!okHost) return null;
+  const valid = (s: string | null): s is string => !!s && /^[A-Za-z0-9_-]{11}$/.test(s);
+  let id: string | null = null;
+  if (host === "youtu.be") {
+    id = u.pathname.split("/").filter(Boolean)[0] ?? null;
+  } else {
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts[0] === "watch") id = u.searchParams.get("v");
+    else if (parts[0] === "embed" || parts[0] === "shorts" || parts[0] === "live" || parts[0] === "v") id = parts[1] ?? null;
+  }
+  if (!valid(id)) return null;
+  // Start time: ?t=1h2m3s / ?t=90 / ?start=90.
+  let start = 0;
+  const raw = u.searchParams.get("t") ?? u.searchParams.get("start");
+  if (raw) {
+    if (/^\d+$/.test(raw)) start = parseInt(raw, 10);
+    else {
+      const m = raw.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/);
+      if (m) start = (parseInt(m[1] ?? "0", 10) || 0) * 3600 + (parseInt(m[2] ?? "0", 10) || 0) * 60 + (parseInt(m[3] ?? "0", 10) || 0);
+    }
+  }
+  return { id, start: start > 0 ? start : 0 };
+}
+
+function youTubeFacade(caption: string, id: string, start: number, poster: string | null = null): string {
+  const thumb = poster && !isLocalSrc(esc(poster))
+    ? `<span class="media-thumb" aria-hidden="true"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="${esc(poster)}"></span>`
+    : `<span class="media-thumb" aria-hidden="true"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="https://i.ytimg.com/vi/${id}/hqdefault.jpg"></span>`;
+  const localPoster = poster && isLocalSrc(poster) ? ` data-poster-local="${esc(poster)}"` : "";
+  return (
+    `<button class="media-card has-poster yt" data-yt="${id}" data-start="${start}"${localPoster} title="Play YouTube video">` +
+    `${thumb}` +
+    `<span class="media-play" aria-hidden="true">\u25B6</span><span class="media-name">${caption}</span>` +
+    `<span class="media-hint">youtube \u00B7 click to play</span></button>`
+  );
+}
+
+function sanitizeYouTubeIframe(full: string): string | null {
+  const open = full.match(/^<iframe\b[^>]*>/i)?.[0] ?? "";
+  if (!open) return null;
+  const raw = attrVal(open, "src");
+  if (!raw) return null;
+  const safe = safeMediaSrc(raw);
+  if (!safe) return null;
+  const yt = youTubeId(safe);
+  if (!yt) return null;
+  const label = esc(attrVal(open, "title") ?? "YouTube video");
+  return youTubeFacade(label, yt.id, yt.start, null);
 }
 
 // VIDEO_FACADE: render time never contains a live <video> element — it
@@ -294,6 +366,11 @@ function linkedMedia(alt: string, posterInner: string, targetInner: string): str
   const safePoster = posterSrc ? safeMediaSrc(posterSrc) : null;
   const safeTarget = targetSrc ? safeMediaSrc(targetSrc) : null;
   if (!safeTarget) return esc(`[![${alt}](${posterInner})](${targetInner})`);
+  const ytTarget = youTubeId(safeTarget);
+  if (ytTarget) {
+    const label = esc(alt) || "YouTube video";
+    return youTubeFacade(label, ytTarget.id, ytTarget.start, safePoster);
+  }
   if (isVideoSrc(safeTarget)) {
     const label = esc(alt) || esc(fileName(safeTarget));
     return videoFacade(label, safeTarget, safePoster);
@@ -417,6 +494,12 @@ function inline(s: string): string {
   // legitimate embeds survive esc() while everything else stays escaped.
   const mediaHolders: string[] = [];
   let t = s
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, (m) => {
+      const ok = sanitizeYouTubeIframe(m);
+      if (!ok) return m; // non-YouTube iframe: leave for esc()
+      mediaHolders.push(ok);
+      return `\u0005${mediaHolders.length - 1}\u0006`;
+    })
     .replace(/<video\b[^>]*>[\s\S]*?<\/video\s*>/gi, (m) => {
       const ok = sanitizeVideo(m);
       if (!ok) return m; // leave for esc(); renders as harmless text
@@ -494,6 +577,8 @@ export function bareMediaLine(text: string): string | null {
   let url = m[1].replace(/[.,;:!?)\]]+$/, "");
   if (!url) return null;
   if (!safeMediaSrc(url)) return null;
+  const yt = youTubeId(url);
+  if (yt) return mediaTag("", url);
   const ext = extOf(url);
   if (!IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext)) return null;
   return mediaTag("", url);
@@ -542,6 +627,12 @@ function renderMdInner(src: string): string {
         i++;
       }
       i++; // skip closing fence
+      // OpenUI fence renders as a live widget, not code (see openui.ts).
+      const gl = (lang || "").toLowerCase();
+      if (gl === "openui" || gl === "openui-lang" || gl === "genui") {
+        out.push(openuiPlaceholder(buf.join("\n")));
+        continue;
+      }
       const known = lang && hljs.getLanguage(lang) ? lang : "plaintext";
       out.push(
         `<div class="codeblock"><div class="codehead"><span>${esc(lang || "code")}</span>` +
@@ -679,6 +770,9 @@ function renderMdInner(src: string): string {
 // click-to-open-full for images.
 export function wireCopy(container: HTMLElement): void {
   wireMedia(container);
+  // OpenUI widgets mount here (bundle lazy-loads on first fence).
+  // A bad spec must never break the transcript.
+  try { wireOpenUI(container); } catch { /* ignore */ }
   container.querySelectorAll<HTMLElement>("pre code[class*='language-']").forEach((c) => {
     if ((c as any)._hl) return;
     (c as any)._hl = true;
@@ -1016,7 +1110,8 @@ function wireMedia(container: HTMLElement): void {
   container.querySelectorAll<HTMLButtonElement>("button.media-card").forEach((b) => {
     if ((b as any)._wired) return;
     (b as any)._wired = true;
-    b.addEventListener("click", () => playVideoCard(b));
+    if (b.hasAttribute("data-yt")) b.addEventListener("click", () => playYouTubeCard(b));
+    else b.addEventListener("click", () => playVideoCard(b));
   });
 }
 
@@ -1039,6 +1134,47 @@ function cardFallback(b: HTMLButtonElement, label: string): void {
     div.appendChild(c);
   }
   b.replaceWith(div);
+}
+
+function playYouTubeCard(b: HTMLButtonElement): void {
+  const id = b.getAttribute("data-yt") ?? "";
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id)) {
+    cardFallback(b, "YouTube video");
+    return;
+  }
+  const start = parseInt(b.getAttribute("data-start") ?? "0", 10) || 0;
+  const caption = b.querySelector(".media-name")?.textContent ?? "YouTube video";
+  const row = document.createElement("div");
+  row.className = "media-row";
+  const fig = document.createElement("figure");
+  fig.className = "media";
+  const wrap = document.createElement("div");
+  wrap.className = "yt-wrap";
+  const f = document.createElement("iframe");
+  f.src = `https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0${start > 0 ? `&start=${start}` : ""}`;
+  f.title = caption.slice(0, 200);
+  f.allow = "accelerometer; autoplay; encrypted-media; picture-in-picture";
+  (f as any).allowFullscreen = true;
+  f.setAttribute("allowfullscreen", "");
+  f.setAttribute("frameborder", "0");
+  f.setAttribute("referrerpolicy", "strict-origin-when-cross-origin");
+  f.addEventListener("load", mediaSettled, { once: true });
+  wrap.appendChild(f);
+  fig.appendChild(wrap);
+  if (caption) {
+    const c = document.createElement("figcaption");
+    c.textContent = caption;
+    fig.appendChild(c);
+  }
+  row.appendChild(fig);
+  const x = document.createElement("button");
+  x.className = "media-ext";
+  x.textContent = "open on youtube \u2197";
+  x.addEventListener("click", () => {
+    openExternal(`https://www.youtube.com/watch?v=${id}${start > 0 ? `&t=${start}s` : ""}`).catch(() => {});
+  });
+  row.appendChild(x);
+  b.replaceWith(row);
 }
 
 function playVideoCard(b: HTMLButtonElement): void {
