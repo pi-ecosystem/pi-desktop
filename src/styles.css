@@ -336,7 +336,7 @@ details.toolrow > summary:hover { color: var(--text); }
 .tstat { font-weight: 700; }
 .tstat.ok { color: #4ade80; }
 .tstat.err { color: #f87171; }
-.tstat.run { color: #7aa2f7; animation: pulse 1.2s ease-in-out infinite; }
+.tstat.run { color: #b8ccff; font-size: 1.15em; text-shadow: 0 0 8px rgba(122, 162, 247, 0.9); animation: pulse 1.2s ease-in-out infinite; }
 .telapsed { color: var(--dim); font-size: 12px; }
 .diffblock { margin: 6px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .diffhead { padding: 5px 10px; font-size: 12px; color: var(--dim); border-bottom: 1px solid var(--border); }
@@ -571,6 +571,7 @@ html:has(> body.qb) { background: var(--surface); }
 .sdot.lost { color: var(--dim); }
 .spawncard[data-state="lost"] > .spsum { opacity: 0.7; }
 @keyframes pulse { 50% { opacity: 0.35; } }
+
 .spbody { margin-top: 8px; line-height: 1.65; }
 .msg.sys.spawnnote { border-style: solid; }
 

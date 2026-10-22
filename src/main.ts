@@ -2294,6 +2294,9 @@ function finishRun() {
     row.classList.remove("liverow");
   }
   liveToolRows.clear();
+  // Runs just settled: stop all pulsing and restore static labels before
+  // the lastRun tail below reads _label. Open/closed untouched.
+  calmRuns($("msgs"));
   // Follow-up bridge: turn A settled with our message accepted but turn
   // B silent so far — stay visibly working instead of dead idle. Any
   // agent output, abort, or 90s clears it; first token hides dots anyway.
@@ -2680,11 +2683,23 @@ function setRunOpen(d: HTMLDetailsElement, open: boolean): void {
 }
 function collapseRuns(box: HTMLElement, except: HTMLElement | null): void {
   box.querySelectorAll(":scope > details.runact").forEach((r) => {
+    calmRun(r as HTMLElement);
     if (r === except) return;
     if ((r as HTMLElement).dataset.userOpen === "1") return;
     stampRunTime(r as HTMLElement);
     setRunOpen(r as HTMLDetailsElement, false);
   });
+}
+// Settle a group's live state without touching open/closed: drop the
+// pulsing marker and recompute the static (completed) label. Open/close
+// stays the user's (or the collapse caller's) decision.
+function calmRun(run: HTMLElement): void {
+  if (run.dataset.live !== "1") return;
+  delete run.dataset.live;
+  refreshRunLabel(run);
+}
+function calmRuns(box: HTMLElement): void {
+  box.querySelectorAll(":scope > details.runact").forEach((r) => calmRun(r as HTMLElement));
 }
 // Group span from the file's own message timestamps. No wall clock,
 // no memory: still-running groups show no time until they close.
@@ -2708,12 +2723,16 @@ function stampRunTime(run: HTMLElement): void {
     run.dataset.tstamped = "1";
   } catch { /* keep previous label */ }
 }
-// Fresh live container: open it. Older groups are NOT touched here —
-// they collapse when the next agent message lands (see
-// appendMessageEnd), so every group follows the same rule, including
-// the last one.
-function openFreshRun(_box: HTMLElement, run: HTMLElement): void {
-  setRunOpen(run as HTMLDetailsElement, true);
+// Closed-group live style: a running group never opens. The summary
+// carries the latest activity with a pulsing dot; the body stays shut
+// until the user opens it. Completed groups keep the old behavior
+// (collapsed, static label). Only one group pulses at a time.
+function openFreshRun(box: HTMLElement, run: HTMLElement): void {
+  box.querySelectorAll(":scope > details.runact").forEach((r) => {
+    if (r !== run) delete (r as HTMLElement).dataset.live;
+  });
+  run.dataset.live = "1";
+  refreshRunLabel(run);
 }
 // Final answer / settle: collapse every Activity except user-pinned ones.
 function collapseAllRuns(box: HTMLElement): void {
@@ -2783,15 +2802,34 @@ function refreshRunLabel(run: HTMLElement): void {
       const t = (d.textContent ?? "").replace(/\s+/g, " ").trim();
       if (t && t !== "Thought") thoughts.push(t.split(/[.?!]\s/)[0].slice(0, 110));
     });
+    const live = run.dataset.live === "1";
     let base = "";
-    if (rows.length > 0 && thoughts.length === 0) base = toolMixLabel(rows);
-    else if (thoughts.length) base = thoughts[thoughts.length - 1];
+    // Live groups name the LATEST activity (it pulses in the summary);
+    // completed groups keep the aggregate breakdown.
+    if (thoughts.length) base = thoughts[thoughts.length - 1];
+    else if (rows.length > 0) base = live ? lastToolText(rows) : toolMixLabel(rows);
     else return;
     if (!base) return;
     (run as any)._label = base;
     const sum = run.querySelector(":scope > summary");
-    if (sum) sum.innerHTML = `<span class="tgsum-txt">${esc(base)}</span> ${CHEV}`;
+    if (sum) {
+      sum.innerHTML = `${live ? `<span class="tstat run">◌</span> ` : ""}` +
+        `<span class="tgsum-txt">${esc(base)}</span> ${CHEV}`;
+    }
   } catch { /* keep previous label */ }
+}
+
+// Newest tool row's one-line summary, glyphs and extra whitespace
+// stripped — the group's pulse label while running.
+function lastToolText(rows: NodeListOf<Element>): string {
+  const last = rows[rows.length - 1];
+  const t = (last.querySelector(":scope > summary")?.textContent ?? "")
+    .replace(/\s+/g, " ").trim()
+    .replace(/^[^A-Za-z0-9$]+/, "")
+    // The pulse dot already says running — the word is noise.
+    .replace(/\s·\s(running|ended)…?\s*$/, "")
+    .slice(0, 120);
+  return t;
 }
 
 // Explicit per-kind summary, counts only — never file names or tool
@@ -3741,6 +3779,18 @@ async function syncRunFlag() {
       // strip first, then re-arm the thinking indicator.
       document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
       showThinking();
+      // The rebuild also dropped the live marker (file has no live
+      // state), orphaning the activity UI: the last group would sit
+      // settled while the run continues, and the next live event would
+      // open a duplicate group. Re-anchor onto the last group so it
+      // pulses again and appends continue inside it.
+      const runs = document.querySelectorAll<HTMLElement>("#msgs > details.runact");
+      const last = runs[runs.length - 1];
+      if (last) {
+        liveRun = last;
+        last.dataset.live = "1";
+        refreshRunLabel(last);
+      }
     }
     // Count-only queue fallback: texts arrive via queue_update, but a
     // background queue predates our view of the session. Never invent
