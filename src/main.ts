@@ -4509,11 +4509,31 @@ function parseHotChords(qb: unknown, main: unknown): void {
 function chordHeld(c: { key: string; mods: string[] }, e: KeyboardEvent): boolean {
   if (e.key.toLowerCase() !== c.key) return false;
   if (!c.mods.length) return true;
-  return c.mods.some((m) =>
-    (m === "super" || m === "meta" || m === "cmd" || m === "win") ? e.metaKey
-    : (m === "ctrl" || m === "control") ? e.ctrlKey
-    : m === "shift" ? e.shiftKey
-    : (m === "alt" || m === "opt") ? e.altKey : false);
+  // Exact modifier match: every listed mod held, no unlisted mod held.
+  // The old .some() check fired Super+Shift+J on a bare Shift+J,
+  // eating every capital J typed in the app.
+  const norm = (m: string): string =>
+    (m === "super" || m === "meta" || m === "cmd" || m === "command" || m === "win") ? "meta"
+    : (m === "ctrl" || m === "control") ? "ctrl"
+    : m === "shift" ? "shift"
+    : (m === "alt" || m === "opt" || m === "option") ? "alt" : "";
+  const want = new Set(c.mods.map(norm).filter(Boolean));
+  if (!want.size) return true;
+  const held = new Set<string>();
+  if (e.metaKey) held.add("meta");
+  if (e.ctrlKey) held.add("ctrl");
+  if (e.altKey) held.add("alt");
+  // Shift counts only when chord-listed, or when needed to type the key
+  // itself (symbols like ? or +). A capital letter never needs shift
+  // for matching — extra shift means typing, not the chord.
+  if (e.shiftKey) {
+    const symbolKey = e.key.length === 1 && /[^a-zA-Z0-9]/.test(e.key);
+    if (!want.has("shift") && !symbolKey) return false;
+    held.add("shift");
+  }
+  for (const m of want) if (!held.has(m)) return false;
+  for (const m of held) if (!want.has(m)) return false;
+  return true;
 }
 parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines below
 

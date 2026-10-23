@@ -64,7 +64,12 @@ outside fences stays Markdown as usual. One widget per fence.
 
 Widget button presses and form submits come back to you as
 `[ui action] <message>` (plus `[data] {...}` for form values) — act on
-them directly.
+them directly. Keep widgets compact: Buttons at size "small" unless a
+single primary action earns "medium"; tables under ~8 rows. Every
+chart gets a title and labeled axes — an unlabeled chart is useless.
+Never put secrets, tokens, or private paths in a spec (it lives in the
+transcript file). End widget answers with 2–4 FollowUpBlock chips for
+likely next actions. Widget text matches the user's language.
 
 Reference — openui-lang component library and syntax (authoritative):
 
