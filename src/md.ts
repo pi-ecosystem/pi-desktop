@@ -15,7 +15,7 @@ const inTauri = typeof window !== "undefined" && "__TAURI__" in window;
 //     player (see VIDEO_FACADE: inline <video> crashes WebKitGTK where
 //     GStreamer is broken, so we never emit a live <video> element).
 //   youtube watch / youtu.be / shorts / live / embed -> click-to-play
-//     youtube-nocookie iframe card (no live iframe until clicked).
+//     youtube iframe card (no live iframe until clicked).
 //   bare https://.../pic.png alone on a line -> auto-embed (same rules)
 //   absolute local paths (/home/u/shot.png, file://..., ./rel.png)
 //     render as <img data-local> and resolve via Tauri convertFileSrc at
@@ -234,7 +234,8 @@ function fileName(src: string): string {
 // YouTube: watch / youtu.be / shorts / live / embed URLs can't play in
 // <video> — they need an iframe. Render time holds a click-to-load card
 // (same facade policy as VIDEO_FACADE: no live iframe until the user
-// clicks), then playYouTubeCard swaps in a youtube-nocookie embed.
+// clicks), then playYouTubeCard swaps in a youtube embed (standard host:
+// nocookie embeds get Error 153 under the app's custom URL scheme).
 function youTubeId(src: string): { id: string; start: number } | null {
   let u: URL;
   try {
@@ -274,9 +275,11 @@ function youTubeId(src: string): { id: string; start: number } | null {
 }
 
 function youTubeFacade(caption: string, id: string, start: number, poster: string | null = null): string {
+  // True-16:9 thumbnail with hqdefault fallback (not all videos have
+  // maxres). onerror is our own markup, not agent input — safe inline.
   const thumb = poster && !isLocalSrc(esc(poster))
     ? `<span class="media-thumb" aria-hidden="true"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="${esc(poster)}"></span>`
-    : `<span class="media-thumb" aria-hidden="true"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="https://i.ytimg.com/vi/${id}/hqdefault.jpg"></span>`;
+    : `<span class="media-thumb" aria-hidden="true"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="https://i.ytimg.com/vi/${id}/maxresdefault.jpg" onerror="this.onerror=null;this.src='https://i.ytimg.com/vi/${id}/hqdefault.jpg'"></span>`;
   const localPoster = poster && isLocalSrc(poster) ? ` data-poster-local="${esc(poster)}"` : "";
   return (
     `<button class="media-card has-poster yt" data-yt="${id}" data-start="${start}"${localPoster} title="Play YouTube video">` +
@@ -1151,7 +1154,7 @@ function playYouTubeCard(b: HTMLButtonElement): void {
   const wrap = document.createElement("div");
   wrap.className = "yt-wrap";
   const f = document.createElement("iframe");
-  f.src = `https://www.youtube-nocookie.com/embed/${id}?autoplay=1&rel=0${start > 0 ? `&start=${start}` : ""}`;
+  f.src = `https://www.youtube.com/embed/${id}?autoplay=1&rel=0${start > 0 ? `&start=${start}` : ""}`;
   f.title = caption.slice(0, 200);
   f.allow = "accelerometer; autoplay; encrypted-media; picture-in-picture";
   (f as any).allowFullscreen = true;
@@ -1167,13 +1170,6 @@ function playYouTubeCard(b: HTMLButtonElement): void {
     fig.appendChild(c);
   }
   row.appendChild(fig);
-  const x = document.createElement("button");
-  x.className = "media-ext";
-  x.textContent = "open on youtube \u2197";
-  x.addEventListener("click", () => {
-    openExternal(`https://www.youtube.com/watch?v=${id}${start > 0 ? `&t=${start}s` : ""}`).catch(() => {});
-  });
-  row.appendChild(x);
   b.replaceWith(row);
 }
 

@@ -30,7 +30,7 @@ for (const a of args) {
 // `pi install` (single copy in ~/.pi/agent) — never vendored, so pi and
 // desktop can never disagree about which copy is loaded.
 const EXTENSIONS = [
-  "git:github.com/pi-ecosystem/pi-spawn",           // subagents (Agents panel)
+  "git:github.com/pi-ecosystem/pi-jobs",             // background jobs + subagents (Agents/Processes panels)
   "git:github.com/pi-ecosystem/pi-shadow-browser", // browser_* tools
 ];
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{Request, StatusCode},
+    http::{Method, Request, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive},
@@ -22,8 +22,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 
 use super::{
-    delete_session, delete_spawn_run, list_sessions, media_stat, pids_alive, rename_session,
-    read_media, read_office_text, read_session_messages, read_sheet, read_spawn_log, read_spawn_transcript, AppState,
+    delete_session, list_sessions, media_stat, rename_session,
+    list_session_jobs, read_job_log, read_job_transcript, read_media, read_office_text, read_session_messages, read_sheet, AppState,
 };
 
 // ---------------------------------------------------------------- params
@@ -93,18 +93,6 @@ fn dispatch(
                 .map(|_| serde_json::Value::Null)
         }
         "pi_states" => Ok(be.pi_states_core()),
-        "pids_alive" => {
-            let pids: Vec<i32> = p
-                .get("pids")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_i64().map(|n| n as i32))
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(serde_json::json!(pids_alive(pids)))
-        }
         "list_sessions" => {
             let cwd_filter = s(p, "cwd_filter", "cwdFilter");
             let session_root = s(p, "session_root", "sessionRoot");
@@ -138,17 +126,17 @@ fn dispatch(
             let offset = opt_u(p, "offset", "offset");
             read_session_messages(path, session_root, max_bytes, offset)
         }
-        "read_spawn_transcript" => {
-            let run_id = req_s(p, "run_id", "runId", "run_id")?;
-            read_spawn_transcript(run_id)
+        "read_job_transcript" => {
+            let id = req_s(p, "id", "id", "job id")?;
+            read_job_transcript(id)
         }
-        "read_spawn_log" => {
-            let run_id = req_s(p, "run_id", "runId", "run_id")?;
-            read_spawn_log(run_id)
+        "read_job_log" => {
+            let id = req_s(p, "id", "id", "job id")?;
+            read_job_log(id)
         }
-        "delete_spawn_run" => {
-            let run_id = req_s(p, "run_id", "runId", "run_id")?;
-            delete_spawn_run(run_id).map(|_| serde_json::Value::Null)
+        "list_session_jobs" => {
+            let session_file = s(p, "session_file", "sessionFile").unwrap_or_default();
+            list_session_jobs(session_file)
         }
         "read_sheet" => {
             let path = req_s(p, "path", "path", "path")?;
@@ -241,15 +229,60 @@ async fn cors(req: Request<Body>, next: Next) -> impl IntoResponse {
 
 // ---------------------------------------------------------------- run
 
-/// Serve the backend on 127.0.0.1:port. Ctrl-C kills supervised children
-/// (mirrors the SIGTERM handler the old Node bridge had).
-pub fn run_server(port: u16) {
+/// Bearer gate for remote mode. No token configured → open (localhost
+/// dev); token set → every /api call needs it, as an Authorization
+/// header or (EventSource can't set headers) a ?token= query param.
+/// Tokens are alphanumeric (frontend generates them so), so a raw
+/// query-pair compare is safe.
+async fn require_token(
+    State(be): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // CORS preflight carries no auth — let it through, the real call
+    // behind it is still gated.
+    if req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+    let need = be.get_config_core().remote_token;
+    if !need.is_empty() {
+        let via_header = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == format!("Bearer {need}"))
+            .unwrap_or(false);
+        let via_query = req
+            .uri()
+            .query()
+            .map(|q| q.split('&').any(|p| p == format!("token={need}")))
+            .unwrap_or(false);
+        if !via_header && !via_query {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "ok": false, "error": "unauthorized (bad or missing token)" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Serve the backend over HTTP. Binds localhost with an open door when
+/// no remote token is set (safe dev default); all interfaces + Bearer
+/// auth once a token exists (phone remote mode — restart to rebind).
+/// Ctrl-C kills supervised children (mirrors the SIGTERM handler the
+/// old Node bridge had).
+pub fn run_server(port_override: Option<u16>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
     rt.block_on(async move {
         let backend = AppState::new_shared();
+        let cfg = backend.get_config_core();
+        let port = port_override.unwrap_or(cfg.remote_port);
+        let exposed = !cfg.remote_token.is_empty();
         {
             let be = backend.clone();
             tokio::spawn(async move {
@@ -276,13 +309,19 @@ pub fn run_server(port: u16) {
             // default would 413 every real attachment first.
             .layer(DefaultBodyLimit::disable())
             .layer(middleware::from_fn(cors))
+            .layer(middleware::from_fn_with_state(backend.clone(), require_token))
             .with_state(backend);
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let ip = if exposed { [0, 0, 0, 0] } else { [127, 0, 0, 1] };
+        let addr = std::net::SocketAddr::from((ip, port));
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
             eprintln!("[pi-desktop] cannot bind http://localhost:{port}: {e}");
             std::process::exit(1);
         });
-        println!("[pi-desktop] backend on http://localhost:{port}");
+        if exposed {
+            println!("[pi-desktop] backend on 0.0.0.0:{port} (token auth on)");
+        } else {
+            println!("[pi-desktop] backend on http://localhost:{port}");
+        }
         axum::serve(listener, app).await.expect("serve backend");
     });
 }

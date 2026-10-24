@@ -518,6 +518,12 @@ figure.media video { display: block; max-width: 100%; max-height: 420px; width: 
 .media-thumb:empty { display: none; }
 .media-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .media-card.has-poster { min-height: 150px; align-items: flex-end; border: none; }
+/* YouTube thumbs are 16:9: give the card the same ratio instead of a
+   content-height strip, or cover-crop beheads everything. Caption
+   overlays the bottom via the gradient; play stays centered. No
+   max-height: a height cap would over-constrain the box and break the
+   ratio on wide windows — the card must match .yt-wrap exactly. */
+.media-card.has-poster.yt { aspect-ratio: 16 / 9; min-height: 0; max-height: none; }
 .media-card.has-poster::after { content: ""; position: absolute; inset: 0; background: linear-gradient(transparent 40%, rgba(0, 0, 0, 0.72)); pointer-events: none; }
 .media-card.has-poster .media-play { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 44px; height: 44px; font-size: 16px; z-index: 1; }
 .media-card.has-poster .media-name, .media-card.has-poster .media-hint { position: relative; z-index: 1; color: #fff; }
@@ -557,7 +563,7 @@ html:has(> body.qb) { background: var(--surface); }
 .qbrow { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--dim); }
 .qbsp { flex: 1; }
 
-/* spawned subagents via pi-spawn (see SPAWN.md there): one card per child */
+/* jobs via pi-jobs: one card per job */
 
 .showearlier { display: block; margin: 10px auto 6px; border-radius: 999px; font-size: 12px; opacity: 0.85; }
 .showearlier:hover:not(:disabled) { opacity: 1; }
@@ -584,7 +590,7 @@ html:has(> body.qb) { background: var(--surface); }
 .spbody { margin-top: 8px; line-height: 1.65; }
 .msg.sys.spawnnote { border-style: solid; }
 
-/* Agents panel: index over spawn-* messages, mirrors the Changes pane */
+/* Agents panel: index over job-* messages, mirrors the Changes pane */
 #agentsbar, #procsbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--sideborder); min-height: 52px; }
 #agentstitle, #procstitle { flex: 1; font-weight: 500; font-size: 14px; }
 #agentsbody { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 10px 10px 24px; display: flex; flex-direction: column; gap: 4px; min-height: 0; }

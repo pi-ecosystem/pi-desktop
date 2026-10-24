@@ -36,7 +36,7 @@ function subKey(cwd: string): string {
 let unlistenEvents: (() => void) | null = null;
 
 // Drop the event channel so the next ensureListening() opens a fresh one.
-// Heals half-open zombies (e.g. created while Termux was frozen: TCP up,
+// Heals half-open zombies (e.g. server went away mid-silence: TCP up,
 // no data, no error, no reconnect — every call hangs till its timeout).
 // Only used on paths with no healthy long runs in flight (boot/retry).
 export function recycleEvents(): void {
@@ -256,30 +256,27 @@ export const runStates = {
     invoke("pi_states"),
 };
 
-// Process liveness probe for subagent rows orphaned by a crash/reboot
-// (pi-spawn/SPAWN.md). Same command name as the Tauri backend. Only ever
-// marks rows dead (high confidence); a live answer changes nothing, so
-// pid reuse can at worst leave a row "running", never kill a live one.
-export const procAlive = {
-  check: (pids: number[]): Promise<boolean[]> => invoke("pids_alive", { pids }),
+// Jobs submitted from one pi session (matched on its session file).
+// The sidebar renders this natively — source of truth, no scraping.
+export const sessionJobs = {
+  list: (sessionFile: string): Promise<{ jobs: any[] }> =>
+    invoke("list_session_jobs", { sessionFile }),
 };
 
-// Transcript of one spawned subagent (pi-spawn/SPAWN.md). Scoped server-side
-// to the spawn-sessions root. Returns {messages} in get_messages shape.
-export const spawnTranscript = {
-  read: (runId: string): Promise<{ messages: any[] }> =>
-    // Tauri maps JS camelCase to Rust snake_case: must be runId here.
-    invoke("read_spawn_transcript", { runId }),
-  remove: (runId: string): Promise<void> =>
-    invoke("delete_spawn_run", { runId }),
+// Transcript of one pi-jobs subagent: its session jsonl parsed server-side
+// into {messages} in get_messages shape. The backend resolves a job id,
+// run id, or unambiguous prefix via the jobs registry.
+export const jobTranscript = {
+  read: (id: string): Promise<{ messages: any[] }> =>
+    invoke("read_job_transcript", { id }),
 };
 
-// Tail of one background process's log (pi-spawn/SPAWN.md, spawn_bg).
-// Scoped server-side to the spawn-sessions root. Returns the last 256KB
-// starting on a line boundary: {text, size, truncated}.
-export const spawnLog = {
-  read: (runId: string): Promise<{ text: string; size: number; truncated: boolean }> =>
-    invoke("read_spawn_log", { runId }),
+// Tail of one pi-jobs run's log. The backend resolves a job id, run id, or
+// prefix via the jobs registry. Returns the last 256KB starting on a line
+// boundary: {text, size, truncated}.
+export const jobLog = {
+  read: (id: string): Promise<{ text: string; size: number; truncated: boolean }> =>
+    invoke("read_job_log", { id }),
 };
 
 export interface AppConfig {

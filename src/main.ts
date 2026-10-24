@@ -6,7 +6,7 @@ import { invoke } from "./tauri-shim";
 import { ensureServerBackend, isServerMode, sendShutdownBeacon } from "./tauri-shim";
 import { listen } from "./tauri-shim";
 import { getCurrentWindow, getCurrentWebview } from "./tauri-window-shim";
-import { awaitSession, config, ensure, getKey, onRecord, onRunStatus, pi, procAlive, recycleEvents, runStates, sessions, setKey, setTag, spawnLog, spawnTranscript, stopChild, type PiCommand, type SessionInfo } from "./pi";
+import { awaitSession, config, ensure, getKey, jobLog, jobTranscript, onRecord, onRunStatus, pi, recycleEvents, runStates, sessionJobs, sessions, setKey, setTag, stopChild, type PiCommand, type SessionInfo } from "./pi";
 import {
   deleteDirectChat,
   getDirectChat,
@@ -376,11 +376,10 @@ function setSidePane(tab: "changes" | "agents" | "procs" | null) {
     if (tab === "changes") renderDiffPane();
     else if (tab === "agents") {
       renderAgents();
-      // Opening the panel is the moment stale rows matter: force a probe.
-      void reconcileSpawns(true);
+      void refreshJobs(true);
     } else {
       renderProcs();
-      void reconcileSpawns(true);
+      void refreshJobs(true);
     }
   }
   syncPaneBtns();
@@ -982,12 +981,14 @@ function wireAttachFiles(container: HTMLElement): void {
 
 function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement {
   const role = m.role ?? "unknown";
-  // Subagents via pi-spawn (see SPAWN.md there): one collapsed card per
-  // child — dispatch + result inline, detail behind the click, index in
-  // the Agents panel. Tracked here so history rebuilds and live appends
-  // share one code path.
-  if (role === "custom" && typeof m.customType === "string" && m.customType.startsWith("spawn-")) {
-    return spawnCard(m);
+  // Jobs via pi-jobs: one collapsed card per job — dispatch + result
+  // inline, detail behind the click, index in the Agents/Processes panel.
+  // Tracked here so history rebuilds and live appends share one path.
+  // Legacy spawn-* cards (pre-jobs histories) render through the same
+  // card; only job-* rows are live-tracked with pids and log detail.
+  if (role === "custom" && typeof m.customType === "string"
+    && (m.customType.startsWith("job-") || m.customType.startsWith("spawn-"))) {
+    return jobCard(m);
   }
   if (role === "user") {
     const wrap = el("div", "umsgwrap");
@@ -1088,174 +1089,157 @@ function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ---- spawned subagents via pi-spawn (see SPAWN.md there) ----
-// Sessions all the way down: the panel is an index over spawn-* messages
-// (dispatch + result inline, detail behind the click). One map, fed by
-// msgNode, so live appends and history rebuilds can never disagree.
-type SpawnInfo = { id: string; label: string; state: string; kind: "agent" | "proc"; startedAt?: number; durationMs?: number; runId?: string; pid?: number; logFile?: string; exitCode?: number; command?: string };
-const spawns = new Map<string, SpawnInfo>();
+// ---- jobs via pi-jobs: native sidebar ----
+// The DB is the source of truth, scoped per session (pi-jobs records
+// the submitting session file on every job). The panel renders
+// list_session_jobs directly — no message scraping, no tombstones, no
+// pid probes. Chat cards below are stateless receipts; live state lives
+// here. kind split: a session-jsonl log means the pi-subagent recipe
+// (Agents tab), anything else is a plain background process.
+type JobInfo = { id: string; label: string; state: string; kind: "agent" | "proc"; startedAt?: number; durationMs?: number; runId?: string; pid?: number; logFile?: string; exitCode?: number; command?: string };
+let jobRows: JobInfo[] = [];
 
-function threadOf(d: any): string {
-  return typeof d.thread === "string" && d.thread ? d.thread : d.id;
+function kindOf(d: any): "agent" | "proc" {
+  if (typeof d.logFile === "string" && d.logFile.endsWith(".jsonl")) return "agent";
+  if (typeof d.command === "string" && d.command.includes("pi --session")) return "agent";
+  return "proc";
 }
 
-function trackSpawn(m: any): void {
-  const ct: string = m.customType ?? "";
-  const d = m.details ?? {};
-  // Tombstones: deletes persist in parent history as notes, so rebuilds
-  // re-bury them. Keyed by viewed session; cheap cached parse.
-  if (d.deleted && d.id) {
-    burySpawn(threadOf(d));
-    spawns.delete(threadOf(d));
-    if (selSpawn === threadOf(d)) {
-      selSpawn = null;
+let jobsFetchInFlight = false;
+let lastJobsFetch = 0;
+// Re-read this session's jobs from the DB (scoped by session file).
+// Prunes selections for vanished rows; safe to call from any trigger.
+async function refreshJobs(force = false): Promise<void> {
+  const file = curFile ?? "";
+  if (!file) {
+    if (jobRows.length) {
+      jobRows = [];
+      updateAgentsBtn();
+      if (agentsVisible()) renderAgents();
+      if (procsVisible()) renderProcs();
+    }
+    return;
+  }
+  if (jobsFetchInFlight) return;
+  if (!force && Date.now() - lastJobsFetch < 5000) return;
+  lastJobsFetch = Date.now();
+  jobsFetchInFlight = true;
+  try {
+    const data = await sessionJobs.list(file);
+    if ((curFile ?? "") !== file) return; // moved on: drop stale fetch
+    const rows: JobInfo[] = ((data as any).jobs ?? []).map((j: any) => ({
+      id: String(j.id),
+      label: String(j.label ?? j.id),
+      state: String(j.state ?? "running"),
+      kind: j.kind === "proc" ? "proc" : "agent",
+      ...(typeof j.startedAt === "number" ? { startedAt: j.startedAt } : {}),
+      ...(typeof j.durationMs === "number" ? { durationMs: j.durationMs } : {}),
+      ...(typeof j.runId === "string" ? { runId: j.runId } : {}),
+      ...(typeof j.pid === "number" ? { pid: j.pid } : {}),
+      ...(typeof j.logFile === "string" && j.logFile ? { logFile: j.logFile } : {}),
+      ...(typeof j.exitCode === "number" ? { exitCode: j.exitCode } : {}),
+    }));
+    jobRows = rows;
+    if (selJob && !rows.some((r) => r.id === selJob)) {
+      selJob = null;
       detailCount = -1;
     }
+    if (selProc && !rows.some((r) => r.id === selProc)) selProc = null;
     updateAgentsBtn();
     if (agentsVisible()) renderAgents();
     if (procsVisible()) renderProcs();
-    return;
-  }
-  if (ct === "spawn-started" || ct === "spawn-bg-started") {
-    if (!d.id) return;
-    const tid = threadOf(d);
-    if (isBuried(tid)) return;
-    const prev = spawns.get(tid);
-    // One row per conversation: continuations flip the SAME row back to
-    // running and retarget it at the new run. First-seen label wins.
-    const entry: SpawnInfo = {
-      id: tid,
-      label: prev?.label ?? d.label ?? tid,
-      state: "running",
-      kind: ct === "spawn-bg-started" ? "proc" : (prev?.kind ?? "agent"),
-      startedAt: prev?.startedAt ?? (typeof d.startedAt === "number" ? d.startedAt : undefined),
-      runId: d.id,
-      ...(typeof d.pid === "number" ? { pid: d.pid } : {}),
-      ...(typeof d.logFile === "string" ? { logFile: d.logFile } : {}),
-      ...(typeof d.command === "string" ? { command: d.command } : {}),
-    };
-    if (!refreshActive) {
-      // Live start supersedes any stale mark (e.g. an explicit
-      // continuation of a lost thread): this run is real. A later probe
-      // re-marks it if the process is actually gone.
-      staleDrop(tid);
-    } else if (staleHas(tid)) {
-      // Rebuild: the backend can no longer settle this run.
-      entry.state = "lost";
-    }
-    spawns.set(tid, entry);
-  } else if (ct === "spawn-done" || ct === "spawn-stopped" || ct === "spawn-bg-done" || ct === "spawn-bg-stopped") {
-    if (!d.id) return;
-    const tid = threadOf(d);
-    if (isBuried(tid)) return;
-    // Completion is authoritative: clears any stale mark (the run did
-    // finish — e.g. its done note simply arrived after the marking).
-    staleDrop(tid);
-    const isProc = ct.startsWith("spawn-bg-");
-    const s: SpawnInfo = spawns.get(tid) ?? { id: tid, label: d.label ?? tid, state: "running", kind: isProc ? "proc" : "agent" };
-    s.state = d.status ?? (ct.endsWith("-done") ? "done" : "stopped");
-    s.runId = d.id;
-    if (typeof d.durationMs === "number") s.durationMs = d.durationMs;
-    if (typeof d.exitCode === "number") s.exitCode = d.exitCode;
-    if (typeof d.logFile === "string") s.logFile = d.logFile;
-    spawns.set(tid, s);
-    morphSpawnCards(tid);
-  } else {
-    return;
-  }
-  updateAgentsBtn();
-  if (agentsVisible()) renderAgents();
-  if (procsVisible()) renderProcs();
+  } catch { /* backend without list_session_jobs: panels stay empty */ }
+  finally { jobsFetchInFlight = false; }
+}
+function scheduleJobsRefresh(): void {
+  void refreshJobs();
 }
 
-function spawnElapsed(s: SpawnInfo): string {
+function jobElapsed(s: JobInfo): string {
   const ms = typeof s.durationMs === "number" ? s.durationMs
     : typeof s.startedAt === "number" ? Date.now() - s.startedAt : -1;
   if (ms < 0) return "";
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
-function spawnDot(state: string): string {
+function jobDot(state: string): string {
   const cls = state === "running" ? "running" : state === "done" ? "done" : state === "lost" ? "lost" : "stopped";
   const glyph = state === "running" ? "◌" : state === "done" ? "●" : state === "lost" ? "○" : "■";
   return `<span class="sdot ${cls}">${glyph}</span>`;
 }
 
-function spawnSummaryHTML(s: SpawnInfo): string {
+function jobSummaryHTML(s: JobInfo): string {
   const running = s.state === "running";
   const isProc = s.kind === "proc";
-  // Actions target the live RUN; rows and deletes target the THREAD.
-  const run = s.runId ?? s.id;
+  // Actions target the JOB (kills its running runs); deletes bury the row.
+  // pi-jobs has no steering — running rows offer stop only.
   const exit = isProc && typeof s.exitCode === "number" ? `<span class="spexit">exit ${s.exitCode}</span>` : "";
   const acts = running
     ? `<span class="spacts">` +
-      (isProc ? "" : `<button class="ssteer" data-id="${esc(run)}" title="Steer this subagent">steer</button>`) +
-      `<button class="sstop" data-id="${esc(run)}"${isProc ? ` data-kind="proc"` : ""} title="Stop this ${isProc ? "process" : "subagent"}">stop</button></span>`
+      `<button class="sstop" data-id="${esc(s.id)}" title="Stop this ${isProc ? "process" : "subagent"}">stop</button></span>`
     : "";
-  return spawnDot(s.state) +
+  return jobDot(s.state) +
     `<span class="splabel">${esc(s.label)}</span>` +
     `<span class="spsid">${esc(s.id.slice(-6))}</span>` +
-    `<span class="spelapsed">${esc(spawnElapsed(s))}</span>` +
+    `<span class="spelapsed">${esc(jobElapsed(s))}</span>` +
     exit + acts;
 }
 
 // A done/stopped notice supersedes its dispatch receipt: morph the
 // summary in place (state, elapsed, buttons) so no stale "running +
 // stop" lingers. Receipts never grow a body — detail lives in the panel.
-function morphSpawnCards(id: string): void {
-  const s = spawns.get(id);
-  if (!s) return;
-  for (const card of Array.from(document.querySelectorAll(`.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
-    const sum = card.querySelector(":scope > .spsum");
-    if (sum) sum.innerHTML = spawnSummaryHTML(s);
-    (card as HTMLElement).dataset.state = s.state;
-  }
-}
-
-function spawnCard(m: any): HTMLElement {
-  trackSpawn(m);
+function jobCard(m: any): HTMLElement {
   const ct: string = m.customType ?? "";
-  const isProc = ct.startsWith("spawn-bg-");
+  const isJob = ct.startsWith("job-");
   const d = m.details ?? {};
-  const id: string = d.id ?? "";
-  if (ct === "spawn-note") {
+  // Delete + stop confirmations never render (the row vanishing or its
+  // state flipping IS the feedback). Other job notes still show.
+  if ((ct === "job-note" || ct === "spawn-note")
+    && (d.deleted === true || /^Deleted \S+\.?$/.test(textOf(m.content).trim())
+      || /^Killed running runs of \S+\.?$/.test(textOf(m.content).trim())
+      || /^Kill signaled on \S+\.?$/.test(textOf(m.content).trim()))) {
+    return el("div", "hidden");
+  }
+  if (ct === "job-note" || ct === "spawn-note") {
     return el("div", "msg sys spawnnote", renderMd(textOf(m.content).slice(0, 2000)));
   }
+  const key: string = isJob
+    ? (typeof d.jobId === "string" && d.jobId ? d.jobId : d.runId ?? "")
+    : (d.id ?? "");
+  // Stateless receipt: live state lives in the DB-backed side panel.
+  // History cards show dispatch-time truth; completions arrive as their
+  // own (silent) messages and morph nothing here.
+  const kind = isJob ? kindOf(d) : (ct.startsWith("spawn-bg-") ? "proc" : "agent");
+  const isProc = kind === "proc";
   const label = d.label ?? (isProc ? "process" : "subagent");
-  const running = ct === "spawn-started" || ct === "spawn-bg-started";
-  // Rebuilds may know more than the bare message (stale/lost orphans):
-  // prefer the tracked state so dead rows never render "Running…".
-  // (trackSpawn ran first, above, so this is fresh.)
-  const tracked = d.id ? spawns.get(threadOf(d)) : undefined;
-  const state = tracked?.state ?? (running ? "running" : (d.status ?? (ct.endsWith("-done") ? "done" : "stopped")));
-  const info: SpawnInfo = {
-    id, label, state, kind: isProc ? "proc" : "agent",
+  const running = ct === "job-started" || ct === "spawn-started" || ct === "spawn-bg-started";
+  const state = running ? "running" : (d.status ?? (ct.endsWith("-done") ? "done" : "stopped"));
+  const info: JobInfo = {
+    id: key, label, state, kind: isProc ? "proc" : "agent",
     ...(typeof d.durationMs === "number" ? { durationMs: d.durationMs } : {}),
     ...(typeof d.startedAt === "number" ? { startedAt: d.startedAt } : {}),
     ...(typeof d.exitCode === "number" ? { exitCode: d.exitCode } : {}),
     ...(typeof d.logFile === "string" ? { logFile: d.logFile } : {}),
   };
   const wrap = el("div", "spawncard");
-  // Receipt identity is the THREAD: continuations morph the same receipt.
+  // Receipt identity is the JOB (retries morph the same receipt).
   // No expandable body — clicking jumps to the row in the side panel,
   // where the transcript/log detail lives.
-  if (d.id) wrap.dataset.spawnId = threadOf(d);
+  if (key) wrap.dataset.spawnId = key;
   wrap.dataset.state = state;
   wrap.dataset.kind = isProc ? "proc" : "agent";
   wrap.title = isProc ? "Open in Processes tab" : "Open in Subagents tab";
-  wrap.appendChild(el("div", "spsum", spawnSummaryHTML(info)));
+  wrap.appendChild(el("div", "spsum", jobSummaryHTML(info)));
   wrap.addEventListener("click", (e) => {
-    // Steer/stop buttons handle themselves (see the delegated send).
-    if ((e.target as HTMLElement).closest?.(".ssteer,.sstop")) return;
-    if (d.id) gotoSpawnPanel(threadOf(d));
+    // Stop buttons handle themselves (see the delegated send).
+    if ((e.target as HTMLElement).closest?.(".sstop")) return;
+    if (key) gotoJobPanel(key);
   });
-  // Late supersede: if done already arrived, morph immediately.
-  if (d.id && !running) morphSpawnCards(threadOf(d));
   return wrap;
 }
 
 function updateAgentsBtn(): void {
-  const all = [...spawns.values()];
+  const all = jobRows;
   const n = all.filter((s) => s.state === "running").length;
   const badge = $("panebadge");
   badge.textContent = n ? String(n) : "";
@@ -1269,8 +1253,8 @@ function updateAgentsBtn(): void {
 function renderAgents(): void {
   renderAgentsList();
   const t = $("agenttranscript");
-  if (selSpawn) {
-    void renderSpawnDetail(selSpawn);
+  if (selJob) {
+    void renderJobDetail(selJob);
   } else {
     t.innerHTML = "";
     t.dataset.detail = "";
@@ -1280,226 +1264,54 @@ function renderAgents(): void {
 
 let listSig = "";
 
-// Parent history is append-only: a delete lands as a spawn-note with
-// details.deleted, so rebuilds re-bury it. Tombstones persist per
-// viewed session in localStorage.
-let tombCacheKey = "";
-let tombCache = new Set<string>();
-function tombstones(): Set<string> {
-  const key = "spawn-deleted:" + viewKey;
-  if (key !== tombCacheKey) {
-    tombCacheKey = key;
-    try {
-      const raw = localStorage.getItem(key);
-      const arr = raw ? JSON.parse(raw) as unknown : [];
-      tombCache = new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
-    } catch {
-      tombCache = new Set();
-    }
-  }
-  return tombCache;
-}
-function isBuried(id: string): boolean {
-  if (tombstones().has(id)) return true;
-  // Deletes made under the fresh key must hold after key migration.
-  if (curFile && curFile !== viewKey) {
-    try {
-      const raw = localStorage.getItem("spawn-deleted:" + curFile);
-      const arr = raw ? (JSON.parse(raw) as unknown[]) : [];
-      if (Array.isArray(arr) && arr.includes(id)) return true;
-    } catch { /* ignore */ }
-  }
-  return false;
-}
-// Key-explicit tombstone write (no cache): for burials whose view is
-// already gone (see deleteSpawn's fence) — the viewKey-bound cache would
-// poison the wrong session's set.
-function buryUnder(key: string, id: string): void {
-  try {
-    const raw = localStorage.getItem("spawn-deleted:" + key);
-    const arr = raw ? (JSON.parse(raw) as unknown[]) : [];
-    const set = new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
-    if (set.has(id)) return;
-    set.add(id);
-    localStorage.setItem("spawn-deleted:" + key, JSON.stringify([...set]));
-  } catch { /* private mode */ }
-}
-function burySpawn(id: string): void {
-  staleDrop(id); // a deleted row needs no orphan mark either
-  const s = tombstones();
-  s.add(id);
-  try {
-    localStorage.setItem(tombCacheKey, JSON.stringify([...s]));
-  } catch { /* private mode */ }
-  // A thread viewed under its fresh key buries under the file path on
-  // revisit: record both so deletes survive the key migration.
-  if (curFile && curFile !== viewKey) buryUnder(curFile, id);
-}
-
-// Orphan marks: subagent threads whose backend can no longer settle them
-// (backend reboot or parent crash — no spawn-done can ever arrive, so the
-// row would read "running" forever). Persisted per session like
-// tombstones. Keyed by the session FILE when known (stable across the
-// fresh-key -> file migration); fresh views fall back to the view key.
-// Deletes (tombstones) win over stale; completions clear it.
-let staleCacheKey = "";
-let staleCache = new Set<string>();
-function staleKey(): string {
-  return "spawn-stale:" + (curFile ?? viewKey);
-}
-function staleSet(): Set<string> {
-  const key = staleKey();
-  if (key !== staleCacheKey) {
-    staleCacheKey = key;
-    try {
-      const raw = localStorage.getItem(key);
-      const arr = raw ? JSON.parse(raw) as unknown : [];
-      staleCache = new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === "string") : []);
-    } catch {
-      staleCache = new Set();
-    }
-  }
-  return staleCache;
-}
-function stalePersist(): void {
-  try {
-    localStorage.setItem(staleCacheKey, JSON.stringify([...staleCache]));
-  } catch { /* private mode */ }
-}
-function staleHas(id: string): boolean {
-  return staleSet().has(id);
-}
-function staleAdd(id: string): void {
-  staleSet().add(id);
-  stalePersist();
-}
-function staleDrop(id: string): void {
-  if (staleSet().delete(id)) stalePersist();
-}
-
-// Flip one running row to "lost" (shared by the boot tripwire and the
-// pid probe). Freezes elapsed at the moment of marking. Returns true if
-// flipped. Cards morph in place, badge/handlers follow from state,
-// transcripts stay viewable.
-function loseSpawn(id: string): boolean {
-  const s = spawns.get(id);
-  if (!s || s.state !== "running") return false;
-  s.state = "lost";
-  if (typeof s.startedAt === "number" && typeof s.durationMs !== "number") {
-    s.durationMs = Date.now() - s.startedAt;
-  }
-  staleAdd(id);
-  morphSpawnCards(id);
-  return true;
-}
-
-// Flip every running row to "lost": the backend underneath them is gone
-// (reboot tripwire, see the 20s interval).
-function markAllSpawnsStale(): void {
-  let any = false;
-  for (const id of [...spawns.keys()]) {
-    if (loseSpawn(id)) any = true;
-  }
-  if (any) {
-    updateAgentsBtn();
-    if (agentsVisible()) renderAgents();
-    if (procsVisible()) renderProcs();
-  }
-}
-
-// Probe recorded child pids and retire the dead. Only ever marks dead
-// (high confidence): pid reuse or a missing backend command leaves rows
-// alone, so this can never kill a live row — worst case, status quo.
-let spawnProbeInFlight = false;
-let lastSpawnProbe = 0;
-async function reconcileSpawns(force = false): Promise<void> {
-  const running = [...spawns.values()].filter(
-    (s) => s.state === "running" && typeof s.pid === "number" && (s.pid as number) > 0);
-  if (!running.length || spawnProbeInFlight) return;
-  if (!force && Date.now() - lastSpawnProbe < 30_000) return;
-  lastSpawnProbe = Date.now();
-  spawnProbeInFlight = true;
-  try {
-    let alive: boolean[];
-    try {
-      alive = await procAlive.check(running.map((s) => s.pid as number));
-    } catch {
-      return; // backend without pids_alive: the boot rule still applies
-    }
-    let changed = false;
-    running.forEach((s, i) => {
-      if (!alive[i] && loseSpawn(s.id)) changed = true;
-    });
-    if (changed) {
-      updateAgentsBtn();
-      if (agentsVisible()) renderAgents();
-      if (procsVisible()) renderProcs();
-    }
-  } catch {
-    // Render-path failures are surfaced by their synchronous callers;
-    // this floating probe must never become an unhandled rejection.
-  } finally {
-    spawnProbeInFlight = false;
-  }
-}
-
 function renderAgentsList(): void {
   const body = $("agentsbody");
   $("agentstitle").textContent = "Subagents";
-  const all = [...spawns.values()].filter((s) => s.kind !== "proc");
+  const all = jobRows.filter((s) => s.kind !== "proc");
   if (!all.length) {
     listSig = "";
     body.innerHTML = "";
-    body.appendChild(el("div", "msg sys", "No subagents this session. Ask Pi to spawn one."));
+    body.appendChild(el("div", "msg sys", "No subagents this session. Ask Pi to start one."));
     return;
   }
   const running = all.filter((s) => s.state === "running");
   const past = all.filter((s) => s.state !== "running");
-  const sig = `sel=${selSpawn}|` + all.map((s) => `${s.id}:${s.state}`).join("|");
+  const sig = `sel=${selJob}|` + all.map((s) => `${s.id}:${s.state}`).join("|");
   if (sig === listSig && body.dataset.sig === sig) return;
   listSig = sig;
   body.dataset.sig = sig;
   body.innerHTML = "";
   // Flat list, running first: no collapsing. One glance, everything.
-  for (const s of running) body.appendChild(agentRow(s, s.id === selSpawn));
-  for (const s of past) body.appendChild(agentRow(s, s.id === selSpawn));
+  for (const s of running) body.appendChild(agentRow(s, s.id === selJob));
+  for (const s of past) body.appendChild(agentRow(s, s.id === selJob));
 }
 
-function agentRow(s: SpawnInfo, selected: boolean): HTMLElement {
+function agentRow(s: JobInfo, selected: boolean): HTMLElement {
   const isProc = s.kind === "proc";
   const sub = s.state +
     (isProc && typeof s.exitCode === "number" ? ` · exit ${s.exitCode}` : "") +
-    (spawnElapsed(s) ? ` · ${spawnElapsed(s)}` : "");
+    (jobElapsed(s) ? ` · ${jobElapsed(s)}` : "");
   const row = el("button", "agentrow" + (selected ? " cur" : ""),
-    spawnDot(s.state) +
+    jobDot(s.state) +
     `<span class="fname">${esc(s.label)}</span>` +
     `<span class="fcount">${esc(sub)}</span>`) as HTMLButtonElement;
   row.title = s.id;
-  row.addEventListener("click", () => isProc ? openProc(s.id) : openSpawn(s.id));
+  row.addEventListener("click", () => isProc ? openProc(s.id) : openJob(s.id));
   const reveal = el("button", "sreveal", "chat") as HTMLButtonElement;
   reveal.title = "Reveal in chat";
   reveal.addEventListener("click", (e) => {
     e.stopPropagation();
-    gotoSpawn(s.id);
+    gotoJob(s.id);
   });
   row.appendChild(reveal);
   if (s.state === "running") {
-    if (!isProc) {
-      const steer = el("button", "ssteer", "steer") as HTMLButtonElement;
-      steer.title = "Steer this subagent";
-      steer.addEventListener("click", (e) => {
-        e.stopPropagation();
-        prefillSteer(s.runId ?? s.id);
-      });
-      row.appendChild(steer);
-    }
     const x = el("button", "sstop", "stop") as HTMLButtonElement;
     x.title = isProc ? "Stop this process" : "Stop this subagent";
     // Direct send: stopPropagation here would also hide the click from
     // the document-level delegation, so don't rely on it.
     x.addEventListener("click", (e) => {
       e.stopPropagation();
-      sendAgentCmd(isProc ? `/proc-stop ${s.runId ?? s.id}` : `/agent-stop ${s.runId ?? s.id}`);
+      sendJobCmd(`/job-kill ${s.id}`);
     });
     row.appendChild(x);
   }
@@ -1508,7 +1320,7 @@ function agentRow(s: SpawnInfo, selected: boolean): HTMLElement {
   del.dataset.id = s.id;
   del.addEventListener("click", (e) => {
     e.stopPropagation();
-    deleteSpawn(s.id);
+    deleteJob(s.id);
   });
   row.appendChild(del);
   return row;
@@ -1536,13 +1348,11 @@ function appendMsgList(
   messages: any[],
   calls: Map<string, any>,
   opts: {
-    // Which customs render (via msgNode, which tracks spawns itself).
+    // Which customs render (via msgNode).
     // Main history renders every non-silent custom; the detail pane
-    // only spawn-* ones.
+    // only job-* ones.
     keepCustom?: (m: any) => boolean;
-    // Silent customs still feed the spawn index in main history, so
-    // tombstones re-bury on rebuild. The detail pane skips them cold.
-    trackSilent?: boolean;
+    // Silent customs never render; the detail pane skips them cold.
     // Fork/revert entry ids for user bubbles (main chat only).
     takeForkId?: (text: string) => string | undefined;
     // Rendered-key dedup hook (main history only).
@@ -1573,10 +1383,9 @@ function appendMsgList(
     // Textless assistant turns (tool-call-only) would flash as empty
     // boxes; their content already lives in the Activity container.
     if (m.role === "assistant" && !textOf(m.content)) { opts.onRendered?.(m); continue; }
-    // Silent customs: track (tombstones) but never render.
+    // Silent customs never render (completions, tombstones).
     if (m.role === "custom" && (m as any).display === false) {
       opts.onRendered?.(m);
-      if (opts.trackSilent) trackSpawn(m);
       continue;
     }
     if (m.role === "custom" && opts.keepCustom && !opts.keepCustom(m)) continue;
@@ -1602,10 +1411,10 @@ function appendMsgList(
 // One transcript at a time: click a child → its full session transcript
 // renders here (same renderer as chat). Running ones re-poll; the count
 // guard avoids clobbering scroll when nothing changed.
-let selSpawn: string | null = null;
+let selJob: string | null = null;
 let detailCount = -1;
 
-function gotoSpawn(id: string): void {
+function gotoJob(id: string): void {
   const cards = Array.from(document.querySelectorAll(`.spawncard[data-spawn-id="${CSS.escape(id)}"]`)) as HTMLElement[];
   const card = cards[cards.length - 1];
   if (!card) return;
@@ -1614,22 +1423,22 @@ function gotoSpawn(id: string): void {
 
 // Chat receipt → side panel: open the owning tab and select the row, so
 // the transcript/log detail renders below the list.
-function gotoSpawnPanel(tid: string): void {
-  const s = spawns.get(tid);
+function gotoJobPanel(tid: string): void {
+  const s = jobRows.find((r) => r.id === tid);
   if (s?.kind === "proc") {
     selProc = tid;
     setSidePane("procs");
   } else {
-    selSpawn = tid;
+    selJob = tid;
     detailCount = -1;
     setSidePane("agents");
   }
 }
 
-function openSpawn(id: string): void {
+function openJob(id: string): void {
   // Split view: transcript renders below the list, no navigation.
   // Clicking the selected row again collapses its transcript.
-  selSpawn = selSpawn === id ? null : id;
+  selJob = selJob === id ? null : id;
   detailCount = -1;
   renderAgents();
 }
@@ -1637,16 +1446,16 @@ function openSpawn(id: string): void {
 // Throttle for the transcript re-read below: the 5s elapsed ticker
 // re-renders the panel, and without this every beat re-reads + re-parses
 // the whole file even when nothing changed. Selection changes force via
-// detailCount = -1 (see openSpawn); content changes apply on the next
+// detailCount = -1 (see openJob); content changes apply on the next
 // beat (≤5s lag in a side panel, main chat stays live via events).
 let lastDetailRead = 0;
-async function renderSpawnDetail(id: string): Promise<void> {
+async function renderJobDetail(id: string): Promise<void> {
   const body = $("agenttranscript");
   if (detailCount >= 0 && body.dataset.detail === id && Date.now() - lastDetailRead < 5000) return;
   lastDetailRead = Date.now();
   let messages: any[] = [];
   try {
-    const data = await spawnTranscript.read(id);
+    const data = await jobTranscript.read(id);
     messages = data.messages ?? [];
   } catch (e: any) {
     body.innerHTML = "";
@@ -1655,7 +1464,7 @@ async function renderSpawnDetail(id: string): Promise<void> {
     return;
   }
   // Selected child may have finished since: keep the header honest.
-  if (selSpawn !== id) return;
+  if (selJob !== id) return;
   if (detailCount === messages.length && body.dataset.detail === id) return;
   detailCount = messages.length;
   const keepScroll = body.scrollTop;
@@ -1669,7 +1478,8 @@ async function renderSpawnDetail(id: string): Promise<void> {
   lastRun = null;
   try {
     const shown = appendMsgList(body, messages, calls, {
-      keepCustom: (m) => typeof m.customType === "string" && m.customType.startsWith("spawn-"),
+      keepCustom: (m) => typeof m.customType === "string"
+        && (m.customType.startsWith("job-") || m.customType.startsWith("spawn-")),
     });
     if (!shown) body.appendChild(el("div", "msg sys", "No transcript yet — child hasn't produced output."));
     // No collectEdits here: the Changes pane belongs to the main session.
@@ -1683,9 +1493,9 @@ async function renderSpawnDetail(id: string): Promise<void> {
   else body.scrollTop = keepScroll;
 }
 
-// ---- background processes tab (spawn_bg) ------------------------------------
+// ---- background processes tab (plain jobs) ------------------------------------
 // Same index map as subagents, filtered on kind === "proc". Detail is a
-// live log tail (read_spawn_log), not a transcript: plain <pre>, same 5s
+// live log tail (read_job_log), not a transcript: plain <pre>, same 5s
 // re-poll throttle as the agents panel.
 function renderProcs(): void {
   renderProcsList();
@@ -1703,7 +1513,7 @@ let procListSig = "";
 function renderProcsList(): void {
   const body = $("procsbody");
   $("procstitle").textContent = "Processes";
-  const all = [...spawns.values()].filter((s) => s.kind === "proc");
+  const all = jobRows.filter((s) => s.kind === "proc");
   if (!all.length) {
     procListSig = "";
     body.innerHTML = "";
@@ -1735,12 +1545,13 @@ async function renderProcDetail(id: string): Promise<void> {
   const body = $("proctranscript");
   if (body.dataset.detail === id && Date.now() - lastProcDetailRead < 5000) return;
   lastProcDetailRead = Date.now();
-  const s = spawns.get(id);
+  const s = jobRows.find((r) => r.id === id);
   let text = "";
   let size = 0;
   let truncated = false;
   try {
-    const data = await spawnLog.read(s?.runId ?? id);
+    // Backend resolves the job id to its latest run's log server-side.
+    const data = await jobLog.read(id);
     text = data.text ?? "";
     size = data.size ?? 0;
     truncated = !!data.truncated;
@@ -1771,61 +1582,40 @@ async function renderProcDetail(id: string): Promise<void> {
 // setSidePane owns visibility now (single shared sidebar); the old
 // per-pane setters are gone. Header buttons toggle their tab.
 
-
-// Direct delete: filesystem business, never touches the agent. Running
-// children are stopped first (theirs to wind down), then files go.
-// No chat message — the row vanishing IS the feedback.
-async function deleteSpawn(id: string): Promise<void> {
-  // View fence: the awaits below can span a session switch. Filesystem
-  // work is view-independent, but the tombstone and panel below belong
-  // to the origin view — never the new one.
-  const dk = viewKey;
-  const cf = curFile;
-  const stillHere = () => viewKey === dk;
-  // One atomic server-side command (stop + exit-wait + files + tombstone).
-  // The old stop prompt + blind sleep + direct remove raced the backend's
-  // own shutdown: files removed mid-shutdown could be recreated by the
-  // dying child after we deleted them.
-  const isProc = spawns.get(id)?.kind === "proc";
-  try {
-    await pi.prompt(cwd, `${isProc ? "/proc-delete" : "/agent-delete"} ${id}`, undefined, dk || undefined);
-  } catch (e: any) {
-    if (stillHere()) {
-      $("msgs").appendChild(el("div", "msg sys", esc(`delete failed: ${e.message ?? e}`)));
-    }
-    return;
-  }
-  if (stillHere()) {
-    burySpawn(id);
-  } else {
-    buryUnder(dk, id);
-    if (cf && cf !== dk) buryUnder(cf, id);
-  }
-  if (!stillHere()) return;
-  spawns.delete(id);
-  if (selSpawn === id) {
-    selSpawn = null;
+// Optimistic delete: the row vanishes now; the agent's /job-delete does
+// the real work (kill + files + DB rows) and the next poll confirms.
+// The confirmation note stays hidden (see jobCard) so chat stays clean.
+async function deleteJob(id: string): Promise<void> {
+  const file = curFile;
+  jobRows = jobRows.filter((r) => r.id !== id);
+  if (selJob === id) {
+    selJob = null;
     detailCount = -1;
   }
   if (selProc === id) selProc = null;
-  listSig = "";
-  procListSig = "";
   updateAgentsBtn();
   if (agentsVisible()) renderAgents();
   if (procsVisible()) renderProcs();
+  try {
+    await pi.prompt(cwd, `/job-delete ${id}`, undefined, viewKey || undefined);
+  } catch (e: any) {
+    if ((curFile ?? "") !== (file ?? "")) return; // moved on
+    $("msgs").appendChild(el("div", "msg sys", esc(`delete failed: ${e.message ?? e}`)));
+  }
+  void refreshJobs(true);
 }
 
-// Fire-and-forget agent command (handled disposition: no run starts, no
-// agent_settled follows). Live spawn-note events append via route(); the
+// Fire-and-forget job command (handled disposition: no run starts, no
+// agent_settled follows). Live job-note events append via route(); the
 // delayed rebuild covers a missed event. Never touches run UI.
-async function sendAgentCmd(text: string): Promise<void> {
+async function sendJobCmd(text: string): Promise<void> {
   hideCmdList();
   const sk = viewKey;
   try {
     await pi.prompt(cwd, text, undefined, sk || undefined);
   } catch (e: any) {
     if (viewKey !== sk) return; // moved on: don't scribble on the new view
-    $("msgs").appendChild(el("div", "msg sys", esc(`agent command failed: ${e.message ?? e}`)));
+    $("msgs").appendChild(el("div", "msg sys", esc(`job command failed: ${e.message ?? e}`)));
     return;
   }
   if (!streaming) {
@@ -1835,15 +1625,6 @@ async function sendAgentCmd(text: string): Promise<void> {
       if (!streaming && viewKey === sk) refreshMsgs();
     }, 1200);
   }
-}
-
-function prefillSteer(id: string): void {
-  const inp = $("input") as HTMLTextAreaElement;
-  inp.value = `/agent-steer ${id} `;
-  inp.style.height = "auto";
-  inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
-  syncSendBtn();
-  inp.focus();
 }
 
 // ---- streaming ----
@@ -2140,14 +1921,21 @@ function appendMessageEnd(message: any): void {
     return;
   }
   if (m.role === "assistant" && !textOf(m.content)) return;
-  // Proc completions (display:false) carry no card-worthy content — id +
-  // exit + log path, already morphed into the dispatch card. Track (row
-  // state) but render nothing, so procs show once. Legacy agent
-  // done/stopped keep their report card below (behavior unchanged).
+  // Job completions (display:false) carry no card-worthy content —
+  // the DB-backed panel refetches instead. Notes still render below
+  // (they carry human text). Legacy spawn-bg completions likewise.
   if (m.role === "custom" && (m as any).display === false
-    && typeof (m as any).customType === "string" && (m as any).customType.startsWith("spawn-bg-")) {
-    trackSpawn(m);
+    && typeof (m as any).customType === "string"
+    && ((m as any).customType === "job-done" || (m as any).customType === "job-failed"
+      || (m as any).customType === "job-killed" || (m as any).customType.startsWith("spawn-bg-"))) {
+    scheduleJobsRefresh();
     return;
+  }
+  // Any job message may change panel state (dispatch, retry, tombstone):
+  // refetch (throttled) so rows follow without a rebuild.
+  if (m.role === "custom" && typeof (m as any).customType === "string"
+    && ((m as any).customType.startsWith("job-") || (m as any).customType.startsWith("spawn-"))) {
+    scheduleJobsRefresh();
   }
   // Mirror: every assistant text renders, even exact repeats. pi shows
   // them; suppressing was our invention (streaming made benign dupes,
@@ -3020,7 +2808,7 @@ async function refreshMsgs() {
   // No wipe here: the old view stays visible until the new window is
   // fetched (tens of ms from disk), then renderHist swaps it in. Wiping
   // first is what made every switch flash blank through the whole load.
-  spawns.clear();
+  jobRows = [];
   // Authoritative wipe: drop live partials too (stream preview, partial
   // Activity, half-streamed thought). Post-wipe deltas rebuild cleanly;
   // without this they write into a detached tree and vanish.
@@ -3113,7 +2901,6 @@ async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => bo
     // Index ToolCall blocks so rows can show what ran.
     const calls = indexToolCalls(arr);
     const shown = appendMsgList(box, arr, calls, {
-      trackSilent: true,
       takeForkId,
       onRendered: (m) => renderedKeys.add(msgKey(m)),
     });
@@ -3142,9 +2929,8 @@ async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => bo
     // Replay anything that completed during the rebuild window above.
     // Deduped against what history just rendered: no drops, no doubles.
     replayLiveBuffer();
-    // Spawns just rebuilt: probe recorded pids (throttled) so rows for
-    // crash/reboot orphans flip to lost instead of pulsing forever.
-    void reconcileSpawns();
+    // Panels re-read from the DB: settles that landed while away show.
+    void refreshJobs(true);
   } catch (e: any) {
     if (!alive()) return;
     refreshActive = false;
@@ -3581,15 +3367,14 @@ function resetRunState() {
   clearMediaCache();
   pendingSend = null;
   freshUnsent = false;
-  spawns.clear();
-  selSpawn = null;
+  jobRows = [];
+  selJob = null;
   selProc = null;
   detailCount = -1;
   listSig = "";
   procListSig = "";
   updateAgentsBtn();
-  if (agentsVisible()) renderAgents();
-  if (procsVisible()) renderProcs();
+  void refreshJobs(true);
   streamDiv?.remove();
   streamDiv = null;
   streamBuf = "";
@@ -3706,7 +3491,7 @@ async function switchSession(path: string) {
   const info = sessCache.find((x) => x.path === path);
   if (info?.cwd) setMediaBase(info.cwd);
   // Reattach to the live proc when one already serves this file (fresh
-  // key from its first send). Otherwise a duplicate idle proc spawns
+  // key from its first send). Otherwise a duplicate idle proc jobs
   // and the view reports a dead-quiet session while the real run
   // continues invisibly elsewhere.
   const key = fileToKey.get(path) ?? path;
@@ -4571,19 +4356,13 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
     const sstop = (e.target as HTMLElement).closest?.(".sstop") as HTMLButtonElement | null;
     if (sstop?.dataset.id) {
       e.stopPropagation();
-      sendAgentCmd(sstop.dataset.kind === "proc" ? `/proc-stop ${sstop.dataset.id}` : `/agent-stop ${sstop.dataset.id}`);
-      return;
-    }
-    const ssteer = (e.target as HTMLElement).closest?.(".ssteer") as HTMLButtonElement | null;
-    if (ssteer?.dataset.id) {
-      e.stopPropagation();
-      prefillSteer(ssteer.dataset.id);
+      sendJobCmd(`/job-kill ${sstop.dataset.id}`);
       return;
     }
     const sdel = (e.target as HTMLElement).closest?.(".sdel") as HTMLButtonElement | null;
     if (sdel?.dataset.id) {
       e.stopPropagation();
-      deleteSpawn(sdel.dataset.id);
+      deleteJob(sdel.dataset.id);
       return;
     }
     const b = (e.target as HTMLElement).closest?.(".act-copy") as HTMLButtonElement | null;
@@ -4954,10 +4733,11 @@ async function loadRemote(): Promise<void> {
   exitDirectMode();
   const c = await config.get();
   // Phone remote lands in the desktop's default dir (a fresh .pi-qa
-  // space), not whatever the desktop was last doing. Desktop keeps
-  // resume-where-you-left-off; both open fresh, never resume.
+  // space), not whatever the desktop was last doing. Both land in their
+  // dir on a NEW chat every launch — never resume (history stays one
+  // click away in the sidebar).
   const dir = isAndroidApp ? c.default_dir : (c.last_cwd || c.default_dir);
-  await setCwd(dir, false, !isServerMode);
+  await setCwd(dir, false, false);
   paintModeToggle();
 }
 
@@ -5299,10 +5079,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   // (One exception: a corroborated backend reboot settles the viewed
   // run — no proc answers AND the boot changed, so it is dead, not busy.)
   setInterval(async () => {
-    // Backend reboot ends every supervised run and orphans (then reaps)
-    // spawn grandchildren: without this tripwire both the composer and
-    // the Agents panel stick "live" forever. One snapshot, no per-proc
-    // traffic; persisted so restarts across app launches trip it too.
+    // Backend reboot ends every supervised pi run: without this tripwire
+    // both the composer and the Agents panel stick "live" forever. Jobs
+    // themselves survive (detached pi-jobs), so only unprobed rows are
+    // marked — probed ones are reconciled by pid below. One snapshot, no
+    // per-proc traffic; persisted so restarts across app launches trip
+    // it too.
     let bootChanged = false;
     try {
       const snap: any = await runStates.snapshot();
@@ -5322,7 +5104,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         }
       }
     } catch { /* snapshot unavailable: skip */ }
-    if (bootChanged) markAllSpawnsStale();
+    if (bootChanged) void refreshJobs(true);
     try {
       if (!cwd || !viewKey) return;
       if (document.hidden) return;
@@ -5404,14 +5186,16 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Elapsed ticking for running subagents: badge + open panel + inline
   // cards. Static elapsed on a live card reads broken within seconds.
   setInterval(() => {
-    if (!spawns.size) return;
+    void refreshJobs();
+    if (!jobRows.length) return;
     let anyRunning = false;
-    for (const [id, s] of spawns) {
+    for (const s of jobRows) {
+      const id = s.id;
       if (s.state !== "running") continue;
       anyRunning = true;
       for (const card of Array.from(document.querySelectorAll(`.spawncard[data-spawn-id="${CSS.escape(id)}"]`))) {
         const t = card.querySelector(":scope > .spsum .spelapsed");
-        if (t) t.textContent = spawnElapsed(s);
+        if (t) t.textContent = jobElapsed(s);
       }
     }
     if (!anyRunning) return;

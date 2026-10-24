@@ -14,7 +14,7 @@ Common prerequisites (all platforms): the [`pi` CLI](https://pi.dev)
 on PATH and Node.js 22+.
 
 ```bash
-pi install git:github.com/pi-ecosystem/pi-spawn   # subagents (Agents panel)
+pi install git:github.com/pi-ecosystem/pi-jobs   # background jobs + subagents (Agents/Processes panels)
 ```
 
 ```bash
@@ -162,9 +162,10 @@ windows stay hidden until a hotkey, unless `--toggle-quickbar` is passed).
   JSONL forwarded as `pi-record` events; session sidebar scans pi's own
   `~/.pi/agent/sessions` files (cwd in header, name in `session_info`).
 - No index DB, no reimplementation: new/resume/switch/fork state all live in pi.
-- Extensions: [`pi-spawn`](https://github.com/pi-ecosystem/pi-spawn) provides
-  subagents (Agents panel) — install it with the `pi install` above; every
-  desktop session picks it up from your pi packages, same as
+- Extensions: [`pi-jobs`](https://github.com/pi-ecosystem/pi-jobs) provides
+  background jobs and subagents (Agents/Processes panels) — install it with
+  the `pi install` above; every desktop session picks it up from your pi
+  packages, same as
   [`pi-shadow-browser`](https://github.com/pi-ecosystem/pi-shadow-browser).
   Desktop never injects extensions itself (a second copy of the same
   extension from a different path is a fatal tool conflict).

@@ -29,7 +29,7 @@ pub use server::run_server;
 // builds carry it with no repo present. THE single prompt call site — prompt
 // changes edit the md file only, never this code. Override with
 // PI_DESKTOP_APP_PROMPT=/path/to/file.md, disable with PI_DESKTOP_APP_PROMPT=0.
-// The effective text also rides PI_DESKTOP_APP_PROMPT_TEXT down to pi-spawn
+// The effective text also rides PI_DESKTOP_APP_PROMPT_TEXT down to pi-jobs
 // grandchildren (CLI flags don't propagate; env does). The HTTP server
 // mode shares this core, so browser dev gets the identical behavior.
 const SYSTEM_PROMPT: &str = include_str!("../../src/system-prompt.md");
@@ -45,20 +45,22 @@ fn bundled_prompt_text() -> Option<String> {
     }
 }
 
-// Subagents (pi-spawn package) load from the USER's own pi packages
-// (`pi install git:github.com/pi-ecosystem/pi-spawn`), exactly like
+// Jobs (pi-jobs package) load from the USER's own pi packages
+// (`pi install git:github.com/pi-ecosystem/pi-jobs`), exactly like
 // shadow-browser — never via --extension from here. Rationale: pi dedupes
 // an identical --extension path but FATALS on the same tool from two
 // DIFFERENT paths (vendored copy + user install = dead child, zombie
 // proc, everything RPC-shaped breaks at once). The only exception is an
-// explicit PI_DESKTOP_SPAWN_EXT override (dev escape hatch).
-fn spawn_ext_path() -> Option<PathBuf> {
+// explicit PI_DESKTOP_JOBS_EXT override (dev escape hatch).
+fn jobs_ext_path() -> Option<PathBuf> {
     // Explicit override only (dev escape hatch):
-    // PI_DESKTOP_SPAWN_EXT=/path/to/index.ts
-    if let Ok(p) = std::env::var("PI_DESKTOP_SPAWN_EXT") {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
+    // PI_DESKTOP_JOBS_EXT=/path/to/index.ts (legacy PI_DESKTOP_SPAWN_EXT honored)
+    for var in ["PI_DESKTOP_JOBS_EXT", "PI_DESKTOP_SPAWN_EXT"] {
+        if let Ok(p) = std::env::var(var) {
+            let pb = PathBuf::from(p);
+            if pb.is_file() {
+                return Some(pb);
+            }
         }
     }
     None
@@ -68,6 +70,9 @@ fn spawn_ext_path() -> Option<PathBuf> {
 
 fn bg_default() -> bool {
     true
+}
+fn remote_port_default() -> u16 {
+    1423
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -79,6 +84,13 @@ struct AppConfig {
     last_cwd: String,
     #[serde(default = "bg_default")]
     run_in_bg: bool,
+    /// HTTP backend exposure for the phone (remote mode). Empty token =
+    /// localhost only (safe default); a set token binds all interfaces
+    /// and requires it as a Bearer token. Needs app restart to rebind.
+    #[serde(default = "remote_port_default")]
+    remote_port: u16,
+    #[serde(default)]
+    remote_token: String,
 }
 
 impl Default for AppConfig {
@@ -94,6 +106,8 @@ impl Default for AppConfig {
             recents: vec![],
             last_cwd: qa.to_string_lossy().into_owned(),
             run_in_bg: true,
+            remote_port: 1423,
+            remote_token: String::new(),
         }
     }
 }
@@ -233,25 +247,11 @@ fn session_root_default() -> String {
 // Launched from a terminal, `pi` is on PATH. Launched from the KDE
 // launcher it is NOT (~/.pi/agent/bin is shell-only). So resolve it:
 // explicit PI_BIN first, then well-known locations, then PATH lookup.
-// Termux (Android) also has a minimal-PATH problem: RUN_COMMAND
-// background services don't carry $PREFIX/bin, so bare "pi" fails
-// there although the interactive shell finds it at $PREFIX/bin/pi.
 fn pi_bin() -> String {
     if let Ok(v) = std::env::var("PI_BIN") {
         if !v.is_empty() {
             return v;
         }
-    }
-    // PREFIX is set in every Termux process, including RUN_COMMAND services.
-    if let Ok(prefix) = std::env::var("PREFIX") {
-        let p = std::path::PathBuf::from(prefix).join("bin/pi");
-        if p.is_file() {
-            return p.to_string_lossy().into_owned();
-        }
-    }
-    // Same path hardcoded, for Termux services launched without PREFIX.
-    if std::path::Path::new("/data/data/com.termux/files/usr/bin/pi").is_file() {
-        return "/data/data/com.termux/files/usr/bin/pi".to_string();
     }
     if let Some(home) = dirs::home_dir() {
         for sub in [".pi/agent/bin/pi", ".local/bin/pi"] {
@@ -322,55 +322,18 @@ impl AppState {
     // interpreter; PI_BIN still reports the canonical entry point.)
     let mut cmd = Command::new(&bin);
     cmd.env("PI_DESKTOP_CHILD", "1");
-    // Grandchildren (pi-spawn subagents) exec `process.env.PI_BIN || "pi"`:
-    // a bare "pi" relies on PATH, which is minimal under a KDE-launched
-    // desktop (no ~/.pi/agent/bin) while pi's own bash tool prepends its
-    // bin dir — so `which pi` succeeds yet spawn fails ENOENT. Hand the
-    // resolved path down; an explicit PI_BIN override passes through
-    // unchanged (pi_bin() returns it first).
+    // Jobs inherit the parent's PATH and run under /bin/sh, where a bare
+    // "pi" relies on PATH — minimal under a KDE-launched desktop (no
+    // ~/.pi/agent/bin), so submits fail exit 127. pi's own bash tool
+    // prepends its bin dir; do the same here with PI_BIN's dir, so every
+    // job from a desktop session resolves pi. An explicit PI_BIN override
+    // passes through unchanged (pi_bin() returns it first).
     cmd.env("PI_BIN", &bin);
-    // Termux service environments (RUN_COMMAND background) are bare:
-    // minimal PATH, no PREFIX, no exec-interception. An npm-installed
-    // `pi` is a symlink to cli.js with a `#!/usr/bin/env node` shebang,
-    // and Termux has no /usr/bin — the shebang only resolves through
-    // libtermux-exec, which login shells preload but services do not.
-    // So: run script shims through node directly (no kernel shebang
-    // lookup at all), and export a full Termux env for everything the
-    // child and its descendants exec from here on.
-    let termux_prefix = std::env::var("PREFIX").ok().filter(|p| !p.is_empty()).or_else(|| {
-        let hard = "/data/data/com.termux/files/usr";
-        if std::path::Path::new(&format!("{hard}/bin")).is_dir() {
-            Some(hard.to_string())
-        } else {
-            None
-        }
-    });
-    if let Some(prefix) = termux_prefix {
-        // Script shim (symlink or .js) with a node shebang: bypass it.
-        let canon = fs::canonicalize(&bin).unwrap_or_else(|_| std::path::PathBuf::from(&bin));
-        let is_node_script = canon.extension().and_then(|e| e.to_str()) == Some("js")
-            && fs::read_to_string(&canon)
-                .map(|head| head.bytes().take(200).collect::<Vec<_>>())
-                .ok()
-                .and_then(|h| String::from_utf8(h).ok())
-                .map(|s| s.lines().next().map(|l| l.contains("node")).unwrap_or(false))
-                .unwrap_or(false);
-        if is_node_script {
-            let node = format!("{prefix}/bin/node");
-            if std::path::Path::new(&node).is_file() {
-                cmd = Command::new(&node);
-                cmd.env("PI_DESKTOP_CHILD", "1");
-                cmd.env("PI_BIN", &bin);
-                cmd.arg(&canon);
-            }
-        }
-        let termux_bin = format!("{prefix}/bin");
-        let path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{termux_bin}:{path}"));
-        cmd.env("PREFIX", &prefix);
-        let exec_so = format!("{prefix}/lib/libtermux-exec.so");
-        if std::path::Path::new(&exec_so).is_file() {
-            cmd.env("LD_PRELOAD", &exec_so);
+    if let Some(dir) = std::path::Path::new(&bin).parent() {
+        let mut paths = vec![dir.as_os_str().to_owned()];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).map(|p| p.into_os_string()));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
         }
     }
     cmd.arg("--mode")
@@ -381,15 +344,15 @@ impl AppState {
         .stderr(Stdio::null());
     // Single bundled prompt (shared core, both hosts): capability primer +
     // formatting guide, one flag. Grandchild subagents don't inherit CLI
-    // flags, so the effective text also rides the env down for pi-spawn
+    // flags, so the effective text also rides the env down for pi-jobs
     // to re-append (absent when disabled via PI_DESKTOP_APP_PROMPT=0).
     if let Some(prompt) = bundled_prompt_text() {
         cmd.arg("--append-system-prompt").arg(&prompt);
         cmd.env("PI_DESKTOP_APP_PROMPT_TEXT", prompt);
     }
-    // Spawn extension only on explicit PI_DESKTOP_SPAWN_EXT override;
-    // normally subagents come from the user's own pi packages.
-    if let Some(ext) = spawn_ext_path() {
+    // Jobs extension only on explicit PI_DESKTOP_JOBS_EXT override;
+    // normally jobs come from the user's own pi packages.
+    if let Some(ext) = jobs_ext_path() {
         cmd.arg("--extension").arg(ext);
     }
     if let Some(sd) = session_dir {
@@ -1135,10 +1098,79 @@ fn read_session_messages(path: String, session_root: Option<String>, max_bytes: 
     Ok(serde_json::json!({ "messages": window, "total": total, "has_more": has_more, "bytes": bytes }))
 }
 
-/// Stop the backend itself (Android/Termux only in practice: the server
-/// outlives the app there, so the UI needs an explicit stop). Kills
-/// supervised pi children, then exits after the response flushes.
-/// Reopening the app re-boots via RUN_COMMAND.
+/// Phone-as-client (remote mode): serve the same core over HTTP so the
+/// phone app can reach this desktop. Localhost when no token is set
+/// (safe default); all interfaces + Bearer auth once a token exists.
+/// Desktop only — the phone app has no use for a TCP server.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn serve_http_for_phone() {
+    std::thread::spawn(|| server::run_server(None));
+}
+
+/// Direct-chat network pipe: the phone WebView can't call provider APIs
+/// itself (CORS blocks cross-origin fetch, and some gateways reject
+/// browser origins outright). This runs the HTTPS request natively and
+/// streams raw bytes back over a Tauri Channel the frontend reassembles
+/// into SSE. Works on-device and on desktop; meaningless over the HTTP
+/// bridge itself (direct mode never runs remote).
+#[tauri::command]
+async fn direct_fetch(
+    url: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Option<String>,
+    method: Option<String>,
+    on_chunk: tauri::ipc::Channel<Vec<u8>>,
+) -> Result<(), String> {
+    // No timeout = a dead network hangs the call forever with no error.
+    // Fail loud instead.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("direct: client error: {e}"))?;
+    eprintln!("[direct] fetch {url}");
+    let mut rb = if method.as_deref() == Some("GET") {
+        client.get(&url)
+    } else {
+        client.post(&url)
+    };
+    rb = rb
+        .header("Accept", "*/*")
+        .header("User-Agent", "pi-desktop/0.1");
+    for (k, v) in &headers {
+        rb = rb.header(k, v);
+    }
+    if let Some(b) = body.as_deref() {
+        rb = rb
+            .header("content-type", "application/json")
+            .body(b.to_string());
+    }
+    let mut resp = rb
+        .send()
+        .await
+        .map_err(|e| format!("direct: request failed: {e}"))?;
+    let status = resp.status();
+    eprintln!("[direct] status {status} for {url}");
+    if !status.is_success() {
+        let t = resp.text().await.unwrap_or_default();
+        let short: String = t.chars().take(300).collect();
+        return Err(format!("direct: {status} {short} :: {url}"));
+    }
+    loop {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => on_chunk
+                .send(bytes.to_vec())
+                .map_err(|e| format!("direct: channel closed: {e}"))?,
+            Ok(None) => break,
+            Err(e) => return Err(format!("direct: stream error: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Stop the backend itself (detached server mode: the server outlives
+/// the UI, so an explicit stop is needed). Kills supervised pi
+/// children, then exits after the response flushes.
 #[tauri::command]
 fn shutdown_server(state: State<Arc<AppState>>) -> Result<(), String> {
     let st = state.inner().clone();
@@ -1151,27 +1183,6 @@ fn shutdown_server(state: State<Arc<AppState>>) -> Result<(), String> {
 }
 
 /// Run-lifecycle snapshot for sidebar status dots: {bootId, runs:
-/// Process liveness probe (kill(pid, 0): no signal sent). Lets the UI
-/// reconcile subagent rows orphaned by a crash/reboot: no completion
-/// event can ever arrive for those, so their history would otherwise
-/// read "running" forever. EPERM still means alive (exists, foreign uid).
-#[tauri::command]
-fn pids_alive(pids: Vec<i32>) -> Vec<bool> {
-    pids.iter()
-        .map(|pid| {
-            if *pid <= 0 {
-                return false;
-            }
-            unsafe {
-                if libc::kill(*pid, 0) == 0 {
-                    true
-                } else {
-                    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                }
-            }
-        })
-        .collect()
-}
 
 /// [{tag, key, streaming}]}. Read from the tracked map (no pi traffic).
 /// Unknown sessions are simply absent (= idle).
@@ -1198,38 +1209,122 @@ fn pi_states(state: State<Arc<AppState>>) -> serde_json::Value {
     state.pi_states_core()
 }
 
-/// Transcript of one spawned subagent (see agent/SPAWN.md). Scoped to the
-/// spawn-sessions root: run ids are `[A-Za-z0-9_-]+`, no path traversal,
-/// one session file per run dir. Returns `{messages}` in get_messages
-/// shape so the frontend renders it with the same renderer. Bounded.
-#[tauri::command]
-fn read_spawn_transcript(run_id: String) -> Result<serde_json::Value, String> {
-    if run_id.is_empty()
-        || run_id.len() > 128
-        || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// Resolve a pi-jobs log file for a job id, run id, or unambiguous prefix
+/// from the SQLite store (`~/.pi/agent/jobs/jobs.db`). Returns the
+/// effective log (the job's own `customLog`, e.g. a pi session jsonl,
+/// else the captured `output.log`). Store paths were recorded by the
+/// agent's own job tool (the same files `job logs` reads), so they only
+/// need to be absolute.
+/// SQLite store (`jobs.db`, WAL). Short reads only, never held open.
+fn abs_path(p: &str) -> Result<PathBuf, String> {
+    let pb = PathBuf::from(p);
+    if pb.is_absolute() {
+        Ok(pb)
+    } else {
+        Err("job log path is not absolute".into())
+    }
+}
+
+fn resolve_job_log(id: &str) -> Result<PathBuf, String> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err("invalid run id".into());
+        return Err("invalid job id".into());
     }
     let home = dirs::home_dir().ok_or("no home dir")?;
-    let dir = home.join(".pi").join("agent").join("spawn-sessions").join(&run_id);
-    let mut session_file: Option<PathBuf> = None;
-    let entries = fs::read_dir(&dir).map_err(|e| format!("unreadable spawn dir: {e}"))?;
-    for e in entries {
-        let e = e.map_err(|e| e.to_string())?;
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
-            if session_file.is_some() {
-                return Err("ambiguous spawn dir (multiple sessions)".into());
-            }
-            session_file = Some(p);
+    let db_path = home.join(".pi").join("agent").join("jobs").join("jobs.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("unreadable jobs db: {e}"))?;
+    // Exact job id → its latest run; exact run id → itself.
+    let hit: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT log_file, custom_log FROM runs WHERE job_id = ?1 ORDER BY started_at DESC LIMIT 1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    if let Some((log_file, custom_log)) = hit {
+        let pick = custom_log.filter(|s: &String| !s.is_empty()).unwrap_or(log_file);
+        if pick.is_empty() {
+            return Err("job run has no log file yet".into());
+        }
+        return abs_path(&pick);
+    }
+    let run_hit: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT log_file, custom_log FROM runs WHERE run_id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    if let Some((log_file, custom_log)) = run_hit {
+        let pick = custom_log.filter(|s: &String| !s.is_empty()).unwrap_or(log_file);
+        if pick.is_empty() {
+            return Err("job run has no log file yet".into());
+        }
+        return abs_path(&pick);
+    }
+    // Unambiguous prefix over jobs + runs, like the job tool. Ids are
+    // [A-Za-z0-9_-] (validated above), so GLOB needs no escaping.
+    let pattern = format!("{id}*");
+    let mut stmt = conn.prepare("SELECT id FROM jobs WHERE id GLOB ?1").map_err(|e| format!("unreadable jobs db: {e}"))?;
+    let j_hits: Vec<String> = stmt.query_map([pattern.as_str()], |row| row.get(0)).map_err(|e| format!("unreadable jobs db: {e}"))?.filter_map(|r| r.ok()).collect();
+    let mut stmt = conn.prepare("SELECT run_id FROM runs WHERE run_id GLOB ?1").map_err(|e| format!("unreadable jobs db: {e}"))?;
+    let r_hits: Vec<String> = stmt.query_map([pattern.as_str()], |row| row.get(0)).map_err(|e| format!("unreadable jobs db: {e}"))?.filter_map(|r| r.ok()).collect();
+    if j_hits.len() + r_hits.len() > 1 {
+        return Err(format!("'{id}' matches multiple jobs/runs; use a longer id"));
+    }
+    if j_hits.len() == 1 {
+        let hit: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT log_file, custom_log FROM runs WHERE job_id = ?1 ORDER BY started_at DESC LIMIT 1",
+                [&j_hits[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        if let Some((log_file, custom_log)) = hit {
+            let pick = custom_log.filter(|s: &String| !s.is_empty()).unwrap_or(log_file);
+            return abs_path(&pick);
+        }
+        return Err("job has no runs yet".into());
+    }
+    if r_hits.len() == 1 {
+        let hit: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT log_file, custom_log FROM runs WHERE run_id = ?1",
+                [&r_hits[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        if let Some((log_file, custom_log)) = hit {
+            let pick = custom_log.filter(|s: &String| !s.is_empty()).unwrap_or(log_file);
+            return abs_path(&pick);
         }
     }
-    let file = session_file.ok_or("no session file for run")?;
-    let meta = fs::metadata(&file).map_err(|e| format!("unreadable session file: {e}"))?;
-    if meta.len() > 2 * 1024 * 1024 {
-        return Err("spawn transcript too large (>2MB)".into());
+    Err(format!("no such job '{id}'"))
+}
+
+/// Legacy JSON registry (`registry.json`, pre-sqlite pi-jobs). Same
+/// semantics as the sqlite store. `None` = registry unusable/absent.
+/// Transcript of one pi-jobs subagent: its session jsonl parsed into
+/// `{messages}` in get_messages shape so the frontend renders it with the
+/// same renderer. Bounded (newest 2000). Errors when the job's log is not
+/// a session jsonl (use read_job_log for plain output).
+#[tauri::command]
+fn read_job_transcript(id: String) -> Result<serde_json::Value, String> {
+    let path = resolve_job_log(&id)?;
+    if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+        return Err("not a subagent session (plain log — use the Processes tab)".into());
     }
-    let text = fs::read_to_string(&file).map_err(|e| format!("unreadable session file: {e}"))?;
+    let meta = fs::metadata(&path).map_err(|e| format!("unreadable session file: {e}"))?;
+    if meta.len() > 2 * 1024 * 1024 {
+        return Err("job transcript too large (>2MB)".into());
+    }
+    let text = fs::read_to_string(&path).map_err(|e| format!("unreadable session file: {e}"))?;
     // Ring: keep the NEWEST 2000. Breaking at the cap would pin the
     // oldest (long sessions would silently lose their recent end).
     let mut messages = std::collections::VecDeque::with_capacity(2001);
@@ -1254,37 +1349,23 @@ fn read_spawn_transcript(run_id: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "messages": messages }))
 }
 
-/// Tail of one background process's log (see agent/SPAWN.md). Scoped to
-/// the spawn-sessions root exactly like read_spawn_transcript: run ids
-/// are `[A-Za-z0-9_-]+`, resolved path must stay inside the root.
-/// Returns `{text, size, truncated}` — the last 256KB starting on a line
-/// boundary. Never parses: raw bytes for the UI to render as text.
+/// Tail of one pi-jobs run's log. Returns `{text, size, truncated}` — the
+/// last 256KB starting on a line boundary. Never parses: raw bytes for
+/// the UI to render as text. For subagent sessions this is the raw jsonl;
+/// the Agents tab parses it via read_job_transcript instead.
 #[tauri::command]
-fn read_spawn_log(run_id: String) -> Result<serde_json::Value, String> {
-    if run_id.is_empty()
-        || run_id.len() > 128
-        || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("invalid run id".into());
-    }
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    let root = home.join(".pi").join("agent").join("spawn-sessions");
-    let file = root.join(&run_id).join("output.log");
-    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable spawn root: {e}"))?;
-    let canonical = fs::canonicalize(&file).map_err(|e| format!("unreadable spawn log: {e}"))?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err("refusing to read outside spawn root".into());
-    }
+fn read_job_log(id: String) -> Result<serde_json::Value, String> {
+    let path = resolve_job_log(&id)?;
     const HEAD_CAP: u64 = 8 * 1024 * 1024;
     const WINDOW: usize = 256 * 1024;
-    let mut f = fs::File::open(&canonical).map_err(|e| format!("unreadable spawn log: {e}"))?;
-    let size = f.metadata().map_err(|e| format!("unreadable spawn log: {e}"))?.len();
+    let mut f = fs::File::open(&path).map_err(|e| format!("unreadable job log: {e}"))?;
+    let size = f.metadata().map_err(|e| format!("unreadable job log: {e}"))?.len();
     use std::io::{Read, Seek, SeekFrom};
     if size > HEAD_CAP {
         f.seek(SeekFrom::Start(size - HEAD_CAP)).map_err(|e| e.to_string())?;
     }
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes).map_err(|e| format!("unreadable spawn log: {e}"))?;
+    f.read_to_end(&mut bytes).map_err(|e| format!("unreadable job log: {e}"))?;
     let mut start = bytes.len().saturating_sub(WINDOW);
     if start > 0 {
         // Align to the next line boundary (skip a torn first line).
@@ -1296,32 +1377,73 @@ fn read_spawn_log(run_id: String) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "text": text, "size": size, "truncated": (start > 0) || (size > bytes.len() as u64) }))
 }
 
-/// Delete one spawned subagent's run dir (see agent/SPAWN.md). Scoped to
-/// the spawn-sessions root: run ids are `[A-Za-z0-9_-]+`, resolved path
-/// must stay inside the root. Removes transcript files outright.
+/// Native job listing for the sidebar: every job submitted from one pi
+/// session (matched on the session file pi-jobs records at submit time)
+/// with its latest run. The DB is the source of truth — the frontend
+/// renders this directly instead of scraping chat messages. Returns
+/// `{jobs: [{id, label, state, kind, startedAt, durationMs, runId, pid,
+/// logFile, exitCode}]}`. kind: a session-jsonl log means the pi-subagent
+/// recipe (Agents tab), anything else is a plain process.
 #[tauri::command]
-fn delete_spawn_run(run_id: String) -> Result<(), String> {
-    if run_id.is_empty()
-        || run_id.len() > 128
-        || !run_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("invalid run id".into());
+fn list_session_jobs(session_file: String) -> Result<serde_json::Value, String> {
+    if session_file.trim().is_empty() {
+        return Ok(serde_json::json!({ "jobs": [] }));
     }
     let home = dirs::home_dir().ok_or("no home dir")?;
-    let root = home.join(".pi").join("agent").join("spawn-sessions");
-    let dir = root.join(&run_id);
-    // Containment: canonicalize the parent (root always exists when a
-    // run does) and require the target to be exactly one entry inside.
-    if !dir.is_dir() {
-        return Ok(()); // already gone: idempotent
+    let db_path = home.join(".pi").join("agent").join("jobs").join("jobs.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("unreadable jobs db: {e}"))?;
+    let _ = conn.pragma_update(None, "query_only", true);
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| format!("unreadable jobs db: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT j.id, j.label, r.run_id, r.state, r.pid, r.started_at, r.ended_at, r.exit_code, r.log_file, r.custom_log
+             FROM jobs j LEFT JOIN runs r ON r.job_id = j.id
+               AND r.started_at = (SELECT MAX(started_at) FROM runs WHERE job_id = j.id)
+             WHERE j.session_file = ?1 ORDER BY j.created_at DESC LIMIT 200",
+        )
+        .map_err(|e| format!("unreadable jobs db: {e}"))?;
+    let rows = stmt
+        .query_map([session_file.as_str()], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "label": row.get::<_, String>(1)?,
+                "runId": row.get::<_, Option<String>>(2)?,
+                "state": row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "running".to_string()),
+                "pid": row.get::<_, Option<i32>>(4)?,
+                "startedAt": row.get::<_, Option<i64>>(5)?,
+                "endedAt": row.get::<_, Option<i64>>(6)?,
+                "exitCode": row.get::<_, Option<i64>>(7)?,
+                "logFile": row.get::<_, Option<String>>(8)?,
+                "customLog": row.get::<_, Option<String>>(9)?,
+            }))
+        })
+        .map_err(|e| format!("unreadable jobs db: {e}"))?;
+    let mut jobs = Vec::new();
+    for r in rows {
+        let mut j = r.map_err(|e| format!("unreadable jobs db: {e}"))?;
+        let log: String = j
+            .get("customLog")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| j.get("logFile").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .unwrap_or_default();
+        let kind = if log.ends_with(".jsonl") { "agent" } else { "proc" };
+        let duration_ms = match (j.get("startedAt").and_then(|v| v.as_i64()), j.get("endedAt").and_then(|v| v.as_i64())) {
+            (Some(s), Some(e)) => Some(e - s),
+            _ => None,
+        };
+        j["kind"] = serde_json::json!(kind);
+        j["logFile"] = serde_json::json!(log);
+        j["durationMs"] = duration_ms.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        jobs.push(j);
     }
-    let canonical_root = fs::canonicalize(&root).map_err(|e| format!("unreadable spawn root: {e}"))?;
-    let canonical = fs::canonicalize(&dir).map_err(|e| format!("unreadable spawn dir: {e}"))?;
-    if canonical.parent() != Some(canonical_root.as_path()) {
-        return Err("refusing to delete outside spawn root".into());
-    }
-    fs::remove_dir_all(&canonical).map_err(|e| format!("delete failed: {e}"))?;
-    Ok(())
+    Ok(serde_json::json!({ "jobs": jobs }))
 }
 
 impl AppState {
@@ -1447,6 +1569,18 @@ impl AppState {
     if let Some(v) = patch.get("run_in_bg").and_then(|v| v.as_bool()) {
         cfg.run_in_bg = v;
         tray_changed = true;
+    }
+    if let Some(v) = patch.get("remote_port").and_then(|v| v.as_u64()) {
+        if !(1..=65535).contains(&v) {
+            return Err(format!("bad remote_port: {v} (1-65535, restart to rebind)"));
+        }
+        cfg.remote_port = v as u16;
+    }
+    if let Some(v) = patch.get("remote_token").and_then(|v| v.as_str()) {
+        if v.len() > 256 {
+            return Err("bad remote_token: too long".into());
+        }
+        cfg.remote_token = v.to_string();
     }
     let mut hotkeys_changed = false;
     if patch.get("quickbar_hotkey").or(patch.get("main_hotkey")).is_some() {
@@ -1762,6 +1896,16 @@ pub fn run() {
     // Shared core (config, procs, broadcast) also used by `--server`.
     let backend = AppState::new_shared();
 
+    // Release desktop only: serve the UI over http://localhost (random
+    // free port) instead of tauri://, so embedded players that require a
+    // valid HTTP Referer (YouTube: Error 153) work. Dev already runs on
+    // http via Vite; mobile never navigates off its bundled scheme.
+    // The port travels into setup() for the window navigation below;
+    // IPC keeps working through the remote-url allowlist in
+    // capabilities/default.json.
+    #[cfg(all(not(debug_assertions), not(any(target_os = "android", target_os = "ios"))))]
+    let localhost_port: u16 = portpicker::pick_unused_port().unwrap_or(14200);
+
     // Desktop-only plugins (not dependencies on android/ios — see
     // Cargo.toml target cfg). Rebind pattern: #[cfg] can't gate a link
     // inside a builder chain, so gate the rebinding instead.
@@ -1780,15 +1924,80 @@ pub fn run() {
         }));
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    #[cfg(all(not(debug_assertions), not(any(target_os = "android", target_os = "ios"))))]
+    let builder = builder.plugin(tauri_plugin_localhost::Builder::new(localhost_port).build());
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        // Termux boot (Android): fires RUN_COMMAND at Termux to start the
-        // --server backend, then the frontend talks to it over localhost.
-        // Desktop stub always errors / reports unavailable — harmless.
-        .plugin(tauri_plugin_termux_boot::init())
+        .plugin(tauri_plugin_sys_insets::init())
         .manage(backend)
         .setup(move |app| {
+            // Local UI over http://localhost (see run()): point the config
+            // windows at the plugin server before first paint. Same files
+            // (index.html, quickbar.html), just an http origin with a real
+            // Referer instead of tauri://.
+            #[cfg(all(not(debug_assertions), not(any(target_os = "android", target_os = "ios"))))]
+            {
+                let base = format!("http://localhost:{localhost_port}");
+                // Exact-origin capability (no wildcard semantics to fight):
+                // mirrors capabilities/default.json permissions for the
+                // remote origin so __TAURI__ IPC keeps working there.
+                let mut cap = tauri::ipc::CapabilityBuilder::new("localhost")
+                    .remote(base.clone())
+                    .windows(["main", "quickbar"]);
+                for perm in [
+                    "core:default",
+                    "core:window:allow-show",
+                    "core:window:allow-hide",
+                    "core:window:allow-set-focus",
+                    "core:window:allow-center",
+                    "core:window:allow-set-size",
+                    "core:event:default",
+                    "opener:default",
+                    "dialog:default",
+                    // App commands (autogenerated allow-<command> in
+                    // build.rs): without these, remote origins can never
+                    // match an app command, no matter the URL pattern.
+                    "allow-delete-session",
+                    "allow-direct-fetch",
+                    "allow-get-config",
+                    "allow-hide-window",
+                    "allow-list-session-jobs",
+                    "allow-list-sessions",
+                    "allow-media-stat",
+                    "allow-open-in-main",
+                    "allow-pi-ensure",
+                    "allow-pi-send",
+                    "allow-pi-states",
+                    "allow-pi-stop",
+                    "allow-pick-dir",
+                    "allow-pick-files",
+                    "allow-qb-hide-self",
+                    "allow-read-job-log",
+                    "allow-read-job-transcript",
+                    "allow-read-media",
+                    "allow-read-office-text",
+                    "allow-read-session-messages",
+                    "allow-read-sheet",
+                    "allow-rename-session",
+                    "allow-save-upload",
+                    "allow-set-config",
+                    "allow-show-window",
+                    "allow-shutdown-server",
+                    "allow-toggle-main",
+                    "allow-toggle-quickbar",
+                ] {
+                    cap = cap.permission(perm);
+                }
+                app.add_capability(cap)?;
+                for (label, page) in [("main", "index.html"), ("quickbar", "quickbar.html")] {
+                    if let Some(w) = app.get_webview_window(label) {
+                        if let Ok(url) = format!("{base}/{page}").parse() {
+                            let _ = w.navigate(url);
+                        }
+                    }
+                }
+            }
             // Bridge: forwarded pi records fan out over the broadcast;
             // re-emit them as pi-record IPC for the frontend.
             let st = app.state::<Arc<AppState>>();
@@ -1818,6 +2027,8 @@ pub fn run() {
                 eprintln!("hotkey registration failed: {e} (edit in Settings; KDE shortcut still works)");
             }
             apply_tray(&app.handle(), cfg.run_in_bg);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            serve_http_for_phone();
             Ok(())
         })
         .on_window_event(|win, ev| {
@@ -1839,16 +2050,15 @@ pub fn run() {
             pi_send,
             pi_stop,
             pi_states,
-            pids_alive,
             list_sessions,
             delete_session,
             rename_session,
             read_media,
             media_stat,
             read_session_messages,
-            read_spawn_transcript,
-            read_spawn_log,
-            delete_spawn_run,
+            read_job_transcript,
+            read_job_log,
+            list_session_jobs,
             save_upload,
             read_sheet,
             read_office_text,
@@ -1863,6 +2073,7 @@ pub fn run() {
             pick_dir,
             pick_files,
             shutdown_server,
+            direct_fetch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
