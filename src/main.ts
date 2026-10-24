@@ -1920,6 +1920,7 @@ function appendMessageEnd(message: any): void {
     }
     return;
   }
+  if (m.role === "assistant" && (m as any).usage) noteCtxUsage((m as any).usage);
   if (m.role === "assistant" && !textOf(m.content)) return;
   // Job completions (display:false) carry no card-worthy content —
   // the DB-backed panel refetches instead. Notes still render below
@@ -2783,6 +2784,7 @@ async function showEarlier() {
     histTotal = data.total ?? histTotal;
     histMore = !!data.has_more;
     histBytes += data.bytes ?? 0;
+    scanCtxUsage(histArr);
     // The wipe below detaches any live stream preview: drop the reference
     // (keep streamBuf) so the next delta rebuilds it in the new tree.
     // Completion still renders authoritatively via replayLiveBuffer.
@@ -2858,6 +2860,7 @@ async function refreshMsgs() {
       histMore = false;
       histBytes = 0;
     }
+    scanCtxUsage(histArr);
     if (!alive()) return;
     // Fork ids need a live proc; a cold switch boots one (~1s+). Race a
     // short timeout so the transcript paints from disk immediately: warm
@@ -2940,6 +2943,69 @@ async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => bo
 }
 
 let curFile: string | null = null;
+
+// ---- context-window ring (chathead) ----
+// Usage comes from the latest assistant message's `usage` block
+// (totalTokens ~= context consumed); the limit from get_state's
+// model.contextWindow. Scan history on load, update live on
+// message_end. Hover tooltip shows the full breakdown.
+let ctxWindow: number | null = null;
+let ctxModelName = "";
+let ctxUsage: { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number } | null = null;
+const CTX_CIRC = 62.83;
+function fmtTok(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k`;
+  return String(n);
+}
+function setCtxWindow(n: number, modelName?: string): void {
+  ctxWindow = n;
+  if (modelName) ctxModelName = modelName;
+  updateCtxUI();
+}
+function noteCtxUsage(u: any): void {
+  if (!u || typeof u !== "object") return;
+  const num = (v: any) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const total = num(u.totalTokens) || num(u.total) || (num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite) + num(u.reasoning));
+  if (!total) return;
+  ctxUsage = { total, input: num(u.input), output: num(u.output), cacheRead: num(u.cacheRead), cacheWrite: num(u.cacheWrite), reasoning: num(u.reasoning) };
+  updateCtxUI();
+}
+function scanCtxUsage(arr: any[]): void {
+  ctxUsage = null;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const m = arr[i]?.message ?? arr[i];
+    if (m?.role === "assistant" && m?.usage) { noteCtxUsage(m.usage); return; }
+  }
+  updateCtxUI();
+}
+function updateCtxUI(): void {
+  const wrap = $("ctxwrap") as HTMLElement | null;
+  const arc = $("ctxarc") as unknown as SVGCircleElement | null;
+  const pct = $("ctxpct") as HTMLElement | null;
+  const tip = $("ctxtip") as HTMLElement | null;
+  if (!wrap || !arc || !pct || !tip) return;
+  if (document.body.classList.contains("direct") || !ctxWindow) { wrap.classList.add("hidden"); return; }
+  wrap.classList.remove("hidden");
+  const total = ctxUsage?.total ?? 0;
+  const frac = Math.min(1, total / ctxWindow);
+  arc.style.strokeDashoffset = String(CTX_CIRC * (1 - frac));
+  arc.style.stroke = frac >= 0.9 ? "#e89b8b" : frac >= 0.7 ? "#e8c06b" : "#7aa2f7";
+  pct.textContent = total ? `${Math.round(frac * 100)}%` : "–";
+  const u = ctxUsage;
+  tip.innerHTML =
+    `<div class="ctx-tip-title">${esc(ctxModelName || "Context")}</div>` +
+    `<div class="ctx-tip-sub">${esc(fmtTok(total))} / ${esc(fmtTok(ctxWindow))} tokens (${Math.round(frac * 100)}%)</div>` +
+    (u
+      ? `<div class="ctx-tip-row"><span>Input</span><span>${esc(fmtTok(u.input))}</span></div>` +
+        `<div class="ctx-tip-row"><span>Cache read</span><span>${esc(fmtTok(u.cacheRead))}</span></div>` +
+        `<div class="ctx-tip-row"><span>Output</span><span>${esc(fmtTok(u.output))}</span></div>` +
+        (u.reasoning ? `<div class="ctx-tip-row"><span>Reasoning</span><span>${esc(fmtTok(u.reasoning))}</span></div>` : "") +
+        (u.cacheWrite ? `<div class="ctx-tip-row"><span>Cache write</span><span>${esc(fmtTok(u.cacheWrite))}</span></div>` : "")
+      : `<div class="ctx-tip-row"><span>No usage yet — send a message.</span></div>`) +
+    (frac >= 0.9 ? `<div class="ctx-tip-warn">Near the limit — consider /compact or a fresh chat.</div>` : "");
+  (wrap as HTMLElement).title = total ? `${fmtTok(total)} / ${fmtTok(ctxWindow)} tokens (${Math.round(frac * 100)}%)` : `${fmtTok(ctxWindow)} token context`;
+}
 
 async function refreshState() {
   try {
@@ -3037,6 +3103,9 @@ function syncModelSelect(cur: any, thinking?: string) {
   const m = allModels.find((x) => `${x.provider}/${x.id}` === id);
   $("modellabel").textContent = m?.name ?? m?.id ?? id;
   markCurModel();
+  // Context-window ring tracks the active model's limit (+ display name).
+  if (typeof cur.contextWindow === "number" && cur.contextWindow > 0) setCtxWindow(cur.contextWindow, m?.name ?? cur.id ?? id);
+  else if (typeof m?.contextWindow === "number" && m.contextWindow > 0) setCtxWindow(m.contextWindow, m?.name ?? m?.id ?? id);
   if (thinking) $("thinklabel").textContent = thinking;
   document.querySelectorAll("#thinklist .dd-opt").forEach((d) =>
     d.classList.toggle("cur", (d as HTMLElement).dataset.v === (thinking ?? $("thinklabel").textContent))
@@ -4382,6 +4451,7 @@ let directAbort: AbortController | null = null;
 function enterDirectMode(): void {
   directMode = true;
   document.body.classList.add("direct");
+  updateCtxUI();
   paintModeToggle();
   const st = loadDirectSettings();
   ($("modellabel") as HTMLElement).textContent = st.model || "model";
@@ -4394,6 +4464,7 @@ function exitDirectMode(): void {
   directMode = false;
   directViewId = null;
   document.body.classList.remove("direct");
+  updateCtxUI();
 }
 
 function renderDirectList(): void {

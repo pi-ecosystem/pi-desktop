@@ -20,6 +20,10 @@
           </button>
         </div>
         <div class="snav">
+          <div id="modetoggle" class="hidden" title="Chat mode">
+            <button id="mode-direct" type="button">Direct</button>
+            <button id="mode-remote" type="button">Remote</button>
+          </div>
           <button id="newsess" class="snavbtn" title="New chat">
             <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M13.5 3.5l3 3L8 15H5v-3l8.5-8.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
             <span>New chat</span>
@@ -91,6 +95,14 @@
               </div>
             </div>
             <span class="csp"></span>
+            <div id="ctxwrap" class="hidden" tabindex="0" aria-label="Context usage">
+              <svg id="ctxring" width="26" height="26" viewBox="0 0 26 26">
+                <circle cx="13" cy="13" r="10" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
+                <circle id="ctxarc" cx="13" cy="13" r="10" fill="none" stroke="#7aa2f7" stroke-width="3" stroke-linecap="round" stroke-dasharray="62.83" stroke-dashoffset="62.83" transform="rotate(-90 13 13)" />
+              </svg>
+              <span id="ctxpct">–</span>
+              <div id="ctxtip"></div>
+            </div>
             <button id="abortbtn" disabled title="Stop"><svg width="14" height="14" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg></button>
             <button id="send" title="Send">↑</button>
           </div>
@@ -135,15 +147,20 @@
         <label class="checkrow deskonly"><input type="checkbox" id="cfg-bg" /> Run in background with tray icon</label>
         <label class="deskonly">Quick-bar hotkey <input id="cfg-quick" spellcheck="false" /></label>
         <label class="deskonly">Sessions hotkey <input id="cfg-main" spellcheck="false" /></label>
-        <label>Default dir <input id="cfg-dir" spellcheck="false" /></label>
-        <div id="cfg-backend-row" class="hidden">
-          <span>Termux backend: <span id="cfg-backend-status">…</span></span>
-          <div class="modalbtns">
-            <button id="cfg-backend-stop">Stop server</button>
-            <button id="cfg-backend-restart">Restart server</button>
-          </div>
-        </div>
+        <label class="deskonly">Default dir <input id="cfg-dir" spellcheck="false" /></label>
+        <div class="cfg-sect desk-remote">Desktop link <span class="cfg-sub">this phone reaches your desktop app (empty = off)</span></div>
+        <label class="desk-remote">Desktop URL <input id="cfg-remote-url" spellcheck="false" placeholder="http://192.168.1.5:1423" /></label>
+        <label class="desk-remote">Desktop token <input id="cfg-remote-token" type="password" spellcheck="false" autocomplete="off" /></label>
+        <div class="cfg-sect desk-local">This device as server <span class="cfg-sub">phone reaches this desktop app (restart app to rebind)</span></div>
+        <label class="desk-local">Remote port <input id="cfg-local-port" inputmode="numeric" spellcheck="false" placeholder="1423" /></label>
+        <label class="desk-local">Remote token <span class="cfg-row"><input id="cfg-local-token" type="password" spellcheck="false" autocomplete="off" /><button id="cfg-local-gen" type="button">Generate</button></span></label>
+        <div class="cfg-sect desk-direct">Direct chat <span class="cfg-sub">no desktop needed — talks straight to the model</span></div>
+        <label class="desk-direct">Provider <select id="cfg-direct-preset"><option value="openai">OpenAI-compatible</option><option value="responses">OpenAI Responses API</option><option value="anthropic">Anthropic</option></select></label>
+        <label class="desk-direct">API base URL <input id="cfg-direct-url" spellcheck="false" placeholder="https://api.openai.com/v1" /></label>
+        <label class="desk-direct">API key <input id="cfg-direct-key" type="password" spellcheck="false" autocomplete="off" /></label>
         <p class="hint deskonly">Format like <code>Super+J</code>, <code>Super+Shift+J</code>. In-app hotkeys may not fire on Wayland while another app is focused — add a KDE fallback: <br /><code>System Settings → Shortcuts → Custom → pi-desktop --toggle-quickbar</code></p>
+        <div class="cfg-sect desk-debug">Debug <span class="cfg-sub">recent app errors + effective config (no keys)</span></div>
+        <div id="cfg-debuglog" class="debuglog desk-debug">…</div>
         <p id="cfgerr" class="err"></p>
         <div class="modalbtns">
           <button id="cfgsave">Save</button>
