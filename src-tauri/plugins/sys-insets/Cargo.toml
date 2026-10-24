@@ -1,0 +1,17 @@
+[package]
+name = "tauri-plugin-sys-insets"
+version = "0.1.0"
+authors = [ "You" ]
+description = "System-bar insets (status/nav) for CSS-safe-area fallback"
+edition = "2024"
+rust-version = "1.90"
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-sys-insets"
+
+[dependencies]
+tauri = { version = "2.12.1" }
+serde = "1.0"
+thiserror = "2"
+
+[build-dependencies]
+tauri-plugin = { version = "2.7.1", features = ["build"] }

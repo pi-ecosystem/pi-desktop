@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verify the Termux/Android server build from this machine.
+# Cross-check the backend for Android from this machine.
 # Needs: rust target aarch64-linux-android + NDK at ~/.android/ndk
 # (one-time: rustup target add aarch64-linux-android; NDK r27c lives there now).
 set -e

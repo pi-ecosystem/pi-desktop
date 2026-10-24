@@ -70,7 +70,7 @@ function setStatus(s: string) {
 }
 
 // Backend boots in the background (see main.ts): the popup stays usable
-// while Termux is down, and tapping the error retries the boot.
+// while the remote backend is down, and tapping the error retries the boot.
 let qbBackendUp = false;
 let qbBooting = false;
 let qbBootDead = false;
@@ -78,7 +78,7 @@ async function bootBackendQb(): Promise<void> {
   if (qbBooting || qbBackendUp) return;
   qbBooting = true;
   try {
-    // Android (APK): boot the Termux backend like the main window does.
+    // Remote mode: wait for the desktop backend like the main window does.
     // No-op elsewhere.
     await ensureServerBackend();
   } catch (e: any) {
@@ -118,7 +118,7 @@ async function bootBackendQb(): Promise<void> {
 
 async function boot() {
   setTag("quickbar");
-  // Android close: stop the Termux backend with the app (re-boots on open).
+  // Remote close: ask the desktop backend to stop with the app.
   window.addEventListener("pagehide", () => { if (isServerMode) sendShutdownBeacon(); });
   ($("qbanswer") as HTMLElement).addEventListener("click", () => {
     if (qbBootDead) { qbBootDead = false; void bootBackendQb(); }
