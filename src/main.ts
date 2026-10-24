@@ -23,6 +23,13 @@ import {
 // Shown in Settings so installed-vs-running is checkable. Value comes
 // from package.json via vite define (single source, see vite.config.ts).
 import { renderMd, setMediaBase, clearMediaCache, wireCopy } from "./md";
+import {
+  mountComposer,
+  composerText,
+  setComposerText,
+  composerCursor,
+  composerFocus,
+} from "./composer";
 import * as pdfjs from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -104,8 +111,7 @@ window.addEventListener("pi-genui-submit", (e) => {
     const text = `[ui action] ${msg}${extra}`;
     if (streaming) void sendFollowUp(text);
     else {
-      const inp = document.getElementById("input") as HTMLTextAreaElement | null;
-      if (inp) inp.value = text;
+      setComposerText(text);
       void send();
     }
   } catch { /* ignore */ }
@@ -113,9 +119,8 @@ window.addEventListener("pi-genui-submit", (e) => {
 // Single-button Send<->Stop morph, ChatGPT-style. The separate #abortbtn
 // is hidden (see styles.css); the composer button does both jobs.
 function syncSendBtn() {
-  const inp = document.getElementById("input") as HTMLTextAreaElement | null;
   const btn = document.getElementById("send") as HTMLButtonElement | null;
-  if (!inp || !btn) return;
+  if (!btn) return;
   if (streaming || directStreaming) {
     btn.disabled = false;
     btn.dataset.mode = "stop";
@@ -125,7 +130,7 @@ function syncSendBtn() {
     btn.dataset.mode = "send";
     btn.innerHTML = ICO_SEND;
     btn.title = "Send";
-    btn.disabled = !inp.value.trim() && !pendingAttachments.length;
+    btn.disabled = !composerText().trim() && !pendingAttachments.length;
   }
 }
 // Mirror of pi's own queue, data-driven (see renderQueued). queue_update
@@ -3229,16 +3234,14 @@ function cmdPool(): PiCommand[] {
 }
 
 function slashFrag(): string | null {
-  const inp = $("input") as HTMLTextAreaElement | null;
-  if (!inp) return null;
-  const v = inp.value;
+  const v = composerText();
   if (!v.startsWith("/")) return null;
   // Only the leading token drives completion ("/fix arg" -> "fix").
   const m = v.match(/^\/(\S*)/);
   if (m == null) return null;
   // Multiline paste: only complete when caret is still on line 1.
   const nl = v.indexOf("\n");
-  if (nl >= 0 && (inp.selectionStart ?? 0) > nl) return null;
+  if (nl >= 0 && composerCursor() > nl) return null;
   return m[1].toLowerCase();
 }
 
@@ -3283,12 +3286,10 @@ function renderCmdList(): void {
 let cmdArrowed = false;
 
 function pickCmd(name: string): void {
-  const inp = $("input") as HTMLTextAreaElement;
-  const rest = inp.value.match(/^\/\S*(.*)$/s)?.[1] ?? "";
-  inp.value = `/${name}` + (rest.startsWith(" ") || rest === "" ? rest : ` ${rest}`);
+  const rest = composerText().match(/^\/\S*(.*)$/s)?.[1] ?? "";
+  setComposerText(`/${name}` + (rest.startsWith(" ") || rest === "" ? rest : ` ${rest}`));
   // Caret to end so args can be typed immediately.
-  inp.selectionStart = inp.selectionEnd = inp.value.length;
-  inp.focus();
+  composerFocus();
   renderCmdList();
   syncSendBtn();
 }
@@ -3312,14 +3313,14 @@ async function runLocalCmd(text: string): Promise<boolean> {
     } catch (e: any) {
       toastErr(`new chat failed: ${e.message ?? e}`);
     }
-    ($("input") as HTMLTextAreaElement).value = "";
+    setComposerText("");
     syncSendBtn();
     refreshAll(false);
     return true;
   }
   if (name === "model") {
     hideCmdList();
-    ($("input") as HTMLTextAreaElement).value = "";
+    setComposerText("");
     syncSendBtn();
     closeDrops();
     $("modellist").classList.remove("hidden");
@@ -3331,7 +3332,7 @@ async function runLocalCmd(text: string): Promise<boolean> {
   }
   if (name === "thinking") {
     hideCmdList();
-    ($("input") as HTMLTextAreaElement).value = "";
+    setComposerText("");
     syncSendBtn();
     closeDrops();
     $("thinklist").classList.remove("hidden");
@@ -3343,7 +3344,7 @@ async function runLocalCmd(text: string): Promise<boolean> {
   }
   if (name === "reload") {
     hideCmdList();
-    ($("input") as HTMLTextAreaElement).value = "";
+    setComposerText("");
     syncSendBtn();
     await refreshModels();
     await refreshCommands();
@@ -3411,11 +3412,8 @@ async function doRevert(entryId: string) {
     }
     await refreshAll(false);
     if (r?.text) {
-      const inp = $("input") as HTMLTextAreaElement;
-      inp.value = r.text;
-      inp.style.height = "auto";
-      inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
-      inp.focus();
+      setComposerText(r.text);
+      composerFocus();
     }
   } catch (err: any) {
     toastErr(`revert failed: ${err.message ?? err}`);
@@ -3727,8 +3725,7 @@ function renderAttachbar() {
 }
 
 async function send() {
-  const inp = $("input") as HTMLTextAreaElement;
-  let text = inp.value.trim();
+  let text = composerText().trim();
   if (!text && !pendingAttachments.length) {
     // Empty fire while streaming still means stop (the button's job).
     if (streaming) stopOnly();
@@ -3780,9 +3777,8 @@ async function send() {
   // Transmit-only: the bubble appears when pi echoes (milliseconds when
   // idle). startRun's dots are the send acknowledgment. On failure the
   // text goes back to the composer instead of being lost.
-  inp.value = "";
+  setComposerText("");
   syncSendBtn();
-  inp.style.height = "auto";
   $("msgs").querySelector(".greet")?.remove();
   liveRun = null;
   liveThinkDiv = null;
@@ -3807,10 +3803,8 @@ async function send() {
   const abandon = (note: string) => {
     // Never clobber what the user typed in the new view: restore only
     // into an empty composer, and only then explain with a note.
-    const inpA = $("input") as HTMLTextAreaElement;
-    if (!inpA.value.trim()) {
-      inpA.value = text;
-      inpA.style.height = "auto";
+    if (!composerText().trim()) {
+      setComposerText(text);
       $("msgs").appendChild(el("div", "msg sys", esc(note)));
     }
     syncSendBtn();
@@ -3831,8 +3825,7 @@ async function send() {
         await ensure(cwd, sendKey || undefined, sendPath);
         await pi.newSession(cwd);
       } catch {
-        const inp3 = $("input") as HTMLTextAreaElement;
-        if (!inp3.value.trim()) inp3.value = text;
+        if (!composerText().trim()) setComposerText(text);
         syncSendBtn();
         if (!movedOn()) {
           $("msgs").appendChild(el("div", "msg sys", esc("new chat failed to start (kept in composer)")));
@@ -3895,12 +3888,10 @@ async function send() {
     // Same fence on failure: restore + note only if still viewing.
     if (!movedOn()) {
       $("msgs").appendChild(el("div", "msg sys", esc(`send failed (kept in composer): ${e.message ?? e}`)));
-      const inp2 = $("input") as HTMLTextAreaElement;
-      inp2.value = text;
+      setComposerText(text);
       syncSendBtn();
     } else {
-      const inp2 = $("input") as HTMLTextAreaElement;
-      if (!inp2.value.trim()) inp2.value = text;
+      if (!composerText().trim()) setComposerText(text);
       syncSendBtn();
     }
     settleIfViewing();
@@ -3913,11 +3904,9 @@ async function send() {
 // Mid-run the echo lands when the message is accepted; idle, within ms.
 // Failures restore the text to the composer instead of losing it.
 async function sendFollowUp(text: string): Promise<void> {
-  const inp = $("input") as HTMLTextAreaElement;
-  inp.value = "";
+  setComposerText("");
   lastTransmit = Date.now();
   syncSendBtn();
-  inp.style.height = "auto";
   stick = true;
   dropToBottom();
   // Follow-up continues the run: settled rows from the previous turn
@@ -3932,9 +3921,9 @@ async function sendFollowUp(text: string): Promise<void> {
   const restoreFollowUp = (note: string) => {
     if (stillHere()) {
       $("msgs").appendChild(el("div", "msg sys", esc(note)));
-      inp.value = text;
-    } else if (!inp.value.trim()) {
-      inp.value = text;
+      setComposerText(text);
+    } else if (!composerText().trim()) {
+      setComposerText(text);
     }
     syncSendBtn();
   };
@@ -3958,13 +3947,11 @@ async function sendFollowUp(text: string): Promise<void> {
 // (no queue), so transmit via bare prompt() without touching run UI.
 // No startRun/watchRun — a run is already live and owns completion.
 async function sendSlashMidRun(text: string): Promise<void> {
-  const inp = $("input") as HTMLTextAreaElement;
   hideCmdList();
   dropToBottom();
-  inp.value = "";
+  setComposerText("");
   lastTransmit = Date.now();
   syncSendBtn();
-  inp.style.height = "auto";
   const sk = viewKey;
   try {
     await pi.prompt(cwd, text, undefined, sk || undefined);
@@ -3972,9 +3959,9 @@ async function sendSlashMidRun(text: string): Promise<void> {
     // Shared composer: never clobber the new view's draft on a switch.
     if (viewKey === sk) {
       $("msgs").appendChild(el("div", "msg sys", esc(`command failed: ${e.message ?? e}`)));
-      inp.value = text;
-    } else if (!inp.value.trim()) {
-      inp.value = text;
+      setComposerText(text);
+    } else if (!composerText().trim()) {
+      setComposerText(text);
     }
     syncSendBtn();
   }
@@ -4059,17 +4046,12 @@ async function editQueued(text: string, kind: "steer" | "followUp"): Promise<voi
     }
   };
   const lost: string[] = [];
-  const inp = $("input") as HTMLTextAreaElement;
   if (stillHere()) {
-    inp.value = text;
-    inp.style.height = "auto";
-    inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
+    setComposerText(text);
     syncSendBtn();
-    inp.focus();
-  } else if (!inp.value.trim()) {
-    inp.value = text;
-    inp.style.height = "auto";
-    inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
+    composerFocus();
+  } else if (!composerText().trim()) {
+    setComposerText(text);
     syncSendBtn();
   } else {
     // Switched with a draft in the composer: park the target back in
@@ -4123,13 +4105,12 @@ async function promoteQueued(text: string): Promise<void> {
     await pi.steerMsg(cwd, text, qk || undefined);
     steeredLive = true;
   } catch (e: any) {
-    const inp = $("input") as HTMLTextAreaElement;
     if (stillHere()) {
       $("msgs").appendChild(el("div", "msg sys", esc(`steer failed: ${e.message ?? e}`)));
-      inp.value = text;
+      setComposerText(text);
       syncSendBtn();
-    } else if (!inp.value.trim()) {
-      inp.value = text;
+    } else if (!composerText().trim()) {
+      setComposerText(text);
       syncSendBtn();
     } else {
       // Switched with a draft: re-park as follow-up on its own session
@@ -4138,8 +4119,8 @@ async function promoteQueued(text: string): Promise<void> {
         await pi.followUpMsg(cwd, text, qk || undefined);
         parked.push(text);
       } catch {
-        if (!inp.value.trim()) {
-          inp.value = text;
+        if (!composerText().trim()) {
+          setComposerText(text);
           syncSendBtn();
         }
       }
@@ -4651,7 +4632,6 @@ function renderDirectModelOpts(loading = false): void {
 }
 
 async function directSend(text: string): Promise<void> {
-  const inp = $("input") as HTMLTextAreaElement;
   if (!text && !pendingAttachments.length) return;
   if (pendingAttachments.length) {
     toastErr("attachments need the desktop agent — direct chat is text-only");
@@ -4663,7 +4643,7 @@ async function directSend(text: string): Promise<void> {
     return;
   }
   if (text.trim() === "/new") {
-    inp.value = "";
+    setComposerText("");
     syncSendBtn();
     openDirectChat(null);
     return;
@@ -4692,7 +4672,7 @@ async function directSend(text: string): Promise<void> {
   box.appendChild(abox);
   stick = true;
   dropToBottom();
-  inp.value = "";
+  setComposerText("");
   syncSendBtn();
   chat.messages.push({ role: "user", content: text, at: Date.now() });
   if (chat.messages.length === 1) chat.title = text.slice(0, 60);
@@ -4977,16 +4957,84 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (ev?.payload?.type === "drop" && Array.isArray(ev.payload.paths)) addFilesByPath(ev.payload.paths);
     });
   } catch { /* browser mode: no-op */ }
-  const inp = $("input") as HTMLTextAreaElement;
-  const autogrow = () => {
-    inp.style.height = "auto";
-    inp.style.height = Math.min(inp.scrollHeight, 200) + "px";
-  };
-  inp.addEventListener("input", () => {
-    autogrow();
-    syncSendBtn();
-    renderCmdList();
-  });
+  // CodeMirror composer (option A): real markdown parser highlights as you
+  // type; the doc stays plain text. Keys mirror the old textarea exactly.
+  mountComposer(
+    $("input"),
+    [
+      {
+        key: "ArrowDown",
+        run: () => {
+          if ($("cmdlist")?.classList.contains("hidden")) return false;
+          menuMove($("cmdlist"), 1);
+          cmdArrowed = true;
+          return true;
+        },
+      },
+      {
+        key: "ArrowUp",
+        run: () => {
+          if ($("cmdlist")?.classList.contains("hidden")) return false;
+          menuMove($("cmdlist"), -1);
+          cmdArrowed = true;
+          return true;
+        },
+      },
+      {
+        // Tab always completes the highlighted/first match. Enter sends —
+        // unless the user just arrowed to a row, in which case it picks it.
+        key: "Tab",
+        run: () => {
+          if ($("cmdlist")?.classList.contains("hidden")) return false;
+          const hl = $("cmdlist").querySelector(".dd-opt.hl[data-v]") as HTMLElement | null;
+          const first = $("cmdlist").querySelector('.dd-opt[data-v]') as HTMLElement | null;
+          if (hl ?? first) {
+            pickCmd(((hl ?? first) as HTMLElement).dataset.v!);
+            return true;
+          }
+          return false;
+        },
+      },
+      {
+        key: "Enter",
+        run: () => {
+          const cmdOpen = !$("cmdlist")?.classList.contains("hidden");
+          if (cmdOpen && cmdArrowed) {
+            const hl = $("cmdlist").querySelector(".dd-opt.hl[data-v]") as HTMLElement | null;
+            if (hl) {
+              pickCmd(hl.dataset.v!);
+              return true;
+            }
+          }
+          void send();
+          return true;
+        },
+      },
+      { key: "Mod-Enter", run: () => { void send(); return true; } },
+      { key: "Ctrl-Enter", run: () => { void send(); return true; } },
+      { key: "Alt-Enter", run: () => { void send(); return true; } },
+      { key: "Shift-Enter", run: () => false },
+      {
+        key: "Escape",
+        run: () => {
+          if (!$("cmdlist")?.classList.contains("hidden")) {
+            hideCmdList();
+            return true;
+          }
+          stopOnly();
+          return true;
+        },
+      },
+    ],
+    {
+      onChange: () => {
+        syncSendBtn();
+        renderCmdList();
+      },
+      onPaste: (files) => addFiles(files),
+      onDropFiles: (files) => addFiles(files),
+    }
+  );
   // Mobile keyboard: the manifest uses adjustNothing, so the keyboard
   // overlays the WebView instead of resizing it. Lift only the composer
   // above the keyboard via the visual viewport — header and transcript
@@ -5002,50 +5050,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       vv.addEventListener("scroll", liftComposer);
     }
   } catch { /* old webviews: no-op */ }
-  inp.addEventListener("paste", (e) => {
-    const files = e.clipboardData?.files;
-    if (files?.length) addFiles(files);
-  });
-  inp.addEventListener("keydown", (e) => {
-    const cmdOpen = !$("cmdlist")?.classList.contains("hidden");
-    if (cmdOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-      e.preventDefault();
-      menuMove($("cmdlist"), e.key === "ArrowDown" ? 1 : -1);
-      cmdArrowed = true;
-      return;
-    }
-    // Tab always completes the highlighted/first match. Enter sends —
-    // unless the user just arrowed to a row, in which case it picks it.
-    if (cmdOpen && e.key === "Tab") {
-      const hl = $("cmdlist").querySelector(".dd-opt.hl[data-v]") as HTMLElement | null;
-      const first = $("cmdlist").querySelector('.dd-opt[data-v]') as HTMLElement | null;
-      if (hl ?? first) {
-        e.preventDefault();
-        pickCmd(((hl ?? first) as HTMLElement).dataset.v!);
-      }
-      return;
-    }
-    if (e.key === "Enter" && !e.shiftKey) {
-      if (cmdOpen && cmdArrowed) {
-        const hl = $("cmdlist").querySelector(".dd-opt.hl[data-v]") as HTMLElement | null;
-        if (hl) {
-          e.preventDefault();
-          pickCmd(hl.dataset.v!);
-          return;
-        }
-      }
-      e.preventDefault();
-      send();
-    } else if (e.key === "Escape") {
-      if (cmdOpen) {
-        e.preventDefault();
-        hideCmdList();
-        return;
-      }
-      e.preventDefault();
-      stopOnly();
-    }
-  });
   ($("newsess") as HTMLButtonElement).addEventListener("click", async () => {
     // Mobile drawer: a fresh chat is a navigation — dismiss the sidebar.
     if (window.matchMedia("(max-width: 768px)").matches) {
@@ -5054,13 +5058,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     if (directMode) {
       openDirectChat(null);
-      ($("input") as HTMLTextAreaElement).focus();
+      composerFocus();
       return;
     }
     cwdGen++; // invalidate any in-flight setCwd (see switchSession)
     resetRunState();
     paintEmpty();
-    ($("input") as HTMLTextAreaElement).focus();
+    composerFocus();
     refreshSessions();
     try {
       await openFresh();
@@ -5119,7 +5123,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (document.querySelector(".lightbox")) return;
       const a = document.activeElement as HTMLElement | null;
       if (a && a !== document.body) return;
-      ($("input") as HTMLTextAreaElement).focus();
+      composerFocus();
     } catch { /* ignore */ }
   };
   try {
