@@ -513,10 +513,23 @@ function turnText(row: HTMLElement): string {
   }
   return parts.join("\n\n");
 }
-function copyTurn(btn: HTMLButtonElement) {
+async function copyTurn(btn: HTMLButtonElement) {
   const row = btn.closest(".turn-tools") as HTMLElement | null;
   if (!row) return;
-  copyText(turnText(row));
+  // Same tick feedback as user-bubble copy (doCopy): swap the icon for
+  // 1.2s so the click visibly lands. Restores the row's own title.
+  const orig = btn.innerHTML;
+  const origTitle = btn.title;
+  const ok = await copyText(turnText(row));
+  btn.innerHTML = ok
+    ? `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M4 10.5l4 4 7-8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+    : `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+  btn.title = ok ? "Copied" : "Copy failed";
+  setTimeout(() => {
+    if (!btn.isConnected) return;
+    btn.innerHTML = orig;
+    btn.title = origTitle;
+  }, 1200);
 }
 // Identity of the turn currently being spoken. Button ELEMENTS don't
 // survive re-renders (markTurnActions rebuilds rows), so toggling by
@@ -997,6 +1010,10 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
   }
   if (role === "user") {
     const wrap = el("div", "umsgwrap");
+    // Raw text for the live fork patcher: rendered markdown can't match
+    // fork entries exactly, so the source text rides along (cleared once
+    // the button lands). Property assignment, no HTML-escaping hazard.
+    wrap.dataset.forkText = textOf(m.content) || "";
     // Attached previews render ABOVE the bubble as their own wrapping
     // row (scales to many files); the bubble holds text only.
     let { text: utext, md: umd, files: ufiles } = splitUserAttachments(textOf(m.content) || "");
@@ -1618,6 +1635,7 @@ async function sendJobCmd(text: string): Promise<void> {
   const sk = viewKey;
   try {
     await pi.prompt(cwd, text, undefined, sk || undefined);
+    scheduleSessionsRefresh(); // job command appended: sidebar order follows
   } catch (e: any) {
     if (viewKey !== sk) return; // moved on: don't scribble on the new view
     $("msgs").appendChild(el("div", "msg sys", esc(`job command failed: ${e.message ?? e}`)));
@@ -1880,6 +1898,9 @@ function appendMessageEnd(message: any): void {
     // Always render the echo — no optimistic bubbles, no skip tokens,
     // so the transcript can never disagree with pi's own history.
     liveRun = null;
+    // Echoes land before pi's fork list knows them (buttonless): patch
+    // revert buttons in once the list catches up (debounced, in place).
+    patchForkButtonsSoon();
   }
   if (m.role === "assistant" && Array.isArray(m.content)) {
     for (const b of m.content) {
@@ -2184,6 +2205,21 @@ function paintRunDots(): void {
   });
 }
 
+let sessRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+// Sidebar order comes from file mtimes, so it goes stale between
+// re-lists. Sends and background settles don't re-list (only view
+// changes and viewed settles do) — schedule a trailing re-list so the
+// sidebar follows activity within ~a second. Debounced: rapid-fire
+// events collapse into one backend list call. Skipped in direct mode
+// (no backend sessions listed there).
+function scheduleSessionsRefresh(): void {
+  if (directMode) return;
+  if (sessRefreshTimer) return;
+  sessRefreshTimer = setTimeout(() => {
+    sessRefreshTimer = null;
+    void refreshSessions();
+  }, 1200);
+}
 async function refreshSessions() {
   hideSessMenu(); // rows rebuild: any open menu points at stale nodes
   try {
@@ -2693,8 +2729,16 @@ function msgKey(m: any): string {
   if (m?.role === "assistant" && typeof m.responseId === "string" && m.responseId) return `a:${m.responseId}`;
   if (m?.role === "toolResult" && typeof m.toolCallId === "string") return `t:${m.toolCallId}`;
   if (m?.role === "bashExecution") return `b:${m.command ?? ""}:${(m.output ?? "").length}`;
-  if (m?.role === "custom") return `c:${m.customType ?? ""}:${textOf(m.content).slice(0, 200)}`;
-  return `${m?.role ?? "?"}:${m?.timestamp ?? ""}:${textOf(m?.content).slice(0, 200)}`;
+  // Fallback kinds have no stable ids: key on a hash of the FULL text,
+  // not a 200-char prefix — two long messages sharing a prefix (pasted
+  // logs, same attachment header) must not dedup each other away.
+  if (m?.role === "custom") return `c:${m.customType ?? ""}:${txtKey(textOf(m.content))}`;
+  return `${m?.role ?? "?"}:${m?.timestamp ?? ""}:${txtKey(textOf(m?.content))}`;
+}
+function txtKey(t: string): string {
+  let h = 0;
+  for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
+  return `${h}:${t.length}`;
 }
 function replayLiveBuffer(): void {
   const buf = liveBuffer;
@@ -2749,6 +2793,85 @@ async function fetchForkMapInto(map: Map<string, string[]>): Promise<void> {
 }
 let lastForkMap = new Map<string, string[]>();
 
+// Post-boot fork fill: a cold switch paints before ensure() boots the
+// proc, so its fork fetch ran with no proc and the first paint is
+// buttonless. Call after ensure(): refetches and repaints (scroll
+// preserved) only if the view hasn't moved on. Skips on empty (proc
+// still down) to avoid churning the tree for nothing.
+async function refreshForkButtons(): Promise<void> {
+  const vk = viewKey, vp = viewPath;
+  const map = new Map<string, string[]>();
+  await Promise.race([
+    fetchForkMapInto(map),
+    new Promise<void>((r) => setTimeout(() => r(), 2000)),
+  ]);
+  if (viewKey !== vk || viewPath !== vp || !map.size) return;
+  const myGen = rebuildGen;
+  const alive = () => myGen === rebuildGen && viewKey === vk;
+  lastForkMap = map;
+  await renderHist($("msgs"), true, alive, map);
+}
+
+let forkPatchTimer: ReturnType<typeof setTimeout> | null = null;
+// Live echoes render before pi's fork list knows them, so they land
+// buttonless. Schedule a bounded refetch, then insert revert buttons
+// into the bubbles still missing them. Patch-in-place (no repaint) so
+// open Activity rows and scroll position survive.
+function patchForkButtonsSoon(): void {
+  if (forkPatchTimer) return;
+  forkPatchTimer = setTimeout(() => {
+    forkPatchTimer = null;
+    void patchMissingForkButtons();
+  }, 800);
+}
+async function patchMissingForkButtons(): Promise<void> {
+  const vk = viewKey, vp = viewPath;
+  const box = $("msgs");
+  const missing: HTMLElement[] = [];
+  box.querySelectorAll(".umsgwrap").forEach((w) => {
+    const wrap = w as HTMLElement;
+    if (!wrap.querySelector(".act-revert") && wrap.dataset.forkText) missing.push(wrap);
+  });
+  if (!missing.length) return;
+  const map = new Map<string, string[]>();
+  await Promise.race([
+    fetchForkMapInto(map),
+    new Promise<void>((r) => setTimeout(() => r(), 2000)),
+  ]);
+  if (viewKey !== vk || viewPath !== vp || !map.size) return;
+  // Merge without duplicating: later repaints derive buttons from these
+  // same maps, so each id must stay listed exactly once.
+  for (const [k, v] of map) {
+    const cur = lastForkMap.get(k) ?? [];
+    for (const id of v) if (!cur.includes(id)) cur.push(id);
+    lastForkMap.set(k, cur);
+  }
+  // Ids already in the DOM stay where they are: assign in DOM order,
+  // skipping used, mirroring takeForkId so a later repaint agrees.
+  const used = new Set<string>();
+  box.querySelectorAll(".act-revert").forEach((b) => {
+    const id = (b as HTMLElement).dataset.entry;
+    if (id) used.add(id);
+  });
+  for (const wrap of missing) {
+    if (!wrap.isConnected || wrap.querySelector(".act-revert")) continue;
+    const t = wrap.dataset.forkText ?? "";
+    const ids = lastForkMap.get(t) ?? [];
+    const id = ids.find((x) => !used.has(x));
+    if (!id) continue;
+    const acts = wrap.querySelector(".actions");
+    if (!acts) continue;
+    const btn = document.createElement("button");
+    btn.className = "act-revert iconbtn";
+    btn.dataset.entry = id;
+    btn.title = "Revert to this message (forks the tree)";
+    btn.innerHTML = ICO_REVERT;
+    acts.appendChild(btn);
+    used.add(id);
+    delete wrap.dataset.forkText;
+  }
+}
+
 // Older-page fetch: prepends the next HIST_PAGE messages and re-renders
 // the accumulated window in one pass (fork ids + spawn tracking keep
 // full-load order). Scroll position survives via delta math in renderHist.
@@ -2797,7 +2920,19 @@ async function showEarlier() {
     // Flag down BEFORE paint: renderHist builds the button from this flag,
     // so painting while still loading bricks it disabled (the stuck state).
     histLoading = false;
+    // Paint first with what we have (same speed as before); then refill
+    // fork ids in the background — lastForkMap may be the empty remnant
+    // of a cold-switch paint. Repaint only when fresh ids arrived.
     await renderHist($("msgs"), true, alive, lastForkMap);
+    if (!alive()) return;
+    const fmap = new Map<string, string[]>();
+    await Promise.race([
+      fetchForkMapInto(fmap),
+      new Promise<void>((r) => setTimeout(() => r(), 1000)),
+    ]);
+    if (!alive() || !fmap.size) return;
+    lastForkMap = fmap;
+    await renderHist($("msgs"), true, alive, fmap);
   } catch (e: any) {
     // Silent failure + disabled button was the brick: surface it, the
     // button stays for retry via the finally repaint below.
@@ -2810,7 +2945,7 @@ async function showEarlier() {
     paintShowEarlierBtn();
   }
 }
-async function refreshMsgs() {
+async function refreshMsgs(): Promise<boolean> {
   const box = $("msgs");
   // No wipe here: the old view stays visible until the new window is
   // fetched (tens of ms from disk), then renderHist swaps it in. Wiping
@@ -2866,7 +3001,7 @@ async function refreshMsgs() {
       histBytes = 0;
     }
     scanCtxUsage(histArr);
-    if (!alive()) return;
+    if (!alive()) return false;
     // Fork ids need a live proc; a cold switch boots one (~1s+). Race a
     // short timeout so the transcript paints from disk immediately: warm
     // procs answer in ms (single pass, buttons included), cold ones
@@ -2875,20 +3010,26 @@ async function refreshMsgs() {
     lastForkMap = forkByText;
     const forkP = fetchForkMapInto(forkByText);
     const forkFast = await Promise.race([forkP.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 250))]);
-    if (!alive()) return;
+    if (!alive()) return false;
     await renderHist(box, false, alive, forkByText);
-    if (!forkFast) void forkP.then(() => { if (alive()) void renderHist(box, true, alive, forkByText); });
+    if (!forkFast) void forkP.then(() => { if (alive() && lastForkMap === forkByText) void renderHist(box, true, alive, forkByText); });
+    return forkFast;
   } catch (e: any) {
-    if (!alive()) return;
+    if (!alive()) return false;
     refreshActive = false;
     replayLiveBuffer();
     box.appendChild(el("div", "msg sys", esc(`could not load messages: ${e.message ?? e}`)));
+    return false;
   }
 }
 // Windowed history render: paints the accumulated newest-first window
 // (histArr) in a single pass. keepScroll preserves position when older
 // pages prepend above (scroll-delta math); otherwise jumps to newest.
 async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => boolean, forkMap: Map<string, string[]>) {
+  // Stale renders must not touch the tree: the wipe below would blank a
+  // newer generation's fresh paint (then the late fork repaint guards
+  // against clobbering it via lastForkMap identity in refreshMsgs).
+  if (!alive()) return;
   renderedKeys.clear();
   const sc = $("scrollwrap");
   const prevH = sc.scrollHeight, prevT = sc.scrollTop;
@@ -3586,13 +3727,18 @@ async function switchSession(path: string) {
     if (pre) $("sesstitle").textContent = titleText(pre);
     refreshSessions();
     refreshCommands().catch(() => {});
-    await refreshMsgs();
+    const forkFast = await refreshMsgs();
     await ensure(cwd, key, path);
     await refreshState();
     // AFTER the rebuild: re-arming here is the only order that survives.
     // Returning to a still-running session shows its thinking indicator
     // again, with the live stream continuing underneath.
     await syncRunFlag();
+    // Cold paint ran with no proc: refill fork ids now that one is up.
+    // Fire-and-forget — the view is already complete (dots re-armed
+    // above); buttons fill in when the fetch lands. Awaiting here is
+    // what made every cold switch feel late.
+    if (!forkFast) void refreshForkButtons();
   } catch (e: any) {
     toastErr(`switch failed: ${e.message ?? e}`);
     // View already moved (paint-first): at least leave the header naming
@@ -3865,6 +4011,7 @@ async function send() {
     const res: any = await pi.prompt(cwd, text, undefined, sendKey || undefined);
     freshUnsent = false;
     virginFresh.delete(sendKey); // sent-on: no longer a leak candidate
+    scheduleSessionsRefresh(); // file mtime moved: sidebar order follows
     if (movedOn()) {
       watchRun(cwd, sendKey);
       return;
@@ -3936,6 +4083,7 @@ async function sendFollowUp(text: string): Promise<void> {
   try {
     await pi.prompt(cwd, text, "followUp", fk || undefined);
     awaitingResponse = true;
+    scheduleSessionsRefresh(); // file mtime moved: sidebar order follows
   } catch (e: any) {
     // (restoreFollowUp already syncs the button.)
     restoreFollowUp(`follow-up failed, kept in composer (run continues): ${e.message ?? e}`);
@@ -3955,6 +4103,7 @@ async function sendSlashMidRun(text: string): Promise<void> {
   const sk = viewKey;
   try {
     await pi.prompt(cwd, text, undefined, sk || undefined);
+    scheduleSessionsRefresh(); // mid-run command appended: sidebar order follows
   } catch (e: any) {
     // Shared composer: never clobber the new view's draft on a switch.
     if (viewKey === sk) {
@@ -4901,6 +5050,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (st.tag && st.tag !== "main") return;
     if (!st.key) return;
     noteRunLive(st.key, st.streaming);
+    // Background activity moved a file mtime: reorder the sidebar.
+    // (Viewed settles already re-list via finishRun; this covers the rest.)
+    scheduleSessionsRefresh();
     // Fresh-id proc keys carry no file path: resolve once so the row
     // dot lights without waiting for the next sidebar snapshot.
     if (st.streaming && !st.key.includes("/") && !fileForProc(st.key)) {
