@@ -179,7 +179,7 @@ function stopOnly() {
 }
 const ICO_COPY = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="6.5" y="6.5" width="10" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M13.5 6.5v-2a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" stroke="currentColor" stroke-width="1.5"/></svg>`;
 const ICO_REVERT = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3.5 8a6.5 6.5 0 1 1-1 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M3.5 3.5V8H8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-const ICO_SPEAK = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 7.5v5h2.5L10 16V4L5.5 7.5H3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M13 7.5a4 4 0 0 1 0 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+const ICO_FORK = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="6" cy="5" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="6" cy="15" r="2" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="10" r="2" stroke="currentColor" stroke-width="1.5"/><path d="M6 7v6M8 5.5h3.5a2 2 0 0 1 2 2V8M8 14.5h3.5a2 2 0 0 0 2-2V12" stroke="currentColor" stroke-width="1.5"/></svg>`;
 async function copyText(text: string): Promise<boolean> {
   if (!text) return false;
   try {
@@ -490,8 +490,7 @@ function lineDiffBlock(oldS: string, newS: string): HTMLElement {
 // their own hover toolbar; these rows cover agent replies.
 function agentToolsRow(): HTMLElement {
   return el("div", "turn-tools",
-    `<button class="act-tcopy iconbtn" title="Copy reply">${ICO_COPY}</button>` +
-    `<button class="act-tspeak iconbtn" title="Read aloud">${ICO_SPEAK}</button>`);
+    `<button class="act-tcopy iconbtn" title="Copy reply">${ICO_COPY}</button>`);
 }
 // All assistant-bubble texts of the turn containing `row` (oldest first).
 // The row lives inside the turn's last bubble; walk back to the user bubble.
@@ -531,62 +530,13 @@ async function copyTurn(btn: HTMLButtonElement) {
     btn.title = origTitle;
   }, 1200);
 }
-// Identity of the turn currently being spoken. Button ELEMENTS don't
-// survive re-renders (markTurnActions rebuilds rows), so toggling by
-// element broke after any refresh. Fork entry ids are stable across
-// rebuilds; text-hash fallback covers pre-fork turns.
-let speakingTurnId: string | null = null;
-function turnId(row: HTMLElement): string {
-  let n: Element | null = row.closest(".msg.assistant");
-  while (n) {
-    const prev = n.previousElementSibling;
-    if (!prev) break;
-    if ((prev as HTMLElement).classList?.contains("umsgwrap")) {
-      const rid = ((prev as HTMLElement).querySelector(".act-revert") as HTMLElement | null)?.dataset?.entry;
-      if (rid) return `fork:${rid}`;
-      break;
-    }
-    n = prev;
-  }
-  const t = turnText(row);
-  let h = 0;
-  for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
-  return `txt:${h}:${t.length}`;
-}
-function speakTurn(btn: HTMLButtonElement) {
-  try {
-    const row = btn.closest(".turn-tools") as HTMLElement | null;
-    if (!row) {
-      speechSynthesis.cancel();
-      speakingTurnId = null;
-      return;
-    }
-    const id = turnId(row);
-    speechSynthesis.cancel();
-    if (speakingTurnId === id) {
-      speakingTurnId = null; // same turn: toggle off
-      return;
-    }
-    const text = turnText(row).slice(0, 2000);
-    if (!text) {
-      speakingTurnId = null;
-      return;
-    }
-    const u = new SpeechSynthesisUtterance(text);
-    u.onend = () => {
-      if (speakingTurnId === id) speakingTurnId = null;
-    };
-    speakingTurnId = id;
-    speechSynthesis.speak(u);
-  } catch { /* no TTS in this WebView */ }
-}
 function markTurnActions() {
   // Rows live INSIDE the turn's last assistant bubble (not as direct
   // #msgs children), so cleanup must be a descendant selector — the old
   // `#msgs > .turn-tools` never matched and rows duplicated on every
   // message_end/finish/refresh. One row per user turn, rebuilt each call.
   document.querySelectorAll("#msgs .turn-tools").forEach((n) => n.remove());
-  // Copy/speak appear only in true quiet: run settled AND nothing queued
+  // Copy appears only in true quiet: run settled AND nothing queued
   // behind it. A settle with queued follow-ups (or an accepted-but-silent
   // follow-up) means more output is coming — showing actions now reads
   // as "done" prematurely and they flicker when the next turn lands.
@@ -1010,9 +960,9 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
   }
   if (role === "user") {
     const wrap = el("div", "umsgwrap");
-    // Raw text for the live fork patcher: rendered markdown can't match
-    // fork entries exactly, so the source text rides along (cleared once
-    // the button lands). Property assignment, no HTML-escaping hazard.
+    // Source text for fork-id matching: rendered markdown can't match pi's
+    // fork entries exactly. Kept for the life of the bubble — clicks resolve
+    // a missing entry id lazily via this text (see resolveForkEntry).
     wrap.dataset.forkText = textOf(m.content) || "";
     // Attached previews render ABOVE the bubble as their own wrapping
     // row (scales to many files); the bubble holds text only.
@@ -1033,13 +983,14 @@ function msgNode(m: any, calls?: Map<string, any>, forkId?: string): HTMLElement
     }
     // Hover toolbar, icon-only and hidden at rest (Claude-style): copy +
     // revert. Overlay takes no layout space so the bubble hugs the text.
+    // Fork/revert icons render immediately (fast UI); the entry id fills
+    // in when pi's fork list arrives, or lazily on click.
     const acts = el(
       "div",
       "actions overlay",
-      `<button class="act-copy iconbtn" title="Copy">${ICO_COPY}</button>` +
-        (forkId
-          ? `<button class="act-revert iconbtn" data-entry="${forkId}" title="Revert to this message (forks the tree)">${ICO_REVERT}</button>`
-          : "")
+      `<button class="act-fork iconbtn" ${forkId ? `data-entry="${forkId}"` : ""} title="Fork to new chat (keep both)">${ICO_FORK}</button>` +
+        `<button class="act-revert iconbtn" ${forkId ? `data-entry="${forkId}"` : ""} title="Revert to this message (replaces current chat)">${ICO_REVERT}</button>` +
+        `<button class="act-copy iconbtn" title="Copy">${ICO_COPY}</button>`
     );
     wrap.appendChild(acts);
     return wrap;
@@ -2793,17 +2744,23 @@ async function fetchForkMapInto(map: Map<string, string[]>): Promise<void> {
 }
 let lastForkMap = new Map<string, string[]>();
 
-// Post-boot fork fill: a cold switch paints before ensure() boots the
-// proc, so its fork fetch ran with no proc and the first paint is
-// buttonless. Call after ensure(): refetches and repaints (scroll
-// preserved) only if the view hasn't moved on. Skips on empty (proc
-// still down) to avoid churning the tree for nothing.
+// Post-boot fork fill: a cold switch paints from disk before ensure()
+// boots the proc, so the first paint is buttonless. Gated on proc
+// readiness (poll pi.ready), then refetches once and repaints (scroll
+// preserved) — only if the view hasn't moved on.
 async function refreshForkButtons(): Promise<void> {
   const vk = viewKey, vp = viewPath;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 15000) {
+    if (viewKey !== vk || viewPath !== vp) return;
+    if (await pi.ready(cwd, viewKey || undefined)) break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (viewKey !== vk || viewPath !== vp) return;
   const map = new Map<string, string[]>();
   await Promise.race([
     fetchForkMapInto(map),
-    new Promise<void>((r) => setTimeout(() => r(), 2000)),
+    new Promise<void>((r) => setTimeout(() => r(), 10000)),
   ]);
   if (viewKey !== vk || viewPath !== vp || !map.size) return;
   const myGen = rebuildGen;
@@ -2813,10 +2770,10 @@ async function refreshForkButtons(): Promise<void> {
 }
 
 let forkPatchTimer: ReturnType<typeof setTimeout> | null = null;
-// Live echoes render before pi's fork list knows them, so they land
-// buttonless. Schedule a bounded refetch, then insert revert buttons
-// into the bubbles still missing them. Patch-in-place (no repaint) so
-// open Activity rows and scroll position survive.
+// Live echoes render before pi's fork list knows them. Schedule one
+// hydration of entry ids; clicks resolve lazily regardless, so a single
+// attempt is enough. Patch-in-place (no repaint) so open Activity rows
+// and scroll position survive.
 function patchForkButtonsSoon(): void {
   if (forkPatchTimer) return;
   forkPatchTimer = setTimeout(() => {
@@ -2827,12 +2784,14 @@ function patchForkButtonsSoon(): void {
 async function patchMissingForkButtons(): Promise<void> {
   const vk = viewKey, vp = viewPath;
   const box = $("msgs");
-  const missing: HTMLElement[] = [];
-  box.querySelectorAll(".umsgwrap").forEach((w) => {
-    const wrap = w as HTMLElement;
-    if (!wrap.querySelector(".act-revert") && wrap.dataset.forkText) missing.push(wrap);
-  });
-  if (!missing.length) return;
+  const wraps = [...box.querySelectorAll(".umsgwrap")].filter((w) => {
+    const elw = w as HTMLElement;
+    if (!elw.isConnected || !elw.dataset.forkText) return false;
+    const r = elw.querySelector(".act-revert") as HTMLElement | null;
+    const f = elw.querySelector(".act-fork") as HTMLElement | null;
+    return !r?.dataset.entry || !f?.dataset.entry;
+  }) as HTMLElement[];
+  if (!wraps.length) return;
   const map = new Map<string, string[]>();
   await Promise.race([
     fetchForkMapInto(map),
@@ -2849,26 +2808,20 @@ async function patchMissingForkButtons(): Promise<void> {
   // Ids already in the DOM stay where they are: assign in DOM order,
   // skipping used, mirroring takeForkId so a later repaint agrees.
   const used = new Set<string>();
-  box.querySelectorAll(".act-revert").forEach((b) => {
+  box.querySelectorAll(".act-revert, .act-fork").forEach((b) => {
     const id = (b as HTMLElement).dataset.entry;
     if (id) used.add(id);
   });
-  for (const wrap of missing) {
-    if (!wrap.isConnected || wrap.querySelector(".act-revert")) continue;
+  for (const wrap of wraps) {
+    if (!wrap.isConnected) continue;
     const t = wrap.dataset.forkText ?? "";
     const ids = lastForkMap.get(t) ?? [];
     const id = ids.find((x) => !used.has(x));
     if (!id) continue;
-    const acts = wrap.querySelector(".actions");
-    if (!acts) continue;
-    const btn = document.createElement("button");
-    btn.className = "act-revert iconbtn";
-    btn.dataset.entry = id;
-    btn.title = "Revert to this message (forks the tree)";
-    btn.innerHTML = ICO_REVERT;
-    acts.appendChild(btn);
+    wrap.querySelectorAll(".act-revert, .act-fork").forEach((b) => {
+      (b as HTMLElement).dataset.entry = id;
+    });
     used.add(id);
-    delete wrap.dataset.forkText;
   }
 }
 
@@ -3036,7 +2989,7 @@ async function renderHist(box: HTMLElement, keepScroll: boolean, alive: () => bo
   box.innerHTML = "";
   const arr = histArr;
   try {
-    // Entry ids so each sent message gets copy + revert (fork) actions.
+    // Entry ids so each sent message gets copy + revert + fork actions.
     // Matched by text (order-independent): index mapping breaks if pi ever
     // returns entries in any other order. Cloned per render: takeForkId
     // consumes queues, and one map serves first paint + background repaint.
@@ -3520,11 +3473,52 @@ function refreshLight() {
 // different child and re-renders. Local partial UI is reset so a stale
 // stream doesn't linger in the new view.
 
-// In-flight revert guard: double-clicking forks twice into two branches
-// (single shared child, last-writer-wins view, one orphaned fork).
+// Revert rewinds this chat in place, fork keeps both: pi always forks
+// into a new file. Revert then deletes the pre-fork file so the sidebar
+// keeps one entry (latest survives); fork keeps the old file so the
+// sidebar shows old + new.
+// Lazy fork-id resolution: icons render before pi's fork list arrives,
+// so a click may need to map bubble → entry id itself. Matches by source
+// text (ordinal among duplicates, mirroring takeForkId) and stashes the
+// win on both buttons so the next click is instant. Null = pi didn't
+// answer or hasn't ingested the echo yet — caller toasts, user retries.
+async function resolveForkEntry(btn: HTMLButtonElement): Promise<string | null> {
+  const vk = viewKey;
+  const wrap = btn.closest(".umsgwrap") as HTMLElement | null;
+  const text = wrap?.dataset.forkText;
+  if (!wrap || !text) return null;
+  const map = new Map<string, string[]>();
+  await Promise.race([
+    fetchForkMapInto(map),
+    new Promise<void>((r) => setTimeout(() => r(), 8000)),
+  ]);
+  if (viewKey !== vk || !wrap.isConnected) return null;
+  const ids = map.get(text);
+  if (!ids?.length) return null;
+  let id: string;
+  if (ids.length === 1) {
+    id = ids[0];
+  } else {
+    const same = [...$("msgs").querySelectorAll(".umsgwrap")].filter(
+      (w) => (w as HTMLElement).dataset.forkText === text
+    );
+    const idx = same.indexOf(wrap);
+    id = ids[Math.min(Math.max(idx, 0), ids.length - 1)] ?? ids[0];
+  }
+  if (!id) return null;
+  wrap.querySelectorAll(".act-revert, .act-fork").forEach((b) => {
+    (b as HTMLElement).dataset.entry = id;
+  });
+  return id;
+}
+
 let reverting = false;
-async function doRevert(entryId: string) {
+async function doForkAt(entryId: string, keepBoth: boolean) {
   if (reverting) return;
+  if (streaming || awaitingResponse) {
+    toastErr(`wait for the run to finish before ${keepBoth ? "forking" : "reverting"}`);
+    return;
+  }
   reverting = true;
   // Same in-flight-setCwd invalidation as switchSession (see above).
   cwdGen++;
@@ -3551,17 +3545,25 @@ async function doRevert(entryId: string) {
       viewPath = file;
       curFile = file;
     }
+    // Fork keeps both files; revert drops the pre-fork file so only the
+    // rewound version remains. Best-effort — the new file is
+    // self-contained (pi copies the root-to-leaf path into it).
+    if (!keepBoth && before && file && file !== before) {
+      try { await sessions.del(before); } catch { /* keep both on failure */ }
+    }
     await refreshAll(false);
     if (r?.text) {
       setComposerText(r.text);
       composerFocus();
     }
   } catch (err: any) {
-    toastErr(`revert failed: ${err.message ?? err}`);
+    toastErr(`${keepBoth ? "fork" : "revert"} failed: ${err.message ?? err}`);
   } finally {
     reverting = false;
   }
 }
+async function doRevert(entryId: string) { await doForkAt(entryId, false); }
+async function doFork(entryId: string) { await doForkAt(entryId, true); }
 
 // Local run state must die with the session: settled events arriving
 // across a switch gap otherwise leave streaming stuck (dead UI) or bleed
@@ -3597,10 +3599,6 @@ function resetRunState() {
   queuedCount = 0;
   $("qbar")?.replaceChildren();
   selPinned = false;
-  try {
-    speechSynthesis.cancel();
-  } catch { /* no TTS */ }
-  speakingTurnId = null;
   hideCmdList();
   lastRun = null;
   diffFiles.clear();
@@ -4521,11 +4519,11 @@ function chordHeld(c: { key: string; mods: string[] }, e: KeyboardEvent): boolea
 }
 parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines below
 
-  // Hover toolbars: copy message text, speak it, or revert (fork) at a user
+  // Hover toolbars: copy message text, or revert/fork at a user
   // message. Queued-message edit/steer live on the queue bar (pi's data),
-  // not on bubbles. Sending after a revert forks a branch (shows
-  // "No summary" in pi's tree view until pi summarizes the abandoned
-  // branch).
+  // not on bubbles. Revert rewinds this chat in place (the pre-revert
+  // file is deleted so only the latest version survives); fork keeps both
+  // as separate chats.
   // Capture phase: kill the toggle chord before any input sees it.
   document.addEventListener("keydown", (e) => {
     if (hotChords.some((c) => chordHeld(c, e as KeyboardEvent))) {
@@ -4535,21 +4533,25 @@ parseHotChords("Super+J", "Super+Shift+J"); // shipped defaults; config refines 
   }, true);
   document.addEventListener("click", async (e) => {
     const rv = (e.target as HTMLElement).closest?.(".act-revert") as HTMLButtonElement | null;
-    if (rv?.dataset.entry) {
+    if (rv) {
       e.stopPropagation();
-      await doRevert(rv.dataset.entry);
+      const entry = rv.dataset.entry ?? await resolveForkEntry(rv);
+      if (entry) await doRevert(entry);
+      else toastErr("message not ready yet — try again in a moment");
+      return;
+    }
+    const fk = (e.target as HTMLElement).closest?.(".act-fork") as HTMLButtonElement | null;
+    if (fk) {
+      e.stopPropagation();
+      const entry = fk.dataset.entry ?? await resolveForkEntry(fk);
+      if (entry) await doFork(entry);
+      else toastErr("message not ready yet — try again in a moment");
       return;
     }
     const tc = (e.target as HTMLElement).closest?.(".act-tcopy") as HTMLButtonElement | null;
     if (tc) {
       e.stopPropagation();
       copyTurn(tc);
-      return;
-    }
-    const ts = (e.target as HTMLElement).closest?.(".act-tspeak") as HTMLButtonElement | null;
-    if (ts) {
-      e.stopPropagation();
-      speakTurn(ts);
       return;
     }
     const sstop = (e.target as HTMLElement).closest?.(".sstop") as HTMLButtonElement | null;

@@ -26,6 +26,10 @@ export function getKey(): string {
 
 let seq = 0;
 const pending = new Map<string, { res: (v: any) => void; rej: (e: any) => void }>();
+// Calls that timed out but may still answer late: swallow the straggler
+// instead of broadcasting it as a record. Ids are never reused (seq only
+// increases), so forgetting old ones is safe — the cap just bounds memory.
+const ignoredResponses = new Set<string>();
 const subs = new Map<string, Set<(rec: any) => void>>();
 let listening = false;
 
@@ -70,17 +74,15 @@ export async function ensureListening(): Promise<void> {
     // Render only the currently viewed session. Other sessions keep
     // running; their UI refreshes when viewed (full reload from messages).
     if (key !== undefined && key !== curKey && !(record && record.type === "response")) return;
-    if (
-      record &&
-      record.type === "response" &&
-      typeof record.id === "string" &&
-      pending.has(record.id)
-    ) {
-      const h = pending.get(record.id)!;
-      pending.delete(record.id);
-      if (record.success) h.res(record.data);
-      else h.rej(new Error(record.error ?? "pi error"));
-      return;
+    if (record && record.type === "response" && typeof record.id === "string") {
+      if (ignoredResponses.delete(record.id)) return; // timed-out call answered late: drop
+      if (pending.has(record.id)) {
+        const h = pending.get(record.id)!;
+        pending.delete(record.id);
+        if (record.success) h.res(record.data);
+        else h.rej(new Error(record.error ?? "pi error"));
+        return;
+      }
     }
     const set = subs.get(subKey(cwd));
     if (set) set.forEach((fn) => fn(record));
@@ -117,6 +119,8 @@ async function call(cwd: string, obj: any, timeoutMs = 120_000, key?: string): P
     const timer = setTimeout(() => {
       if (pending.has(id)) {
         pending.delete(id);
+        if (ignoredResponses.size > 500) ignoredResponses.clear();
+        ignoredResponses.add(id);
         rej(new Error("pi timeout"));
       }
     }, timeoutMs);
@@ -166,6 +170,11 @@ export const pi = {
   switchSession: (cwd: string, sessionPath: string) =>
     call(cwd, { type: "switch_session", sessionPath }),
   state: (cwd: string, key?: string) => call(cwd, { type: "get_state" }, 120_000, key),
+  // Readiness probe: true once the proc answers RPC. Cold boots (~1s+
+  // extension loading) and dead procs answer nothing. Short timeout so
+  // callers can poll without stalling the view.
+  ready: (cwd: string, key?: string): Promise<boolean> =>
+    call(cwd, { type: "get_state" }, 2000, key).then(() => true).catch(() => false),
   messages: (cwd: string) => call(cwd, { type: "get_messages" }),
   models: (cwd: string) => call(cwd, { type: "get_available_models" }),
   setModel: (cwd: string, provider: string, modelId: string) =>
