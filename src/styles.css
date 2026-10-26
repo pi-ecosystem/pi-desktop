@@ -433,9 +433,15 @@ details.toolrow > summary:hover { color: var(--text); }
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: 700; }
 .copybtn { font-size: 12px; padding: 1px 8px; border: none; color: var(--text); opacity: 0; }
-.msg table, #qbanswer table { border-collapse: collapse; margin: 8px 0; font-size: 13.5px; }
-.msg th, .msg td, #qbanswer th, #qbanswer td { padding: 8px 12px; border-bottom: 1px solid #4d4d4d; text-align: left; vertical-align: top; }
-.msg th, #qbanswer th { font-weight: 500; }
+.msg .tbl-wrap, #qbanswer .tbl-wrap { overflow-x: auto; margin: 8px 0; border: 1px solid #4d4d4d; border-radius: 12px; }
+/* :where() keeps these at zero specificity so GenUI widget internals
+   (Thesys bundle classes like .openui-table-cell) always win over our
+   chat markdown defaults. Plain markdown tables have no classes and
+   still get our styling. */
+:where(.msg, #qbanswer) table { border-collapse: collapse; margin: 0; font-size: 13.5px; width: 100%; min-width: 560px; }
+:where(.msg, #qbanswer) th { background: rgba(255, 255, 255, 0.04); }
+:where(.msg, #qbanswer) th, :where(.msg, #qbanswer) td { padding: 8px 12px; border-bottom: 1px solid #4d4d4d; text-align: left; vertical-align: top; }
+:where(.msg, #qbanswer) th { font-weight: 500; }
 .codeblock:hover .copybtn, .copybtn:focus { opacity: 1; }
 /* OpenUI widgets (see openui.ts): the bundle ships its own design
    system; we only lift widgets off the chat bg with a whisper of
@@ -455,6 +461,14 @@ details.toolrow > summary:hover { color: var(--text); }
   --openui-font-size-xl: 18px;
 }
 .genui-openui .genui-loading { color: var(--dim); font-size: 13px; padding: 8px 0; }
+/* Accordion tuning: the section trigger IS a <button>, so our global
+   button:hover paints a solid block behind it that overlaps the divider
+   above — the bundle designs no hover wash, so drop ours. Collapse
+   dead air: the bundle keeps gap-l around zero-height closed content
+   (18px item gap + 18px root gap per row). */
+.genui-openui .openui-foldable-section-trigger:hover { background-color: transparent; }
+.genui-openui .openui-foldable-section-root { gap: 8px; }
+.genui-openui .openui-foldable-section-item { gap: 0; }
 .genui-error summary { cursor: pointer; color: var(--dim); font-size: 13px; }
 .genui-error pre { margin: 8px 0 0; max-height: 200px; overflow: auto; }
 
@@ -644,7 +658,8 @@ html:has(> body.qb) { background: var(--surface); }
   #chathead { min-height: 48px; padding: calc(6px + var(--sat)) 8px 6px; }
   #scrollbtn { bottom: 170px; }
   .modalcard { width: calc(100vw - 32px); }
-  .msg table, #qbanswer table { display: block; overflow-x: auto; }
+  .msg .tbl-wrap, #qbanswer .tbl-wrap { margin-left: -4px; margin-right: -4px; }
+  :where(.msg, #qbanswer) table { min-width: 520px; }
   .greet h2 { font-size: 24px; line-height: 30px; }
 }
 

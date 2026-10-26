@@ -596,6 +596,68 @@ export function renderMd(src: string): string {
   }
 }
 
+type Align = "left" | "center" | "right" | null;
+
+// Split a table row on unescaped pipes, respecting `code spans` (a |
+// b in code is one cell). Returns raw cell strings. Outer pipes are
+// optional.
+function splitCells(r: string): string[] {
+  const cells: string[] = [];
+  let cur = "";
+  let inCode = false;
+  let body = r.trim();
+  if (body.startsWith("|")) body = body.slice(1);
+  if (body.endsWith("|") && !body.endsWith("\\|")) body = body.slice(0, -1);
+  for (let k = 0; k < body.length; k++) {
+    const ch = body[k];
+    if (ch === "\\" && body[k + 1] === "|") {
+      cur += "|";
+      k++;
+      continue;
+    }
+    if (ch === "`") inCode = !inCode;
+    if (ch === "|" && !inCode) {
+      cells.push(cur.trim());
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+// Delimiter row: every pipe-separated cell is :--, :--:, --:. Null =
+// not a delimiter row.
+function delimAligns(r: string): Align[] | null {
+  if (!r.includes("-") || /[^\s|:.-]/.test(r.trim().replace(/^\||\|$/g, ""))) return null;
+  const cells = splitCells(r);
+  if (cells.length === 0) return null;
+  const aligns: Align[] = [];
+  for (const c of cells) {
+    const t = c.trim();
+    if (!/^:-{1,}:?$/.test(t) && !/^-{1,}:?$/.test(t)) return null;
+    const l = t.startsWith(":");
+    const rr = t.endsWith(":");
+    aligns.push(l && rr ? "center" : rr ? "right" : l ? "left" : null);
+  }
+  return aligns;
+}
+
+function tableHtml(headRaw: string[], aligns: Align[], rowsRaw: string[][]): string {
+  const alignAttr = (a: Align): string => (a ? ` style="text-align:${a}"` : "");
+  const head = headRaw.map((c) => inline(c));
+  return (
+    '<div class="tbl-wrap"><table><thead><tr>' +
+    head.map((c, k) => `<th${alignAttr(aligns[k] ?? null)}>${c}</th>`).join("") +
+    "</tr></thead><tbody>" +
+    rowsRaw
+      .map((r) => "<tr>" + r.map((c, k) => `<td${alignAttr(aligns[k] ?? null)}>${inline(c)}</td>`).join("") + "</tr>")
+      .join("") +
+    "</tbody></table></div>"
+  );
+}
+
 function renderMdInner(src: string): string {
   const out: string[] = [];
   const lines = src.split("\n");
@@ -652,44 +714,28 @@ function renderMdInner(src: string): string {
       i++;
       continue;
     }
-    // Markdown tables: header row + |---|---| separator.
-    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes("-")) {
-      closeList();
-      closeOl();
-      // Split on pipes, but respect code spans: `a | b` is one cell.
-      const splitRow = (r: string): string[] => {
-        const cells: string[] = [];
-        let cur = "";
-        let inCode = false;
-        const body = r.trim().replace(/^\||\|$/g, "");
-        for (let i = 0; i < body.length; i++) {
-          const ch = body[i];
-          if (ch === "`") inCode = !inCode;
-          if (ch === "|" && !inCode) {
-            cells.push(inline(cur.trim()));
-            cur = "";
-          } else {
-            cur += ch;
-          }
+    // Markdown tables: header row + ---|--- separator. Outer pipes are
+    // optional (models often omit them), alignment comes from the
+    // separator row (:---, :---:, ---:). Continuation rows need only
+    // contain a pipe — not outer pipes.
+    if (line.includes("|") && i + 1 < lines.length) {
+      const headRaw = splitCells(line);
+      const aligns = headRaw.length > 1 ? delimAligns(lines[i + 1]) : null;
+      if (aligns && aligns.length === headRaw.length) {
+        closeList();
+        closeOl();
+        i += 2;
+        const rowsRaw: string[][] = [];
+        while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "" && !lines[i].startsWith("```")) {
+          const cells = splitCells(lines[i]);
+          // Ragged rows: pad short, truncate long — never drop the row.
+          while (cells.length < headRaw.length) cells.push("");
+          rowsRaw.push(cells.slice(0, headRaw.length));
+          i++;
         }
-        cells.push(inline(cur.trim()));
-        return cells;
-      };
-      const head = splitRow(line);
-      i += 2;
-      const rows: string[][] = [];
-      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
-        rows.push(splitRow(lines[i]));
-        i++;
+        out.push(tableHtml(headRaw, aligns, rowsRaw));
+        continue;
       }
-      out.push(
-        "<table><thead><tr>" +
-          head.map((c) => `<th>${c}</th>`).join("") +
-          "</tr></thead><tbody>" +
-          rows.map((r) => "<tr>" + r.map((c) => `<td>${c}</td>`).join("") + "</tr>").join("") +
-          "</tbody></table>"
-      );
-      continue;
     }
     const ol = line.match(/^\s*\d+\.\s+(.*)$/);
     if (ol) {
@@ -737,6 +783,19 @@ function renderMdInner(src: string): string {
     while (i < lines.length && lines[i].trim() !== "" && !lines[i].startsWith("```")) {
       buf.push(lines[i]);
       i++;
+    }
+    // Delimiter-less pipe table: models often skip the ---|--- row.
+    // Without this, consecutive pipe lines merge into one <p> (newlines
+    // collapse in HTML) and render as pipe soup. Every line must hold
+    // 2+ cells with a consistent column count — prose with a stray pipe
+    // never qualifies.
+    if (buf.length >= 2 && buf.every((l) => l.includes("|"))) {
+      const rawRows = buf.map(splitCells);
+      const width = rawRows[0].length;
+      if (width >= 2 && width <= 12 && rawRows.every((c) => c.length === width)) {
+        out.push(tableHtml(rawRows[0], rawRows[0].map(() => null), rawRows.slice(1)));
+        continue;
+      }
     }
     const isLabelLine = (s: string): boolean => {
       // Accept plain `Label:` and **bold** `**Label:**` / `**Label**:`.
