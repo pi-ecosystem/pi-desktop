@@ -61,52 +61,52 @@
         </header>
         <div id="scrollwrap">
           <div id="msgs"></div>
+          <div id="composer">
+            <div id="qbar" title="Queued with the agent"></div>
+            <div id="cmdlist" class="hidden"></div>
+            <div id="attachbar" class="hidden"></div>
+            <div id="input" role="textbox" aria-label="Message" aria-multiline="true"></div>
+            <input type="file" id="attachfile" class="hidden" multiple />
+            <div class="cbtns">
+              <div class="ctools">
+                <button class="dd-btn" id="attachbtn" title="Attach files">
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M11.5 7.5l-4.8 4.8a2.3 2.3 0 01-3.2-3.2l5.5-5.5a3.8 3.8 0 015.4 5.4l-5.5 5.5a5.3 5.3 0 01-7.5-7.5l5-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <div class="dd" id="modeldd">
+                  <button class="dd-btn" id="modelbtn" title="Model"><span id="modellabel">model</span></button>
+                  <div class="dd-list hidden" id="modellist"><input id="modeltype" spellcheck="false" placeholder="Search models…" /><div id="modelopts"></div></div>
+                </div>
+                <div class="dd" id="thinkdd">
+                  <button class="dd-btn" id="thinkbtn" title="Thinking level"><span id="thinklabel"></span></button>
+                  <div class="dd-list hidden" id="thinklist"><input id="thinktype" spellcheck="false" placeholder="Search levels…" /><div id="thinkopts"></div></div>
+                </div>
+                <div class="dd" id="dirdd">
+                  <button class="dd-btn" id="dirbtn" title="Working directory"><span id="dirlabel">…</span></button>
+                  <div class="dd-list hidden" id="dirlist">
+                    <input id="dirtype" spellcheck="false" placeholder="Type a path, Enter to use" />
+                    <div id="dirrecents"></div>
+                    <div class="dd-opt" id="dirbrowse">Browse…</div>
+                  </div>
+                </div>
+              </div>
+              <span class="csp"></span>
+              <div id="ctxwrap" class="hidden" tabindex="0" aria-label="Context usage">
+                <svg id="ctxring" width="26" height="26" viewBox="0 0 26 26">
+                  <circle cx="13" cy="13" r="10" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
+                  <circle id="ctxarc" cx="13" cy="13" r="10" fill="none" stroke="#7aa2f7" stroke-width="3" stroke-linecap="round" stroke-dasharray="62.83" stroke-dashoffset="62.83" transform="rotate(-90 13 13)" />
+                </svg>
+                <span id="ctxpct">–</span>
+                <div id="ctxtip"></div>
+              </div>
+              <button id="abortbtn" disabled title="Stop"><svg width="14" height="14" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg></button>
+              <button id="send" title="Send">↑</button>
+            </div>
+          </div>
         </div>
         <button id="scrollbtn" class="iconbtn hidden" title="Scroll to bottom">
           <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 3v12m0 0l-4.5-4.5M10 15l4.5-4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <div id="status"></div>
-        <div id="composer">
-          <div id="qbar" title="Queued with the agent"></div>
-          <div id="cmdlist" class="hidden"></div>
-          <div id="attachbar" class="hidden"></div>
-          <div id="input" role="textbox" aria-label="Message" aria-multiline="true"></div>
-          <input type="file" id="attachfile" class="hidden" multiple />
-          <div class="cbtns">
-            <div class="ctools">
-              <button class="dd-btn" id="attachbtn" title="Attach files">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M11.5 7.5l-4.8 4.8a2.3 2.3 0 01-3.2-3.2l5.5-5.5a3.8 3.8 0 015.4 5.4l-5.5 5.5a5.3 5.3 0 01-7.5-7.5l5-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <div class="dd" id="modeldd">
-                <button class="dd-btn" id="modelbtn" title="Model"><span id="modellabel">model</span></button>
-                <div class="dd-list hidden" id="modellist"><input id="modeltype" spellcheck="false" placeholder="Search models…" /><div id="modelopts"></div></div>
-              </div>
-              <div class="dd" id="thinkdd">
-                <button class="dd-btn" id="thinkbtn" title="Thinking level"><span id="thinklabel"></span></button>
-                <div class="dd-list hidden" id="thinklist"><input id="thinktype" spellcheck="false" placeholder="Search levels…" /><div id="thinkopts"></div></div>
-              </div>
-              <div class="dd" id="dirdd">
-                <button class="dd-btn" id="dirbtn" title="Working directory"><span id="dirlabel">…</span></button>
-                <div class="dd-list hidden" id="dirlist">
-                  <input id="dirtype" spellcheck="false" placeholder="Type a path, Enter to use" />
-                  <div id="dirrecents"></div>
-                  <div class="dd-opt" id="dirbrowse">Browse…</div>
-                </div>
-              </div>
-            </div>
-            <span class="csp"></span>
-            <div id="ctxwrap" class="hidden" tabindex="0" aria-label="Context usage">
-              <svg id="ctxring" width="26" height="26" viewBox="0 0 26 26">
-                <circle cx="13" cy="13" r="10" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="3" />
-                <circle id="ctxarc" cx="13" cy="13" r="10" fill="none" stroke="#7aa2f7" stroke-width="3" stroke-linecap="round" stroke-dasharray="62.83" stroke-dashoffset="62.83" transform="rotate(-90 13 13)" />
-              </svg>
-              <span id="ctxpct">–</span>
-              <div id="ctxtip"></div>
-            </div>
-            <button id="abortbtn" disabled title="Stop"><svg width="14" height="14" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg></button>
-            <button id="send" title="Send">↑</button>
-          </div>
-        </div>
       </main>
       <aside id="sidepane" class="hidden">
         <div id="sideresize" title="Resize panel"></div>
