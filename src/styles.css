@@ -219,7 +219,7 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 .ctx-tip-row { display: flex; justify-content: space-between; font-size: 12px; padding: 1px 0; font-variant-numeric: tabular-nums; }
 .ctx-tip-row span:first-child { color: var(--dim); }
 .ctx-tip-warn { margin-top: 8px; font-size: 11px; color: #e8a06b; }
-#msgs { flex: none; overflow: visible; padding: 32px 24px 48px; display: flex; flex-direction: column; gap: 28px; width: calc(100% - 48px); max-width: 1024px; margin: 0 auto; min-height: 100%; }
+#msgs { flex: none; overflow: visible; padding: 32px 0 48px; display: flex; flex-direction: column; gap: 28px; width: calc(100% - 48px); max-width: 1024px; margin: 0 auto; min-height: 100%; }
 
 /* messages: user right bubble, assistant full-width plain.
    15.5px / 1.7 is the Claude/ChatGPT long-read zone: same size feel as
