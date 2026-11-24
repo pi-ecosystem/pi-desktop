@@ -49,12 +49,17 @@ export function recycleEvents(): void {
   } catch { /* ignore */ }
   unlistenEvents = null;
   listening = false;
+  listeningProbe = null;
 }
+
+// In-flight listen() shared by concurrent callers (boot fires several
+// calls at once): all await the same probe instead of stacking listeners.
+let listeningProbe: Promise<void> | null = null;
 
 export async function ensureListening(): Promise<void> {
   if (listening) return;
-  listening = true;
-  unlistenEvents = await listen("pi-record", (e: any) => {
+  if (listeningProbe) return listeningProbe;
+  listeningProbe = listen("pi-record", (e: any) => {
     const p = e.payload ?? {};
     const { cwd, tag, key, record } = p;
     if (tag !== NS) return;
@@ -86,7 +91,20 @@ export async function ensureListening(): Promise<void> {
     }
     const set = subs.get(subKey(cwd));
     if (set) set.forEach((fn) => fn(record));
+  }).then((unlisten) => {
+    unlistenEvents = unlisten;
+    listening = true;
+  }).catch((e) => {
+    // listen() failed (cold-boot race): never latch `listening` true —
+    // that wedged every later call till its 120s timeout with no retry,
+    // and the only fix was an app restart. Reset so the next call
+    // retries (and rejects fast with the real error instead of hanging).
+    listening = false;
+    listeningProbe = null;
+    unlistenEvents = null;
+    throw e;
   });
+  return listeningProbe;
 }
 
 export function onRunStatus(fn: (s: { tag: string; key: string; streaming: boolean }) => void): () => void {

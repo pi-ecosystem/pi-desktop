@@ -534,7 +534,11 @@ fn scan_name(blob: &str) -> Option<String> {
     let mut name: Option<String> = None;
     let mut rest = blob;
     while let Some(i) = rest.find("\"type\":\"session_info\"") {
-        let seg = &rest[i..(i + 600).min(rest.len())];
+        let mut end = (i + 600).min(rest.len());
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let seg = &rest[i..end];
         if let Some(n) = quoted_after(seg, "\"name\"") {
             name = Some(n);
         }
@@ -547,7 +551,11 @@ fn scan_name(blob: &str) -> Option<String> {
 fn scan_preview(blob: &str) -> Option<String> {
     let mut rest = blob;
     while let Some(i) = rest.find("\"role\":\"user\"") {
-        let seg = &rest[i..(i + 2000).min(rest.len())];
+        let mut end = (i + 2000).min(rest.len());
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let seg = &rest[i..end];
         if let Some(t) = quoted_after(seg, "\"text\"") {
             if !t.starts_with("Ran `") {
                 return Some(t);

@@ -546,6 +546,13 @@ function inline(s: string): string {
   // so `**a *b* c**` (italic-close + bold-close `***`) resolves correctly.
   h = h.replace(/\*\*([\s\S]+?)\*\*(?!\*)/g, "<strong>$1</strong>");
   h = h.replace(/(^|[^*\w])\*([^\s*][^*\n]*?)\*(?![*\w])/g, "$1<em>$2</em>");
+  // Underscore twins of the above, plus strikethrough: the composer
+  // highlights them, so the transcript must render them (else formatted
+  // text looks right while typing and goes flat after send). Word guards
+  // keep snake_case identifiers intact.
+  h = h.replace(/~~([^~\n]+?)~~/g, "<s>$1</s>");
+  h = h.replace(/(^|[^_\w])__([^\s_][\s\S]*?)__(?![_\w])/g, "$1<strong>$2</strong>");
+  h = h.replace(/(^|[^_\w])_([^\s_][^_\n]*?)_(?![_\w])/g, "$1<em>$2</em>");
   // Link URLs may contain balanced parens (Wikipedia…): match one level
   // instead of stopping at the first `)`.
   h = h.replace(/\[([^\]]+)\]\((https?:[^()\s]*(?:\([^)]*\)[^()\s]*)*)\)/g, (_m, text, url) => linkTag(url, text));
@@ -559,7 +566,11 @@ function inline(s: string): string {
       part.startsWith("<figure")
     )
       return part;
-    return part.replace(/(https?:\/\/[^\s<\]\\)]+)/g, (url) => {
+    // Single newlines are hard breaks (chat convention): what you typed
+    // line-by-line must not merge into one wrapped paragraph after send.
+    // Code spans and media placeholders are partitioned out above, so
+    // this only touches plain prose.
+    return part.replace(/\n/g, "<br>").replace(/(https?:\/\/[^\s<\]\\)]+)/g, (url) => {
       const m = url.match(/^(.*?)([.,;:!?)\]]+)$/);
       const clean = m ? m[1] : url;
       const trail = m ? m[2] : "";

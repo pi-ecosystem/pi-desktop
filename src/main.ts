@@ -4323,6 +4323,10 @@ async function setCwd(next: string, save = true, resume = true) {
   $("dirlabel").textContent = baseName(cwd) || cwd;
   ($("dirbtn") as HTMLButtonElement).title = cwd;
   syncDirMenu();
+  // Paint-first: cold boots (~1s+ pi spawn + extension load) must never
+  // sit on a blank view. Worst case the user sees "Ready when you are"
+  // plus a real error, never nothing.
+  paintEmpty();
   try {
     const files = await sessions.list(cwd).catch(() => []);
     if (gen !== cwdGen) return;

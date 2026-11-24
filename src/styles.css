@@ -219,15 +219,19 @@ pre.dl-add, pre.dl-ctx, .diffblock pre { white-space: pre-wrap; word-break: brea
 .ctx-tip-row { display: flex; justify-content: space-between; font-size: 12px; padding: 1px 0; font-variant-numeric: tabular-nums; }
 .ctx-tip-row span:first-child { color: var(--dim); }
 .ctx-tip-warn { margin-top: 8px; font-size: 11px; color: #e8a06b; }
-#msgs { flex: none; overflow: visible; padding: 32px 0 48px; display: flex; flex-direction: column; gap: 28px; width: calc(100% - 48px); max-width: 1024px; margin: 0 auto; min-height: 100%; }
+#msgs { flex: none; overflow: visible; padding: 32px 0 48px; display: flex; flex-direction: column; gap: 28px; width: calc(100% - 48px); max-width: 1024px; margin: 0 auto; /* Reserve the floating composer's height so empty-state greetings center in the visible area, not under the overlay. */ min-height: calc(100% - 160px); }
 
 /* messages: user right bubble, assistant full-width plain.
    15.5px / 1.7 is the Claude/ChatGPT long-read zone: same size feel as
    16px but with room to breathe. Narrow 768px measure (~75ch) keeps
    lines from running wall-to-wall. */
 .msg { font-size: 14px; line-height: 1.7; font-variant-numeric: tabular-nums; }
-.msg.user { align-self: flex-end; max-width: min(75%, 640px); background: var(--bubble); border-radius: 20px; padding: 8px 16px; font-size: 14px; line-height: 1.6; }
+.msg.user { align-self: flex-end; max-width: min(85%, 800px); background: var(--bubble); border-radius: 20px; padding: 8px 16px; font-size: 14px; line-height: 1.6; }
 .msg.user .ubody { line-height: 1.6; }
+/* User bubbles keep the author's line breaks exactly: `text-wrap: pretty`
+   (set on .msg p for assistant prose) rebalances lines and splits ones
+   that would fit. Wrap only at the bubble edge. */
+.msg.user p { text-wrap: wrap; }
 .msg.assistant { align-self: stretch; position: relative; padding: 0; border: none; background: none; line-height: 1.7; }
 .msg.sys { align-self: stretch; color: var(--dim); font-size: 13px; border: 1px dashed var(--border); border-radius: 8px; padding: 6px 12px; background: none; }
 .msg.stream { opacity: 0.95; }
