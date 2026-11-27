@@ -2007,14 +2007,28 @@ pub fn run() {
                 }
             }
             // Bridge: forwarded pi records fan out over the broadcast;
-            // re-emit them as pi-record IPC for the frontend.
+            // re-emit them as pi-record IPC for the frontend. Must NEVER
+            // die: a burst past channel capacity reports Lagged (not data)
+            // and the old `while let Ok` exited there — silently ending ALL
+            // events, wedging every call till its 120s timeout with zero
+            // logging. Drop the backlog, keep bridging (frontend re-syncs
+            // via history reads + pi_states).
             let st = app.state::<Arc<AppState>>();
             let bridge_rx = st.inner().clone();
             let ah = app.handle().clone();
             std::thread::spawn(move || {
                 let mut rx = bridge_rx.events.subscribe();
-                while let Ok(payload) = rx.blocking_recv() {
-                    let _ = ah.emit("pi-record", payload);
+                loop {
+                    match rx.blocking_recv() {
+                        Ok(payload) => {
+                            let _ = ah.emit("pi-record", payload);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!("pi-record bridge lagged, skipped {n} records");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             });
             let cfg = st.get_config_core();
